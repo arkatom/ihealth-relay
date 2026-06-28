@@ -55,12 +55,23 @@ _SF_DATALESS = 0x40000000
 #: 完了は ``_SF_DATALESS`` フラグ消滅で polling 判定する。
 _BRCTL = Path("/usr/bin/brctl")
 
-#: dataless 解除 (materialize) を待つ最大時間 (秒)。実機計測では 1 ファイル ~3 秒、
-#: 11 メトリクス並列で同時に走らせても 5 秒以内に完了したため、60 秒あれば
-#: ネットワーク遅延が混じる朝のリトライでも十分なマージンがある。
-_MATERIALIZE_TIMEOUT_SEC = 60.0
+#: dataless 解除 (materialize) を待つ最大時間 (秒)。実機計測 (2026-06 ログ 30日):
+#: 多くのメトリクスは 5 秒以内に完了するが、``walking_running_distance`` だけ
+#: 例外的に **平均 55 秒・ピーク 60 秒超** で iCloud sync が完了するため、旧値 60 秒
+#: では 30% の頻度で TIMEOUT して ``distance_km`` が永久に missing になっていた。
+#: 既定 120 秒に延長することで構造的に解消。``IHEALTH_MATERIALIZE_TIMEOUT_SEC``
+#: env で上書き可能 (将来 iCloud sync がさらに遅延した時の運用調整用 / テスト高速化)。
+#:
+#: 副作用: 全メトリクス TIMEOUT の最悪ケースで 1320 秒 (= 22 分) かかる計算だが、
+#: 通常運用では速いメトリクスから順に処理が進み、120 秒の壁に当たるのは
+#: ``walking_running_distance`` 1 つだけなので、実質的な追加コストは数十秒以内。
+_DEFAULT_MATERIALIZE_TIMEOUT_SEC = 120.0
 
-#: materialize 完了 polling 間隔 (秒)。0.5 秒 × 120 ステップで 60 秒タイムアウト。
+#: ``IHEALTH_MATERIALIZE_TIMEOUT_SEC`` env の許容上限 (10 分)。inf や巨大値が来ても
+#: launchd 朝バッチを 1 時間ぶら下げないよう clamp する安全網。
+_MATERIALIZE_TIMEOUT_UPPER_BOUND_SEC = 600.0
+
+#: materialize 完了 polling 間隔 (秒)。0.5 秒 × 240 ステップで 120 秒タイムアウト。
 _MATERIALIZE_POLL_INTERVAL_SEC = 0.5
 
 #: 「毎日必ず取れるはず」のメトリクス (logical key)。iPhone を携帯している限り
@@ -164,7 +175,7 @@ def _ensure_materialized(path: Path, log: logging.Logger) -> None:
         - ``brctl`` プロセス起動失敗 (``PermissionError`` / ``OSError``)
         - ``brctl download`` のタイムアウトまたは非ゼロ終了
         - polling 中の ``os.stat`` 失敗 (一時的な ``ENOENT`` / ``EPERM``)
-        - ``_MATERIALIZE_TIMEOUT_SEC`` 秒以内にフラグが解除されなかった
+        - ``_DEFAULT_MATERIALIZE_TIMEOUT_SEC`` 秒 (= 既定) 以内にフラグが解除されなかった
 
     Why this exists:
         launchd が起動した python3 から dataless な ``.hae`` を ``compression_tool``
@@ -175,7 +186,7 @@ def _ensure_materialized(path: Path, log: logging.Logger) -> None:
 
     Design notes:
         - **end-to-end deadline 制**: 単一 deadline を関数頭で固定し、``brctl``
-          実行 + polling の合計で ``_MATERIALIZE_TIMEOUT_SEC`` 秒を超えない。
+          実行 + polling の合計で ``timeout_sec`` 秒を超えない。
           以前は subprocess に 60s + polling に新たに 60s = 最悪 120s/ファイル
           になっていて、11 メトリクス逐次なら 20 分以上ぶら下がる可能性があった。
         - **polling 中は ``os.stat`` を直接呼ぶ**: ``_is_dataless`` の
@@ -197,7 +208,8 @@ def _ensure_materialized(path: Path, log: logging.Logger) -> None:
         )
     log.info("dataless 検出 → brctl で materialize 要求: %s", path)
 
-    deadline = time.monotonic() + _MATERIALIZE_TIMEOUT_SEC
+    timeout_sec = _materialize_timeout_from_env()
+    deadline = time.monotonic() + timeout_sec
 
     # subprocess には残り時間を渡す。最低 0.1 秒を保証して即時タイムアウトを防ぐ
     # (deadline = now ぴったりだと timeout=0 で TimeoutExpired が即発火するため)。
@@ -253,9 +265,28 @@ def _ensure_materialized(path: Path, log: logging.Logger) -> None:
         time.sleep(min(_MATERIALIZE_POLL_INTERVAL_SEC, remaining))
 
     raise SourceError(
-        f"materialize がタイムアウト ({_MATERIALIZE_TIMEOUT_SEC:.0f} 秒) しました: "
+        f"materialize がタイムアウト ({timeout_sec:.0f} 秒) しました: "
         f"path={path} (iCloud 同期遅延または File Provider の異常を確認してください)"
     )
+
+
+def _materialize_timeout_from_env() -> float:
+    """``IHEALTH_MATERIALIZE_TIMEOUT_SEC`` 環境変数で materialize timeout を上書き.
+
+    不正値 (非数値 / 負数 / NaN / ±Infinity / 巨大値) は既定値に戻す
+    (launchd 誤設定で運用が止まらないようにする). 有限値は
+    ``_MATERIALIZE_TIMEOUT_UPPER_BOUND_SEC`` で clamp.
+    """
+    raw = os.environ.get("IHEALTH_MATERIALIZE_TIMEOUT_SEC")
+    if not raw:
+        return _DEFAULT_MATERIALIZE_TIMEOUT_SEC
+    try:
+        parsed = float(raw)
+    except ValueError:
+        return _DEFAULT_MATERIALIZE_TIMEOUT_SEC
+    if not math.isfinite(parsed) or parsed <= 0:
+        return _DEFAULT_MATERIALIZE_TIMEOUT_SEC
+    return min(parsed, _MATERIALIZE_TIMEOUT_UPPER_BOUND_SEC)
 
 
 def decompress_hae(src: Path, dst: Path) -> None:

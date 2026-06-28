@@ -362,7 +362,7 @@ class TestEnsureMaterialized(unittest.TestCase):
             "ihealth.source._MATERIALIZE_POLL_INTERVAL_SEC", 0.0,
         )
         self._timeout_patcher = patch(
-            "ihealth.source._MATERIALIZE_TIMEOUT_SEC", 0.5,
+            "ihealth.source._DEFAULT_MATERIALIZE_TIMEOUT_SEC", 0.5,
         )
         self._poll_patcher.start()
         self._timeout_patcher.start()
@@ -525,7 +525,7 @@ class TestFetchOnceMaterializeIntegration(unittest.TestCase):
         self._ctool_patcher = patch("ihealth.source.COMPRESSION_TOOL", _FAKE_COMPRESSION_TOOL)
         self._brctl_patcher = patch("ihealth.source._BRCTL", _FAKE_COMPRESSION_TOOL)
         self._poll_patcher = patch("ihealth.source._MATERIALIZE_POLL_INTERVAL_SEC", 0.0)
-        self._timeout_patcher = patch("ihealth.source._MATERIALIZE_TIMEOUT_SEC", 0.5)
+        self._timeout_patcher = patch("ihealth.source._DEFAULT_MATERIALIZE_TIMEOUT_SEC", 0.5)
         self._ctool_patcher.start()
         self._brctl_patcher.start()
         self._poll_patcher.start()
@@ -625,7 +625,7 @@ class TestFetchMetricForDateMaterialize(unittest.TestCase):
         self._ctool_patcher = patch("ihealth.source.COMPRESSION_TOOL", _FAKE_COMPRESSION_TOOL)
         self._brctl_patcher = patch("ihealth.source._BRCTL", _FAKE_COMPRESSION_TOOL)
         self._poll_patcher = patch("ihealth.source._MATERIALIZE_POLL_INTERVAL_SEC", 0.0)
-        self._timeout_patcher = patch("ihealth.source._MATERIALIZE_TIMEOUT_SEC", 0.5)
+        self._timeout_patcher = patch("ihealth.source._DEFAULT_MATERIALIZE_TIMEOUT_SEC", 0.5)
         self._ctool_patcher.start()
         self._brctl_patcher.start()
         self._poll_patcher.start()
