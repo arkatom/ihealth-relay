@@ -146,6 +146,22 @@ def parse_active_energy_kcal(payload: dict, ctx: ParseContext) -> "float | None"
     return float(sum(items))
 
 
+def parse_exercise_minutes(payload: dict, ctx: ParseContext) -> "float | None":
+    """apple_exercise_time の qty (分) を当日合計して返す.
+
+    Health Auto Export の ``apple_exercise_time.hae`` は 1 秒粒度の瞬間サンプル
+    (qty = 1/60 分) を大量に出力する形式. SUM すれば実機の Exercise リング相当
+    の合計分が得られる (実機計測: 6/19=141分, 6/24=36分).
+
+    AppleWatch 装着時間ゼロの日は ``data:[]`` で来るので ``None`` を返し、
+    publisher 側で「既存値を保持 / スキップ」される.
+    """
+    items = [d["qty"] for d in payload.get("data", []) if d.get("unit") == "min"]
+    if not items:
+        return None
+    return float(sum(items))
+
+
 def parse_exercise_intensity_score(
     payload: dict, ctx: ParseContext
 ) -> "float | None":
@@ -218,7 +234,11 @@ def parse_exercise_intensity_score(
         elif mean_avg >= t_moderate:
             total_points += 1
 
-    return float(total_points) if total_points > 0 else None
+    # 0pt の日 (運動ゼロ) も 0 として明示記録する. 旧実装は 0 を None に潰して
+    # いたため、Notion 側で「測定漏れ」と「運動量ゼロ」が区別不能になっていた
+    # (heart_rate.json が空のときだけ buckets 空 → None になり、心拍は取れたが
+    # 運動強度がゼロな日は 0 として書き込まれる).
+    return float(total_points)
 
 
 def parse_heart_rate_avg(payload: dict, ctx: ParseContext) -> "float | None":
@@ -332,6 +352,7 @@ FIELD_SOURCES: "dict[str, tuple[str, ParserFn]]" = {
     "step_count":               ("step_count",               parse_step_count),
     "distance_km":              ("walking_running_distance", parse_distance_km),
     "active_energy_kcal":       ("active_energy",            parse_active_energy_kcal),
+    "exercise_minutes":         ("apple_exercise_time",      parse_exercise_minutes),
     "exercise_intensity_score": ("heart_rate",               parse_exercise_intensity_score),
     "heart_rate_avg":           ("heart_rate",               parse_heart_rate_avg),
     "heart_rate_max":           ("heart_rate",               parse_heart_rate_max),

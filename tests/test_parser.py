@@ -23,6 +23,7 @@ from ihealth.parser import (
     parse_body_mass_kg,
     parse_distance_km,
     parse_exercise_intensity_score,
+    parse_exercise_minutes,
     parse_heart_rate_avg,
     parse_heart_rate_max,
     parse_heart_rate_resting,
@@ -104,6 +105,42 @@ class TestActiveEnergyKcal(unittest.TestCase):
         self.assertIsNone(parse_active_energy_kcal({"data": []}, self.CTX))
 
 
+class TestExerciseMinutes(unittest.TestCase):
+    CTX = ParseContext(target_date=date(2026, 4, 22), max_heart_rate=178.0)
+
+    def test_min_unit_sum(self):
+        # apple_exercise_time は 1 秒粒度の qty=1/60 サンプルを大量に出す形式.
+        # SUM(qty) で当日合計分を求める.
+        payload = {"data": [
+            {"qty": 1/60, "unit": "min"},
+            {"qty": 1/60, "unit": "min"},
+            {"qty": 1/60, "unit": "min"},
+        ]}
+        self.assertAlmostEqual(parse_exercise_minutes(payload, self.CTX), 3/60)
+
+    def test_realistic_141_minutes(self):
+        # 6/19 実機計測の 141 分相当 (8400 サンプル × 1/60 分)
+        payload = {"data": [{"qty": 1/60, "unit": "min"} for _ in range(8460)]}
+        self.assertAlmostEqual(
+            parse_exercise_minutes(payload, self.CTX), 141.0,
+        )
+
+    def test_non_min_unit_skipped(self):
+        # 想定外の単位混入時は捨てる (kcal などが混じったケース防衛)
+        payload = {"data": [
+            {"qty": 1.0, "unit": "min"},
+            {"qty": 999.0, "unit": "kcal"},
+        ]}
+        self.assertAlmostEqual(parse_exercise_minutes(payload, self.CTX), 1.0)
+
+    def test_empty(self):
+        # AppleWatch 装着ゼロの日は data:[] で来る → None (Notion 既存値を保持)
+        self.assertIsNone(parse_exercise_minutes({"data": []}, self.CTX))
+
+    def test_no_data_key(self):
+        self.assertIsNone(parse_exercise_minutes({}, self.CTX))
+
+
 class TestExerciseIntensityScore(unittest.TestCase):
     """Heart Points (Issue #13): 1 分 bucket 集約 → bucket 平均 avg → zone 倍率。
 
@@ -132,8 +169,18 @@ class TestExerciseIntensityScore(unittest.TestCase):
 
     def test_low_bucket_0pt(self):
         payload = {"data": [{"avg": 80, "start": 0, "end": 1}]}
-        # low zone → None (0 pt)
-        self.assertIsNone(parse_exercise_intensity_score(payload, self._ctx(180.0)))
+        # low zone → 0pt (None ではなく 0.0 を返す)。
+        # 旧実装は 0 を None にしていたが、それだと「測定漏れ」と「運動量ゼロ」が
+        # 区別不能で Notion 上で常に空欄になっていた (真因B修正済み)。
+        self.assertEqual(
+            parse_exercise_intensity_score(payload, self._ctx(180.0)), 0.0,
+        )
+
+    def test_empty_buckets_returns_none(self):
+        # heart_rate.json が空 (装着なし) なら None を返す (測定漏れと区別)。
+        self.assertIsNone(
+            parse_exercise_intensity_score({"data": []}, self._ctx(180.0))
+        )
 
     def test_missing_fields_skipped(self):
         payload = {"data": [

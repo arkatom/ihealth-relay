@@ -5,7 +5,7 @@
 iPhone の Health Auto Export アプリが Apple Health のデータを `.hae` (LZFSE 圧縮 JSON) で iCloud Drive に吐き出し、macOS 側の Python バッチがそれを解凍・集計して、複数の pluggable sink (Notion / Markdown / stdout / SQLite / Slack / dryrun) に自動転記するツール。
 前身の GoogleFitNotionIntegration (Python / Google Fit / Cloud Functions) からの移行プロジェクト。
 
-> **実装状況 (2026-04-30 / v0.1.0 リリース済み)**: Sink プラガブル化で `--publisher` フラグ経由で notion / markdown / stdout / sqlite / slack / dryrun を切り替え可能 (既定は `notion`). Notion PROPERTY_MAP は英語 Title Case 名が既定 (英語以外の DB 列名を持つユーザーは `config.toml` で override 可能). 主要メトリクス欠落時の retry (120s × 5 回, `step_count`/`heart_rate` のみ critical), launchd 自動実行 (07:00), Reminders.app 永続通知, dataless `.hae` の自動 materialize (`brctl download` + polling) も完了済. 残作業は Issue #11 (時間プロパティの hours 表記移行) と #13 (Heart Points 厳密 Google Fit 準拠).
+> **実装状況 (2026-06-28)**: Sink プラガブル化で `--publisher` フラグ経由で notion / markdown / stdout / sqlite / slack / dryrun を切り替え可能 (既定は `notion`). Notion PROPERTY_MAP は英語 Title Case 名が既定 (英語以外の DB 列名を持つユーザーは `config.toml` で override 可能). 主要メトリクス欠落時の retry (120s × 5 回, `step_count`/`heart_rate` のみ critical), launchd 自動実行 (07:00), Reminders.app 永続通知, dataless `.hae` の自動 materialize (`brctl download` + polling) も完了済. **2026-06-28 修正**: `exercise_minutes` フィールド新規追加 (`apple_exercise_time` を集計しなかった実装漏れ修正) + `exercise_intensity_score = 0pt` を None に潰さず 0 として記録 (運動量ゼロを「未測定」と区別) + materialize timeout 60→120s (`walking_running_distance` の 30% timeout 構造修正、`IHEALTH_MATERIALIZE_TIMEOUT_SEC` env で上書き可) → DailyHealthData フィールド数 13 → 14. 残作業は Issue #11 (時間プロパティの hours 表記移行) と #13 (Heart Points 厳密 Google Fit 準拠).
 
 **設計上の重要な選択**: Swift + HealthKit 直叩きは `com.apple.developer.healthkit` entitlement のために Apple Developer Program (年 99 USD) への加入が必須だったため断念し、iPhone 側の Health Auto Export にデータ抽出を委任する構成に変更した。
 
@@ -78,7 +78,8 @@ python3 -m unittest discover tests           # テスト実行
 | step_count | `step_count` | Step Count | SUM(qty) | count | `Step Count` | 歩 |
 | distance_km | `walking_running_distance` | Walking + Running Distance | SUM(qty) | km | `Distance (km)` | km (round 1 桁) |
 | active_energy_kcal | `active_energy` | Active Energy | SUM(qty) | **kcal** (kJ は捨てる) | `Active Energy (kcal)` | kcal (round 1 桁) |
-| exercise_intensity_score | `heart_rate` | Heart Rate | Heart Points 近似: 各サンプルを `int(start // 60)` で 1 分 bucket に振り分け、bucket 平均 `avg` で zone 判定 (≥ 70% max_hr → 2pt, ≥ 50% → 1pt, それ未満 → 0pt) を総和 | — | `Exercise Intensity Score` | pt (round 1 桁) |
+| exercise_minutes | `apple_exercise_time` | Apple Exercise Time | SUM(qty) | min | `Exercise Minutes` | 分 (round 整数) |
+| exercise_intensity_score | `heart_rate` | Heart Rate | Heart Points 近似: 各サンプルを `int(start // 60)` で 1 分 bucket に振り分け、bucket 平均 `avg` で zone 判定 (≥ 70% max_hr → 2pt, ≥ 50% → 1pt, それ未満 → 0pt) を総和。**心拍データがあるが zone 未到達の日も 0 として記録** (旧実装は 0 を None に潰していたため Notion 側で「未測定」と「運動ゼロ」が区別不能だった). 心拍データ自体が空 (`heart_rate.json` の `data:[]`) なら None | — | `Exercise Intensity Score` | pt (round 1 桁) |
 | heart_rate_avg | `heart_rate` | Heart Rate | MEAN(avg) | count/min | `Heart Rate Avg (bpm)` | bpm (round 1 桁) |
 | heart_rate_max | `heart_rate` | Heart Rate | MAX(max) | count/min | `Heart Rate Max (bpm)` | bpm (round 1 桁) |
 | heart_rate_resting | `resting_heart_rate` | Resting Heart Rate | MEAN(qty where unit="count/min") | count/min | `Heart Rate Resting (bpm)` | bpm (round 1 桁) |

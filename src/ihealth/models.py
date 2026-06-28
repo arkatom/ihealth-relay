@@ -34,6 +34,7 @@ _VALID_RANGES: "dict[str, tuple[float | None, float | None]]" = {
     "step_count":               (0, None),
     "distance_km":              (0, 500),      # 1 日 500km 以上歩く人類は希
     "active_energy_kcal":       (0, 20000),    # エリートアスリートでも 1 日 1 万 kcal 未満
+    "exercise_minutes":         (0, 24 * 60),  # apple_exercise_time SUM、1 日分が上限
     "exercise_intensity_score": (0, None),     # pt 上限なし (Issue #13 の 1 分 bucket 集約)
     "heart_rate_avg":           (20, 250),     # 成人心拍の生理学的範囲
     "heart_rate_max":           (20, 250),
@@ -59,6 +60,7 @@ class DailyHealthData:
     step_count: "int | None" = None
     distance_km: "float | None" = None
     active_energy_kcal: "float | None" = None
+    exercise_minutes: "float | None" = None
     exercise_intensity_score: "float | None" = None
     heart_rate_avg: "float | None" = None
     heart_rate_max: "float | None" = None
@@ -125,6 +127,7 @@ class DailyHealthData:
             "step_count": self.step_count,
             "distance_km": self.distance_km,
             "active_energy_kcal": self.active_energy_kcal,
+            "exercise_minutes": self.exercise_minutes,
             "exercise_intensity_score": self.exercise_intensity_score,
             "heart_rate_avg": self.heart_rate_avg,
             "heart_rate_max": self.heart_rate_max,

@@ -186,7 +186,7 @@ def run_pipeline(
         1 for key, value in health_data.as_dict().items()
         if key != "date" and value is not None
     )
-    logger.info("集計完了: target=%s populated=%d/13", target_date, populated)
+    logger.info("集計完了: target=%s populated=%d/14", target_date, populated)
     logger.debug("集計値:")
     for key, value in health_data.as_dict().items():
         logger.debug("  %s = %s", key, value)

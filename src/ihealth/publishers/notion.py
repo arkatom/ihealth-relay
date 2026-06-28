@@ -87,6 +87,7 @@ PROPERTY_MAP: "dict[str, tuple[str, Callable[[object], object]]]" = {
     "step_count":               ("Step Count",                  lambda v: int(v)),
     "distance_km":              ("Distance (km)",               lambda v: round(float(v), 1)),
     "active_energy_kcal":       ("Active Energy (kcal)",        lambda v: round(float(v), 1)),
+    "exercise_minutes":         ("Exercise Minutes",            lambda v: int(round(float(v)))),
     "exercise_intensity_score": ("Exercise Intensity Score",    lambda v: round(float(v), 1)),
     "heart_rate_avg":           ("Heart Rate Avg (bpm)",        lambda v: round(float(v), 1)),
     "heart_rate_max":           ("Heart Rate Max (bpm)",        lambda v: round(float(v), 1)),

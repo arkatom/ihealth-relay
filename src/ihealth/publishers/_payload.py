@@ -55,6 +55,7 @@ _FIELD_SPECS_RAW: "dict[str, _FieldSpec]" = {
     "step_count":               _FieldSpec(kind="int",   ndigits=None),
     "distance_km":              _FieldSpec(kind="float", ndigits=2),
     "active_energy_kcal":       _FieldSpec(kind="float", ndigits=1),
+    "exercise_minutes":         _FieldSpec(kind="float", ndigits=1),
     "exercise_intensity_score": _FieldSpec(kind="float", ndigits=1),
     "heart_rate_avg":           _FieldSpec(kind="float", ndigits=1),
     "heart_rate_max":           _FieldSpec(kind="float", ndigits=1),

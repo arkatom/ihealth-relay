@@ -40,6 +40,9 @@ property = "移動距離 (km)"
 [publishers.notion.fields.active_energy_kcal]
 property = "消費カロリー (kcal)"
 
+[publishers.notion.fields.exercise_minutes]
+property = "アクティビティ時間 (分)"
+
 [publishers.notion.fields.exercise_intensity_score]
 property = "運動強度スコア"
 

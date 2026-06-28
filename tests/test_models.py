@@ -96,13 +96,13 @@ class TestValidation(unittest.TestCase):
 
 
 class TestIterFields(unittest.TestCase):
-    def test_iter_returns_15_fields(self):
+    def test_iter_returns_16_fields(self):
         d = DailyHealthData(date=date(2026, 4, 22), step_count=100)
         fields = list(d.iter_fields())
-        # date + 14 metric fields (CLAUDE.md では "13 メトリクス" と書かれるが、
-        # heart_rate が avg/max/resting の 3 つに分解されていて mindful も
-        # sessions/minutes の 2 つなので、models.py 上の属性数は 14 + date)
-        self.assertEqual(len(fields), 15)
+        # date + 15 metric fields (heart_rate が avg/max/resting の 3 つに分解、
+        # mindful が sessions/minutes の 2 つに分解、apple_exercise_time を
+        # exercise_minutes として追加).
+        self.assertEqual(len(fields), 16)
         # 最初は date
         self.assertEqual(fields[0][0], "date")
         self.assertEqual(fields[0][1], date(2026, 4, 22))
