@@ -5,12 +5,17 @@
     {"data": {
         "metrics": [
             {"name": "step_count", "units": "count",
-             "data": [{"date": "2026-10-10 05:02:00 +0900", "qty": 12, "source": "..."},
+             "data": [{"date": "2030-01-15 05:02:00 +0900", "qty": 12, "source": "..."},
                       ...]},
             ...
         ],
         "workouts": [...]          # 任意 (オートメーションで含めた場合のみ)
     }}
+
+``data.workouts`` が **無い** 出力 (HAE のオートメーションでワークアウトを含めない設定 =
+``includeWorkouts=false``) では、その日にワークアウトがあったかを判断できない。
+そのためアクティビティ詳細は ``None`` (= 書かない) にする (``"なし"`` / ``"瞑想N分"`` と
+断定すると、実際にあったワークアウトを含む既存の値を上書きしてしまう)。
 
 主対象は ``aggregateData=true`` (record = 1 分集計) / ``aggregateSleep=true``
 (睡眠は 1 日 1 レコードの集計値) の設定。非集計の睡眠 segment 形式
@@ -18,13 +23,17 @@
 
 規約 (旧 AutoSync 用 :mod:`ihealth.parser` と同じ考え方):
 
-* 全て tolerant: 欠損キー / 型違い (数値でない qty 等) の record は skip する
-* record の日時 (``"2026-10-10 05:02:00 +0900"``) は **record 自身の offset の暦日**
+* 個々の record の欠損キー / 型違い (数値でない qty 等) は skip する (tolerant)
+* ただし **metric 全体が解釈できない** (data が配列でない / どの record の日時も
+  解釈できない / 対象日の record に使える数値が 1 つも無い / 未知の単位) 場合は
+  黙って ``None`` にせず ``errors`` に記録する。HAE の更新やロケール変更で書式が
+  変わったときに「データなし」と区別できず、通知されないまま値が途絶えるのを防ぐ
+* record の日時 (``"2030-01-15 05:02:00 +0900"``) は **record 自身の offset の暦日**
   で ``target_date`` と比較する (JST 固定にしない。海外滞在中の記録も現地日付で
   1 日に入る)
 * 該当 record が無いフィールドは ``None`` (= publisher は書かない / 既存値を保持)
 * 単位は metric ごとに換算 (kJ → kcal, mi → km, lb → kg ...)。未知の単位は
-  黙って誤換算せず、警告を出してそのフィールドを ``None`` にする
+  黙って誤換算せず、そのフィールドを ``None`` にしてエラーとして記録する
 * 同名 metric が複数回出現したら優先単位 (kcal > kJ, kg > lb > g, km > m > mi)
   の 1 つだけ採用し、他は捨てる (加算すると二重計上になるため)
 * 生理学的妥当性は :func:`ihealth.parser.drop_invalid_fields` でフィールド単位に
@@ -39,7 +48,7 @@ import statistics
 from collections.abc import Mapping
 from dataclasses import dataclass
 from dataclasses import fields as dataclass_fields
-from datetime import date, datetime, timezone
+from datetime import date, datetime, time, timedelta, timezone
 from types import MappingProxyType
 from typing import Callable, Iterable, Sequence, TypeVar
 
@@ -70,6 +79,8 @@ METRIC_MINDFUL = "mindful_minutes"
 #: ``body_mass_index`` (BMI) とは別物。名前の完全一致でしか拾わない。
 METRIC_BODY_MASS = "weight_body_mass"
 METRIC_BODY_FAT = "body_fat_percentage"
+#: ``errors`` / ``failed_metrics`` でワークアウトの集計失敗を表すラベル。
+WORKOUTS_LABEL = "workouts"
 
 #: DailyHealthData の集計フィールド名 (date を除く 15 個、定義順)。
 HEALTH_FIELDS: "tuple[str, ...]" = tuple(
@@ -117,14 +128,19 @@ _ASLEEP_STAGE_WORDS: "tuple[str, ...]" = (
 )
 #: 非集計 segment の除外 stage (小文字部分一致、asleep 判定より優先)。
 _EXCLUDED_STAGE_WORDS: "tuple[str, ...]" = ("awake", "in bed", "inbed", "in_bed")
-#: 同一ソースの segment を 1 つの睡眠セッションにまとめる最大間隔 (秒)。
-#: 夜中の覚醒 (Awake segment は合算対象外なので asleep segment 間の隙間になる)
-#: でセッションが割れ、0 時前に終わる前半部分が「前日の 20-24 時終了」として
-#: どの日にも入らなくなるのを防ぐ。2 時間を超える覚醒は別セッション扱い。
-_SLEEP_SESSION_GAP_SEC = 2 * 60 * 60
-#: 夜主睡眠 / 昼寝の判定 (セッション終了時刻の現地 hour)。
+#: 同一ソースの segment を 1 つの睡眠セッションとみなす最大間隔 (秒)。Awake /
+#: In Bed segment もセッションの一部として間隔を埋める。セッションは
+#: 「0 時前に終わる segment (20-24 時台終了) を翌朝の夜主睡眠へ繰り越すか」と
+#: 「当日の夜主睡眠が前日ファイルの segment に依存しうるか」の判定にだけ使い、
+#: 夜主睡眠 / 昼寝の分類自体は **segment ごとの終了時刻** で行う。
+SLEEP_SESSION_GAP_SEC = 2 * 60 * 60
+#: 夜主睡眠 / 昼寝の判定 (segment 終了時刻の現地 hour)。
 _MAIN_SLEEP_END_HOURS = (0, 14)
 _NAP_END_HOURS = (14, 20)
+#: HAE の aggregateSleep 集計における「1 日」の締めの時刻 (現地 hour)。実データの
+#: 観測: sleepEnd が 18 時以降のセッションは **翌日付** のレコードになり、翌日の
+#: totalSleep に含まれる (18 時前に終わる昼寝は当日の totalSleep に含まれる)。
+HAE_AGGREGATED_SLEEP_DAY_END_HOUR = 18
 
 SLEEP_MODE_AGGREGATED = "aggregated"
 SLEEP_MODE_SEGMENTS = "segments"
@@ -204,12 +220,26 @@ class AutomationParseResult:
     Attributes:
         health: 集計結果 (妥当性違反フィールドは None に落とし済み)
         activity_detail: ``"瞑想3分、ウォーキング20分"`` / ``"なし"``。
-            payload に metrics が 1 件も無い (or 対象日のデータが 1 つも無い)
-            ときは ``None`` (= 書かない)
+            payload に metrics が 1 件も無い / 対象日のデータが 1 つも無い /
+            ``data.workouts`` が含まれていない (ワークアウトを出力しない設定) /
+            瞑想かワークアウトを解釈できなかったときは ``None`` (= 書かない)
         has_metrics: payload に metric が 1 件以上あったか
         sleep_mode: ``"aggregated"`` / ``"segments"`` / ``None`` (睡眠データなし)
-        errors: 集計中に例外になった metric の説明 (該当フィールドは None)
+        errors: 集計できなかった metric の説明 (該当フィールドは None)
         dropped_fields: 妥当性検証で None に落としたフィールド名
+        failed_metrics: 集計に失敗した metric 名 (``errors`` と対応。ワークアウトは
+            :data:`WORKOUTS_LABEL`)
+        workouts: 対象日のワークアウト ``(日本語名, 分)``。``data.workouts`` が無い
+            (出力しない設定) / 解釈できなかったら ``None``
+        workouts_included: payload に ``data.workouts`` があったか (False なら
+            ワークアウトの有無を判断できないので activity_detail を書かない)
+        main_sleep_end: segment 形式で、対象日の夜主睡眠に数えた segment の最遅終了時刻
+            (record 自身の offset)。夜主睡眠が無い / aggregated なら ``None``
+        main_sleep_needs_prev: segment 形式で、対象日の夜主睡眠のセッションが
+            「0 時 + :data:`SLEEP_SESSION_GAP_SEC`」より前に始まっている
+            (= 前日ファイルにしか無い 0 時前の segment が繋がりうる)。呼び出し側は
+            前日ファイルを読めていない / 夜が明ける前に書かれた古い前日ファイル
+            しか無いとき、夜主睡眠を「過少の恐れあり」として書かないこと
     """
 
     health: DailyHealthData
@@ -218,6 +248,11 @@ class AutomationParseResult:
     sleep_mode: "str | None" = None
     errors: "tuple[str, ...]" = ()
     dropped_fields: "tuple[str, ...]" = ()
+    failed_metrics: "tuple[str, ...]" = ()
+    workouts: "tuple[tuple[str, float], ...] | None" = ()
+    main_sleep_end: "datetime | None" = None
+    main_sleep_needs_prev: bool = False
+    workouts_included: bool = False
 
 
 # ---------- 汎用ヘルパー ----------
@@ -233,10 +268,10 @@ _DATETIME_FORMATS: "tuple[str, ...]" = (
 
 
 def parse_hae_datetime(value: object) -> "datetime | None":
-    """HAE の日時文字列 (``"2026-10-10 05:02:00 +0900"``) を datetime にする。
+    """HAE の日時文字列 (``"2030-01-15 05:02:00 +0900"``) を datetime にする。
 
     offset 付きなら aware datetime (offset はそのまま保持、JST へ変換しない)。
-    ISO 8601 (``2026-10-10T05:02:00+09:00``) も受け付ける。解釈できなければ None。
+    ISO 8601 (``2030-01-15T05:02:00+09:00``) も受け付ける。解釈できなければ None。
     """
     if not isinstance(value, str):
         return None
@@ -309,6 +344,11 @@ def _unit_factor(
     return lowered.get(text.lower())
 
 
+def _unit_error(units: object) -> ValueError:
+    """未知の単位: 誤換算せずに metric ごと集計失敗として記録させる例外。"""
+    return ValueError(f"単位 {units!r} は未対応のため集計しません (誤換算防止)")
+
+
 def _unit_rank(metric: "Mapping[str, object]", priority: "Sequence[str]") -> int:
     units = metric.get("units")
     if isinstance(units, str):
@@ -367,6 +407,7 @@ def _metrics_by_name(
 
 
 def _records(metric: "Mapping[str, object] | None") -> "list[Mapping[str, object]]":
+    """metric の record (dict のみ)。判定用の tolerant 版 (data が配列でなければ空)。"""
     if metric is None:
         return []
     data = metric.get("data")
@@ -375,8 +416,24 @@ def _records(metric: "Mapping[str, object] | None") -> "list[Mapping[str, object
     return [record for record in data if isinstance(record, Mapping)]
 
 
+def _strict_records(metric: "Mapping[str, object] | None") -> "list[Mapping[str, object]]":
+    """集計用の record 取得。``data`` があるのに配列でなければ解釈不能として ValueError。"""
+    if metric is None:
+        return []
+    data = metric.get("data")
+    if data is None:
+        return []
+    if not isinstance(data, list):
+        raise ValueError(f"data が配列ではありません ({type(data).__name__})")
+    return [record for record in data if isinstance(record, Mapping)]
+
+
 #: 一般 metric の record 日時キー (先に見つかったものを使う)。
 _RECORD_DATE_KEYS: "tuple[str, ...]" = ("date", "startDate", "start")
+#: :func:`has_data_for` が「対象日の record か」を見るときの日時キー (どれか 1 つでも一致)。
+_ANY_DATE_KEYS: "tuple[str, ...]" = (
+    "date", "startDate", "start", "endDate", "end", "sleepStart", "sleepEnd",
+)
 
 
 def _records_on(
@@ -384,20 +441,37 @@ def _records_on(
 ) -> "list[tuple[datetime, Mapping[str, object]]]":
     """record 自身の offset の暦日が ``target_date`` の record を ``(datetime, record)`` で返す。
 
-    日時が無い / 解釈できない record は日付を判定できないので除外する。
+    日時が無い / 解釈できない個々の record は日付を判定できないので除外する。
+    ただし record があるのに **1 件も** 日時を解釈できない場合は書式変更とみなして
+    ValueError (黙って「対象日のデータなし」にしない)。
     """
+    records = _strict_records(metric)
     matched: "list[tuple[datetime, Mapping[str, object]]]" = []
-    for record in _records(metric):
+    dated = 0
+    for record in records:
         dt = _first_datetime(record, _RECORD_DATE_KEYS)
-        if dt is None or dt.date() != target_date:
+        if dt is None:
             continue
-        matched.append((dt, record))
+        dated += 1
+        if dt.date() == target_date:
+            matched.append((dt, record))
+    if records and dated == 0:
+        raise ValueError(f"record {len(records)} 件の日時をどれも解釈できません")
     return matched
+
+
+def _require_values(
+    records: "Sequence[object]", values: "Sequence[object]", what: str
+) -> None:
+    """対象日の record があるのに使える値が 1 つも無ければ書式変更とみなして ValueError。"""
+    if records and not values:
+        raise ValueError(f"対象日の record {len(records)} 件に数値の {what} がありません")
 
 
 def _sum_qty(records: "Sequence[tuple[datetime, Mapping[str, object]]]") -> "float | None":
     values = [_num(record.get("qty")) for _dt, record in records]
     present = [value for value in values if value is not None]
+    _require_values(records, present, "qty")
     if not present:
         return None
     return float(sum(present))
@@ -406,6 +480,7 @@ def _sum_qty(records: "Sequence[tuple[datetime, Mapping[str, object]]]") -> "flo
 def _guard(
     label: str,
     errors: "list[str]",
+    failed: "list[str]",
     log: logging.Logger,
     func: "Callable[[], _T]",
     default: "_T",
@@ -423,14 +498,8 @@ def _guard(
             label, type(exc).__name__, exc,
         )
         errors.append(f"{label}: {type(exc).__name__}: {exc}")
+        failed.append(label)
         return default
-
-
-def _warn_unit(log: logging.Logger, metric_name: str, units: object) -> None:
-    log.warning(
-        "metric %s の単位 %r は未対応のため集計しません (誤換算防止)",
-        metric_name, units,
-    )
 
 
 # ---------- metric 別の集計 ----------
@@ -448,16 +517,13 @@ def _converted_sum(
     target_date: date,
     table: "Mapping[str, float]",
     default_unit: str,
-    metric_name: str,
-    log: logging.Logger,
 ) -> "float | None":
     records = _records_on(metric, target_date)
     if not records or metric is None:
         return None
     factor = _unit_factor(metric.get("units"), table, default_unit)
     if factor is None:
-        _warn_unit(log, metric_name, metric.get("units"))
-        return None
+        raise _unit_error(metric.get("units"))
     total = _sum_qty(records)
     if total is None:
         return None
@@ -478,10 +544,11 @@ def _heart_rate(
       の総和 (Google Fit Heart Points 近似、:func:`ihealth.parser.parse_exercise_intensity_score`
       と同じ閾値)。心拍 record が 1 件以上あれば 0pt でも 0.0、無ければ None
     """
+    records = _records_on(metric, target_date)
     avgs: "list[float]" = []
     peaks: "list[float]" = []
     buckets: "dict[int, tuple[float, int]]" = {}
-    for dt, record in _records_on(metric, target_date):
+    for dt, record in records:
         avg = _first_num(record, ("Avg", "avg", "qty"))
         peak = _first_num(record, ("Max", "max", "qty", "Avg", "avg"))
         if avg is not None:
@@ -491,6 +558,7 @@ def _heart_rate(
             buckets[bucket] = (prev_sum + avg, prev_count + 1)
         if peak is not None:
             peaks.append(peak)
+    _require_values(records, avgs or peaks, "Avg / Max / qty")
 
     heart_rate_avg = float(statistics.mean(avgs)) if avgs else None
     heart_rate_max = float(max(peaks)) if peaks else None
@@ -510,8 +578,12 @@ def _heart_rate(
 
 
 def _mean_qty(metric: "Mapping[str, object] | None", target_date: date) -> "float | None":
-    values = [_num(record.get("qty")) for _dt, record in _records_on(metric, target_date)]
-    present = [value for value in values if value is not None]
+    records = _records_on(metric, target_date)
+    present = [
+        value for value in (_num(record.get("qty")) for _dt, record in records)
+        if value is not None
+    ]
+    _require_values(records, present, "qty")
     if not present:
         return None
     return float(statistics.mean(present))
@@ -520,43 +592,52 @@ def _mean_qty(metric: "Mapping[str, object] | None", target_date: date) -> "floa
 def _oxygen_saturation(
     metric: "Mapping[str, object] | None", target_date: date
 ) -> "float | None":
-    values = [
-        _first_num(record, ("qty", "Avg", "avg"))
-        for _dt, record in _records_on(metric, target_date)
+    """酸素飽和度の平均 (%)。
+
+    ``0.97`` のような fraction 表記の値は **値ごとに** % へ直す (SpO2 が 1% 以下は
+    生理的にありえないので、1.0 以下は fraction と断定できる)。fraction と % が
+    混在していても平均が壊れない。
+    """
+    records = _records_on(metric, target_date)
+    present = [
+        value for value in (
+            _first_num(record, ("qty", "Avg", "avg")) for _dt, record in records
+        )
+        if value is not None
     ]
-    present = [value for value in values if value is not None]
+    _require_values(records, present, "qty / Avg")
     if not present:
         return None
-    if all(value <= 1.0 for value in present):
-        # 0.97 のような fraction 表記で来た場合は % に直す
-        present = [value * 100.0 for value in present]
-    return float(statistics.mean(present))
+    return float(statistics.mean(
+        value * 100.0 if value <= 1.0 else value for value in present
+    ))
 
 
 def _latest_qty(
     metric: "Mapping[str, object] | None", target_date: date
 ) -> "float | None":
+    records = _records_on(metric, target_date)
     latest: "tuple[float, float] | None" = None
-    for dt, record in _records_on(metric, target_date):
+    for dt, record in records:
         value = _num(record.get("qty"))
         if value is None:
             continue
         key = _epoch(dt)
         if latest is None or key >= latest[0]:
             latest = (key, value)
+    _require_values(records, [] if latest is None else [latest[1]], "qty")
     return None if latest is None else latest[1]
 
 
 def _body_mass_kg(
-    metric: "Mapping[str, object] | None", target_date: date, log: logging.Logger
+    metric: "Mapping[str, object] | None", target_date: date
 ) -> "float | None":
     value = _latest_qty(metric, target_date)
     if value is None or metric is None:
         return None
     factor = _unit_factor(metric.get("units"), _MASS_TO_KG, "kg")
     if factor is None:
-        _warn_unit(log, METRIC_BODY_MASS, metric.get("units"))
-        return None
+        raise _unit_error(metric.get("units"))
     return value * factor
 
 
@@ -570,11 +651,11 @@ def _body_fat_percentage(
 
 
 def _source_count(record: "Mapping[str, object]") -> int:
-    """record の ``source`` に含まれるソース数 (``"Muse | Apple Watch"`` → 2、無ければ 1)。
+    """record の ``source`` に含まれるソース数 (``"App A | Watch B"`` → 2、無ければ 1)。
 
     aggregateData=true の分単位集計では、**同じ分に始まった** 複数ソースの
     セッションが 1 record にまとめられ、``source`` が ``|`` 区切りになる
-    (実データ: Muse の瞑想と Apple Watch のマインドフルネスを同時に記録した日)。
+    (例: 瞑想アプリと Apple Watch のマインドフルネスを同時に記録した日)。
     qty は合算されているので、回数だけソース数で数え直す。
     """
     source = record.get("source")
@@ -586,27 +667,29 @@ def _source_count(record: "Mapping[str, object]") -> int:
 
 
 def _mindful(
-    metric: "Mapping[str, object] | None", target_date: date, log: logging.Logger
+    metric: "Mapping[str, object] | None", target_date: date
 ) -> "tuple[int | None, float | None]":
     """``(mindful_sessions, mindful_minutes)``。
 
     * sessions = record 数。ただし分単位集計で複数ソースがまとめられた record
       (``source`` が ``|`` 区切り) はソース数で数える (:func:`_source_count`)
     * minutes = SUM(qty)。qty が無い record は ``start``/``end``
-      (``startDate``/``endDate``) の差で補う
+      (``startDate``/``endDate``) の差で補う。合計が 0 以下なら None (旧
+      :func:`ihealth.parser.parse_mindful_minutes` と同じ「測定なし」扱い)
+    * 未知の単位の qty / 時間を求められる record が 1 件も無い → ValueError
     """
     records = _records_on(metric, target_date)
     if not records or metric is None:
         return None, None
     factor = _unit_factor(metric.get("units"), _DURATION_TO_MIN, "min")
-    if factor is None:
-        _warn_unit(log, METRIC_MINDFUL, metric.get("units"))
     sessions = sum(_source_count(record) for _dt, record in records)
     total = 0.0
     measured = False
     for _dt, record in records:
         qty = _num(record.get("qty"))
-        if qty is not None and factor is not None:
+        if qty is not None:
+            if factor is None:
+                raise _unit_error(metric.get("units"))
             total += qty * factor
             measured = True
             continue
@@ -617,7 +700,11 @@ def _mindful(
             if seconds >= 0:
                 total += seconds / 60.0
                 measured = True
-    minutes = total if measured and total > 0 else None
+    if not measured:
+        raise ValueError(
+            f"対象日の record {len(records)} 件のどれからも瞑想時間を求められません"
+        )
+    minutes = total if total > 0 else None
     return sessions, minutes
 
 
@@ -638,11 +725,13 @@ def _is_asleep_stage(stage: str) -> bool:
     return any(word in lowered for word in _ASLEEP_STAGE_WORDS)
 
 
-def _sleep_hours_factor(metric: "Mapping[str, object] | None") -> "float | None":
-    """睡眠 metric の単位 → 時間への係数 (既定 hr)。"""
+def _sleep_hours_factor(metric: "Mapping[str, object] | None") -> float:
+    """睡眠 metric の単位 → 時間への係数 (既定 hr)。未知の単位は ValueError。"""
     units = metric.get("units") if metric is not None else None
     per_min = _unit_factor(units, _DURATION_TO_MIN, "hr")
-    return None if per_min is None else per_min / 60.0
+    if per_min is None:
+        raise _unit_error(units)
+    return per_min / 60.0
 
 
 def _aggregated_sleep_hours(
@@ -655,15 +744,18 @@ def _aggregated_sleep_hours(
     record の ``date`` の暦日 (無ければ ``sleepEnd`` の暦日) が target_date のもの。
     値は ``totalSleep`` (無い / 0 なら asleep+core+deep+rem)。複数ソース・重複が
     あっても最大の 1 つを採用する (加算すると二重計上)。0 以下は「測定なし」扱い。
+    どの record の日付も解釈できなければ ValueError。
     """
     best: "float | None" = None
+    anchored = 0
     for record in records:
-        if not _is_aggregated_sleep(record):
-            continue
         anchor = parse_hae_datetime(record.get("date"))
         if anchor is None:
             anchor = parse_hae_datetime(record.get("sleepEnd"))
-        if anchor is None or anchor.date() != target_date:
+        if anchor is None:
+            continue
+        anchored += 1
+        if anchor.date() != target_date:
             continue
         total = _num(record.get("totalSleep"))
         if total is None or total <= 0:
@@ -674,38 +766,53 @@ def _aggregated_sleep_hours(
             continue
         hours = total * hours_factor
         best = hours if best is None else max(best, hours)
+    if records and anchored == 0:
+        raise ValueError(
+            f"睡眠集計 record {len(records)} 件の日付 (date / sleepEnd) をどれも解釈できません"
+        )
     return best
 
 
-def _segment_sleep_hours(
-    records: "Sequence[Mapping[str, object]]",
-    target_date: date,
-    hours_factor: float,
-) -> "tuple[float | None, float | None]":
-    """非集計 segment から ``(sleep_hours, nap_hours)`` を求める。
+@dataclass(frozen=True)
+class _Segment:
+    """非集計睡眠 segment 1 件 (重複除去済み)。"""
 
-    1. asleep 系 stage (Asleep / Core / Deep / REM / Unspecified 等) の segment だけを
-       対象にし、(source, start, end, stage) が同じ重複 segment は 1 回だけ数える
-       (当日 + 前日 payload の結合で同じ segment が 2 回来ても二重計上しない)
-    2. source ごとに時刻順に並べ、間隔 :data:`_SLEEP_SESSION_GAP_SEC` 以内の segment を
-       1 セッションにまとめる (セッション時間 = segment の duration 合計、
-       duration は qty (時間) が無ければ end - start)
-    3. セッション終了 (end) の **現地暦日** が target_date で、end.hour が
-       [0,14) → 夜主睡眠、[14,20) → 昼寝。source ごとに合計し、最大の source を採用
-       (Apple Watch と AutoSleep 等の重複投入を二重計上しない)
+    begin: float        #: 開始 epoch 秒 (start が無ければ end)
+    end: datetime       #: 終了 (record 自身の offset を保持)
+    end_epoch: float
+    hours: float        #: asleep 系 stage の時間 (それ以外は 0)
+    asleep: bool
+
+
+@dataclass(frozen=True)
+class _SleepResult:
+    sleep_hours: "float | None" = None
+    nap_hours: "float | None" = None
+    mode: "str | None" = None
+    main_sleep_end: "datetime | None" = None
+    main_sleep_needs_prev: bool = False
+
+
+def _collect_segments(
+    entries: "Sequence[tuple[Mapping[str, object], float]]",
+) -> "dict[str, list[_Segment]]":
+    """``(record, 時間係数)`` から source 別の segment 一覧を作る。
+
+    (source, start, end, stage) が同じ重複 segment は 1 回だけ (当日 + 前日 payload の
+    結合で同じ segment が 2 回来ても二重計上しない)。asleep 系の duration は qty
+    (時間) が無ければ end - start。Awake / In Bed はセッションの間隔を埋めるためだけに
+    duration 0 で残す。segment があるのに 1 件も終了時刻を解釈できなければ ValueError。
     """
     seen: "set[tuple[str, float | None, float, str]]" = set()
-    by_source: "dict[str, list[tuple[float, datetime, float]]]" = {}
-    for record in records:
-        if not _is_sleep_segment(record):
-            continue
+    by_source: "dict[str, list[_Segment]]" = {}
+    with_end = 0
+    for record, hours_factor in entries:
         stage = str(record.get("value"))
-        if not _is_asleep_stage(stage):
-            continue
         start = _first_datetime(record, ("startDate", "start"))
         end = _first_datetime(record, ("endDate", "end"))
         if end is None:
             continue
+        with_end += 1
         source_raw = record.get("source")
         source = source_raw if isinstance(source_raw, str) else ""
         start_epoch = _epoch(start) if start is not None else None
@@ -714,74 +821,151 @@ def _segment_sleep_hours(
         if key in seen:
             continue
         seen.add(key)
-        qty = _num(record.get("qty"))
-        if qty is not None and qty >= 0:
-            hours = qty * hours_factor
-        elif start_epoch is not None and end_epoch >= start_epoch:
-            hours = (end_epoch - start_epoch) / 3600.0
-        else:
-            continue
-        begin_epoch = start_epoch if start_epoch is not None else end_epoch
-        by_source.setdefault(source, []).append((begin_epoch, end, hours))
-
-    sleep_by_source: "dict[str, float]" = {}
-    nap_by_source: "dict[str, float]" = {}
-    for source, segments in by_source.items():
-        segments.sort(key=lambda item: (item[0], _epoch(item[1])))
-        # session = [begin_epoch, end_datetime, hours]
-        sessions: "list[list]" = []
-        for begin_epoch, end, hours in segments:
-            if sessions and begin_epoch - _epoch(sessions[-1][1]) <= _SLEEP_SESSION_GAP_SEC:
-                if _epoch(end) > _epoch(sessions[-1][1]):
-                    sessions[-1][1] = end
-                sessions[-1][2] += hours
+        asleep = _is_asleep_stage(stage)
+        if asleep:
+            qty = _num(record.get("qty"))
+            if qty is not None and qty >= 0:
+                hours = qty * hours_factor
+            elif start_epoch is not None and end_epoch >= start_epoch:
+                hours = (end_epoch - start_epoch) / 3600.0
             else:
-                sessions.append([begin_epoch, end, hours])
-        for _begin, end, hours in sessions:
-            if end.date() != target_date:
                 continue
-            if _MAIN_SLEEP_END_HOURS[0] <= end.hour < _MAIN_SLEEP_END_HOURS[1]:
-                sleep_by_source[source] = sleep_by_source.get(source, 0.0) + hours
-            elif _NAP_END_HOURS[0] <= end.hour < _NAP_END_HOURS[1]:
-                nap_by_source[source] = nap_by_source.get(source, 0.0) + hours
+        elif start_epoch is None or end_epoch < start_epoch:
+            continue  # 区間の無い Awake / In Bed は間隔を埋められない
+        else:
+            hours = 0.0
+        begin = start_epoch if start_epoch is not None else end_epoch
+        by_source.setdefault(source, []).append(
+            _Segment(begin=begin, end=end, end_epoch=end_epoch, hours=hours, asleep=asleep)
+        )
+    if entries and with_end == 0:
+        raise ValueError(f"睡眠 segment {len(entries)} 件の終了時刻をどれも解釈できません")
+    return by_source
 
-    sleep_hours = max(sleep_by_source.values()) if sleep_by_source else None
-    nap_hours = max(nap_by_source.values()) if nap_by_source else None
-    return sleep_hours, nap_hours
+
+def _classify_segment(
+    segment: _Segment, later_asleep: "Sequence[_Segment]"
+) -> "tuple[str | None, date | None]":
+    """segment を ``("main" | "nap", 帰属日)`` に分類する (どちらでもなければ ``(None, None)``)。
+
+    * 終了の現地 hour が [0,14) → その日の夜主睡眠、[14,20) → その日の昼寝
+    * [20,24) (0 時前に終わる夜の前半) → 同じセッションの後続 asleep segment に
+      「翌日の [0,14) に終わるもの」があれば翌日の夜主睡眠へ繰り越す。無ければ
+      どの日にも数えない (旧 AutoSync の分類と同じく 20 時以降の短い睡眠は対象外)
+
+    後続の segment が先行 segment の分類を変えることは無い (長い朝寝の後の昼寝が
+    夜主睡眠ごと昼寝に化ける、などを起こさない)。
+    """
+    hour = segment.end.hour
+    if _MAIN_SLEEP_END_HOURS[0] <= hour < _MAIN_SLEEP_END_HOURS[1]:
+        return "main", segment.end.date()
+    if _NAP_END_HOURS[0] <= hour < _NAP_END_HOURS[1]:
+        return "nap", segment.end.date()
+    next_day = segment.end.date() + timedelta(days=1)
+    for other in later_asleep:
+        if (
+            other.end.date() == next_day
+            and _MAIN_SLEEP_END_HOURS[0] <= other.end.hour < _MAIN_SLEEP_END_HOURS[1]
+        ):
+            return "main", next_day
+    return None, None
+
+
+def _segment_sleep(
+    entries: "Sequence[tuple[Mapping[str, object], float]]",
+    target_date: date,
+) -> _SleepResult:
+    """非集計 segment から ``target_date`` の夜主睡眠 / 昼寝を求める。
+
+    1. :func:`_collect_segments` で重複除去 (source, start, end, stage)
+    2. source ごとに時刻順に並べ、間隔 :data:`SLEEP_SESSION_GAP_SEC` 以内 (Awake /
+       In Bed segment も含めて) を 1 セッションにまとめる
+    3. asleep 系 segment を **segment ごとの終了時刻** で分類する
+       (:func:`_classify_segment`。0 時前に終わる前半だけセッション経由で翌朝へ繰り越す)
+    4. source ごとに合計し、最大の source を採用 (Apple Watch と別アプリ等の
+       重複投入を二重計上しない)
+    """
+    by_source = _collect_segments(entries)
+    main_by_source: "dict[str, float]" = {}
+    nap_by_source: "dict[str, float]" = {}
+    main_end: "datetime | None" = None
+    needs_prev = False
+    for source, segments in by_source.items():
+        segments.sort(key=lambda item: (item.begin, item.end_epoch))
+        sessions: "list[list[_Segment]]" = []
+        session_end = 0.0
+        for segment in segments:
+            if sessions and segment.begin - session_end <= SLEEP_SESSION_GAP_SEC:
+                sessions[-1].append(segment)
+                session_end = max(session_end, segment.end_epoch)
+            else:
+                sessions.append([segment])
+                session_end = segment.end_epoch
+        for session in sessions:
+            session_start = min(item.begin for item in session)
+            asleep = [item for item in session if item.asleep]
+            for index, segment in enumerate(asleep):
+                kind, day = _classify_segment(segment, asleep[index + 1:])
+                if day != target_date:
+                    continue
+                if kind == "nap":
+                    nap_by_source[source] = nap_by_source.get(source, 0.0) + segment.hours
+                    continue
+                main_by_source[source] = main_by_source.get(source, 0.0) + segment.hours
+                if main_end is None or segment.end_epoch > _epoch(main_end):
+                    main_end = segment.end
+                midnight = datetime.combine(target_date, time.min, tzinfo=segment.end.tzinfo)
+                if session_start < _epoch(midnight) + SLEEP_SESSION_GAP_SEC:
+                    needs_prev = True
+
+    return _SleepResult(
+        sleep_hours=max(main_by_source.values()) if main_by_source else None,
+        nap_hours=max(nap_by_source.values()) if nap_by_source else None,
+        mode=SLEEP_MODE_SEGMENTS,
+        main_sleep_end=main_end,
+        main_sleep_needs_prev=needs_prev,
+    )
 
 
 def _sleep(
     metric: "Mapping[str, object] | None",
     prev_metric: "Mapping[str, object] | None",
     target_date: date,
-    log: logging.Logger,
-) -> "tuple[float | None, float | None, str | None]":
-    """``(sleep_hours, nap_hours, sleep_mode)``。
+) -> _SleepResult:
+    """睡眠を集計する。
 
-    * aggregated (aggregateSleep=true): sleep_hours = その日の totalSleep
-      (= 昼寝も含む総睡眠)。昼寝は分離できないので nap_hours = None
-      (HealthLoader が AutoSync .hae から補完する)
+    * aggregated (aggregateSleep=true): **当日 payload の** 集計レコードだけを使う。
+      sleep_hours = その日の totalSleep (= 昼寝も含む総睡眠)。昼寝は分離できないので
+      nap_hours = None (HealthLoader が AutoSync .hae から補完する)。前日 payload の
+      集計レコードは使わない (前日ファイルにある「翌日付」のレコードは書き出し時点の
+      途中経過で、当日ファイルの同じ日付のレコードが正)
     * segments: 当日 + 前日 payload の segment を結合して夜主睡眠 / 昼寝に分ける
+      (当日が segment 形式、または当日に睡眠レコードが無い日。設定切替日に前日が
+      aggregated でも当日の segment で集計できる)
     """
-    records = _records(metric) + _records(prev_metric)
-    if not records:
-        return None, None, None
-    hours_factor = _sleep_hours_factor(metric if metric is not None else prev_metric)
-    if hours_factor is None:
-        source_metric = metric if metric is not None else prev_metric
-        _warn_unit(log, METRIC_SLEEP, source_metric.get("units") if source_metric else None)
-        return None, None, None
+    own = _strict_records(metric)
+    prev = _records(prev_metric)
+    aggregated = [record for record in own if _is_aggregated_sleep(record)]
+    own_segments = [record for record in own if _is_sleep_segment(record)]
+    prev_segments = [record for record in prev if _is_sleep_segment(record)]
+    if own and not aggregated and not own_segments:
+        raise ValueError(f"睡眠 record {len(own)} 件の形式を解釈できません")
 
-    has_aggregated = any(_is_aggregated_sleep(record) for record in records)
-    has_segments = any(_is_sleep_segment(record) for record in records)
-    if has_aggregated:
-        total = _aggregated_sleep_hours(records, target_date, hours_factor)
-        if total is not None or not has_segments:
-            return total, None, SLEEP_MODE_AGGREGATED
-    if has_segments:
-        sleep_hours, nap_hours = _segment_sleep_hours(records, target_date, hours_factor)
-        return sleep_hours, nap_hours, SLEEP_MODE_SEGMENTS
-    return None, None, None
+    if aggregated:
+        total = _aggregated_sleep_hours(aggregated, target_date, _sleep_hours_factor(metric))
+        if total is not None or not own_segments:
+            return _SleepResult(sleep_hours=total, mode=SLEEP_MODE_AGGREGATED)
+    if not own_segments and not prev_segments:
+        return _SleepResult()
+
+    entries: "list[tuple[Mapping[str, object], float]]" = []
+    if own_segments:
+        own_factor = _sleep_hours_factor(metric)
+        entries.extend((record, own_factor) for record in own_segments)
+    if prev_segments:
+        prev_factor = _sleep_hours_factor(prev_metric)
+        entries.extend((record, prev_factor) for record in prev_segments)
+    return _segment_sleep(entries, target_date)
 
 
 # ---------- ワークアウト / アクティビティ詳細 ----------
@@ -795,30 +979,41 @@ def workout_name_ja(name: object) -> str:
     return WORKOUT_NAMES_JA.get(normalized, name.strip())
 
 
-def extract_workouts(
-    payload: "Mapping[str, object] | None", target_date: date
-) -> "list[tuple[str, float]]":
-    """``data.workouts`` から target_date の ``(日本語名, 分)`` を開始時刻順に返す。
-
-    同じ日本語名は合算する (旧 Google Fit 時代の「種目ごと 1 回」表記に合わせる)。
-    duration は ``duration`` (秒) を優先し、無ければ end - start。開始日時の現地暦日
-    (開始が無ければ終了) が target_date のものだけを対象にする。
-    """
+def _workouts_included(payload: "Mapping[str, object] | None") -> bool:
+    """payload に ``data.workouts`` (ワークアウトの出力欄) があるか。"""
     if not isinstance(payload, Mapping):
-        return []
+        return False
     data = payload.get("data")
+    return isinstance(data, Mapping) and data.get("workouts") is not None
+
+
+def _workouts(
+    payload: "Mapping[str, object] | None", target_date: date, *, strict: bool
+) -> "list[tuple[str, float]] | None":
+    """target_date のワークアウト。``data.workouts`` が無ければ ``None`` (= 有無が不明)。"""
+    data = payload.get("data") if isinstance(payload, Mapping) else None
     workouts = data.get("workouts") if isinstance(data, Mapping) else None
+    if workouts is None:
+        return None
     if not isinstance(workouts, list):
+        if strict:
+            raise ValueError(f"workouts が配列ではありません ({type(workouts).__name__})")
         return []
 
     items: "list[tuple[float, int, str, float]]" = []
+    candidates = 0
+    dated = 0
     for index, workout in enumerate(workouts):
         if not isinstance(workout, Mapping):
             continue
+        candidates += 1
         start = _first_datetime(workout, ("start", "startDate"))
         end = _first_datetime(workout, ("end", "endDate"))
         anchor = start if start is not None else end
-        if anchor is not None and anchor.date() != target_date:
+        if anchor is None:
+            continue  # 日付を判定できないワークアウトはどの日にも数えない
+        dated += 1
+        if anchor.date() != target_date:
             continue
         duration = _num(workout.get("duration"))
         if duration is not None and duration >= 0:
@@ -827,14 +1022,30 @@ def extract_workouts(
             minutes = (_epoch(end) - _epoch(start)) / 60.0
         else:
             continue
-        order = _epoch(anchor) if anchor is not None else math.inf
-        items.append((order, index, workout_name_ja(workout.get("name")), minutes))
+        items.append((_epoch(anchor), index, workout_name_ja(workout.get("name")), minutes))
+    if strict and candidates and dated == 0:
+        raise ValueError(f"ワークアウト {candidates} 件の日時をどれも解釈できません")
 
     items.sort(key=lambda item: (item[0], item[1]))
     totals: "dict[str, float]" = {}
     for _order, _index, name, minutes in items:
         totals[name] = totals.get(name, 0.0) + minutes
     return list(totals.items())
+
+
+def extract_workouts(
+    payload: "Mapping[str, object] | None", target_date: date
+) -> "list[tuple[str, float]]":
+    """``data.workouts`` から target_date の ``(日本語名, 分)`` を開始時刻順に返す。
+
+    同じ日本語名は合算する (旧 Google Fit 時代の「種目ごと 1 回」表記に合わせる)。
+    duration は ``duration`` (秒) を優先し、無ければ end - start。開始日時の現地暦日
+    (開始が無ければ終了) が target_date のものだけを対象にする。日時の無い
+    ワークアウトはどの日にも数えない。``data.workouts`` が無ければ空 list
+    (有無が不明なことを区別したいときは :func:`parse_automation_day_detailed` の
+    ``workouts_included`` を見る)。
+    """
+    return _workouts(payload, target_date, strict=False) or []
 
 
 def build_activity_detail(
@@ -862,19 +1073,61 @@ def build_activity_detail(
 
 
 def needs_prev_payload(payload: "Mapping[str, object] | None") -> bool:
-    """前日 payload の併読が必要か (= 睡眠が非集計 segment 形式か)。
+    """前日 payload の併読が必要か (= 当日の睡眠が aggregateSleep の集計レコードでないか)。
 
     aggregateSleep=true の集計レコードは「その日のファイル」に完結しているので
     前日ファイルは不要 (iCloud dataless の前日ファイルを無駄に materialize しない)。
-    segment 形式は前夜の segment が前日ファイルに入るため併読が必要。
+    それ以外 (非集計 segment / 当日ファイルに睡眠レコードが無い) は、前夜の
+    segment が前日ファイルにしか無い可能性があるので併読が必要。
     """
     metric = _metrics_by_name(payload, None).get(METRIC_SLEEP)
-    return any(_is_sleep_segment(record) for record in _records(metric))
+    return not any(_is_aggregated_sleep(record) for record in _records(metric))
 
 
 def has_metrics(payload: "Mapping[str, object] | None") -> bool:
     """payload に名前付き metric が 1 件以上あるか。"""
     return bool(_metrics_by_name(payload, None))
+
+
+def has_data_for(payload: "Mapping[str, object] | None", target_date: date) -> bool:
+    """payload の metric に ``target_date`` の record が含まれうるか。
+
+    ``False`` を返すのは「名前付き metric の record が無い」か「全 record の日時を
+    解釈でき、どれも target_date ではない」ときだけ。解釈できない metric / record が
+    あれば ``True`` (集計側で書式エラーとして報告させる)。同じ日付の候補ファイルが
+    複数あるとき、他の日の record しか持たないファイル (前日付の手首皮膚温だけ等)
+    で、対象日のデータを持つ別の候補を隠さないための判定。ワークアウトだけの
+    ファイルは対象外 (metric を持つ候補を優先する)。
+    """
+    if not isinstance(payload, Mapping):
+        return False
+    data = payload.get("data")
+    if not isinstance(data, Mapping):
+        return False
+    metrics = data.get("metrics")
+    if not isinstance(metrics, list):
+        return False
+    for metric in metrics:
+        if not isinstance(metric, Mapping):
+            continue
+        name = metric.get("name")
+        if not isinstance(name, str) or not name.strip():
+            continue
+        records = metric.get("data")
+        if records is None:
+            continue
+        if not isinstance(records, list):
+            return True
+        for record in records:
+            if not isinstance(record, Mapping):
+                continue
+            stamps = [parse_hae_datetime(record.get(key)) for key in _ANY_DATE_KEYS]
+            parsed = [stamp for stamp in stamps if stamp is not None]
+            if not parsed:
+                return True
+            if any(stamp.date() == target_date for stamp in parsed):
+                return True
+    return False
 
 
 def parse_automation_day_detailed(
@@ -893,80 +1146,74 @@ def parse_automation_day_detailed(
     metrics = _metrics_by_name(payload, log)
     prev_metrics = _metrics_by_name(prev_payload, log) if prev_payload is not None else {}
     errors: "list[str]" = []
+    failed: "list[str]" = []
     values: "dict[str, object]" = {name: None for name in HEALTH_FIELDS}
 
     def metric(name: str) -> "Mapping[str, object] | None":
         return metrics.get(name)
 
-    values["step_count"] = _guard(
-        METRIC_STEP_COUNT, errors, log,
-        lambda: _step_count(metric(METRIC_STEP_COUNT), target_date), None,
+    def guard(label: str, func: "Callable[[], _T]", default: "_T") -> "_T":
+        return _guard(label, errors, failed, log, func, default)
+
+    values["step_count"] = guard(
+        METRIC_STEP_COUNT, lambda: _step_count(metric(METRIC_STEP_COUNT), target_date), None,
     )
-    values["distance_km"] = _guard(
-        METRIC_DISTANCE, errors, log,
-        lambda: _converted_sum(
-            metric(METRIC_DISTANCE), target_date, _DISTANCE_TO_KM, "km",
-            METRIC_DISTANCE, log,
-        ),
+    values["distance_km"] = guard(
+        METRIC_DISTANCE,
+        lambda: _converted_sum(metric(METRIC_DISTANCE), target_date, _DISTANCE_TO_KM, "km"),
         None,
     )
-    values["active_energy_kcal"] = _guard(
-        METRIC_ACTIVE_ENERGY, errors, log,
+    values["active_energy_kcal"] = guard(
+        METRIC_ACTIVE_ENERGY,
         lambda: _converted_sum(
             metric(METRIC_ACTIVE_ENERGY), target_date, _ENERGY_TO_KCAL, "kcal",
-            METRIC_ACTIVE_ENERGY, log,
         ),
         None,
     )
-    values["exercise_minutes"] = _guard(
-        METRIC_EXERCISE_TIME, errors, log,
+    values["exercise_minutes"] = guard(
+        METRIC_EXERCISE_TIME,
         lambda: _converted_sum(
             metric(METRIC_EXERCISE_TIME), target_date, _DURATION_TO_MIN, "min",
-            METRIC_EXERCISE_TIME, log,
         ),
         None,
     )
-    hr_avg, hr_max, intensity = _guard(
-        METRIC_HEART_RATE, errors, log,
+    hr_avg, hr_max, intensity = guard(
+        METRIC_HEART_RATE,
         lambda: _heart_rate(metric(METRIC_HEART_RATE), target_date, ctx.max_heart_rate),
         (None, None, None),
     )
     values["exercise_intensity_score"] = intensity
     values["heart_rate_avg"] = hr_avg
     values["heart_rate_max"] = hr_max
-    values["heart_rate_resting"] = _guard(
-        METRIC_RESTING_HEART_RATE, errors, log,
+    values["heart_rate_resting"] = guard(
+        METRIC_RESTING_HEART_RATE,
         lambda: _mean_qty(metric(METRIC_RESTING_HEART_RATE), target_date), None,
     )
-    values["oxygen_saturation"] = _guard(
-        METRIC_OXYGEN_SATURATION, errors, log,
+    values["oxygen_saturation"] = guard(
+        METRIC_OXYGEN_SATURATION,
         lambda: _oxygen_saturation(metric(METRIC_OXYGEN_SATURATION), target_date), None,
     )
-    sleep_hours, nap_hours, sleep_mode = _guard(
-        METRIC_SLEEP, errors, log,
-        lambda: _sleep(
-            metric(METRIC_SLEEP), prev_metrics.get(METRIC_SLEEP), target_date, log,
-        ),
-        (None, None, None),
+    sleep = guard(
+        METRIC_SLEEP,
+        lambda: _sleep(metric(METRIC_SLEEP), prev_metrics.get(METRIC_SLEEP), target_date),
+        _SleepResult(),
     )
-    values["sleep_hours"] = sleep_hours
-    values["nap_hours"] = nap_hours
-    mindful_sessions, mindful_minutes = _guard(
-        METRIC_MINDFUL, errors, log,
-        lambda: _mindful(metric(METRIC_MINDFUL), target_date, log), (None, None),
+    values["sleep_hours"] = sleep.sleep_hours
+    values["nap_hours"] = sleep.nap_hours
+    mindful_sessions, mindful_minutes = guard(
+        METRIC_MINDFUL, lambda: _mindful(metric(METRIC_MINDFUL), target_date), (None, None),
     )
     values["mindful_sessions"] = mindful_sessions
     values["mindful_minutes"] = mindful_minutes
-    values["body_mass_kg"] = _guard(
-        METRIC_BODY_MASS, errors, log,
-        lambda: _body_mass_kg(metric(METRIC_BODY_MASS), target_date, log), None,
+    values["body_mass_kg"] = guard(
+        METRIC_BODY_MASS, lambda: _body_mass_kg(metric(METRIC_BODY_MASS), target_date), None,
     )
-    values["body_fat_percentage"] = _guard(
-        METRIC_BODY_FAT, errors, log,
+    values["body_fat_percentage"] = guard(
+        METRIC_BODY_FAT,
         lambda: _body_fat_percentage(metric(METRIC_BODY_FAT), target_date), None,
     )
-    workouts = _guard(
-        "workouts", errors, log, lambda: extract_workouts(payload, target_date), [],
+    workouts: "list[tuple[str, float]] | None" = guard(
+        WORKOUTS_LABEL, lambda: _workouts(payload, target_date, strict=True), None,
     )
 
     cleaned = drop_invalid_fields(values, logger=log)
@@ -979,7 +1226,10 @@ def parse_automation_day_detailed(
     health = _rebuild_with_validation_drop(target_date, cleaned)
 
     present = bool(metrics)
-    if not present:
+    mindful_unknown = METRIC_MINDFUL in failed or "mindful_minutes" in dropped
+    if not present or workouts is None or mindful_unknown:
+        # metric が無い / ワークアウトを出力しない設定 (data.workouts が無い) /
+        # 瞑想やワークアウトを解釈できなかった → 「なし」「瞑想N分」とは言えない
         activity_detail: "str | None" = None
     elif all(cleaned.get(name) is None for name in HEALTH_FIELDS) and not workouts:
         # metric はあるが対象日のデータが 1 つも無い → 「活動なし」とは言えない
@@ -991,9 +1241,14 @@ def parse_automation_day_detailed(
         health=health,
         activity_detail=activity_detail,
         has_metrics=present,
-        sleep_mode=sleep_mode,
+        sleep_mode=sleep.mode,
         errors=tuple(errors),
         dropped_fields=dropped,
+        failed_metrics=tuple(failed),
+        workouts=None if workouts is None else tuple(workouts),
+        main_sleep_end=sleep.main_sleep_end,
+        main_sleep_needs_prev=sleep.main_sleep_needs_prev,
+        workouts_included=_workouts_included(payload),
     )
 
 

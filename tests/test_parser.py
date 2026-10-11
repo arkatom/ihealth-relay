@@ -421,20 +421,20 @@ class TestSleepHours(unittest.TestCase):
         self.assertAlmostEqual(parse_sleep_hours(payload, self.CTX), 4.5)
 
     def test_cross_midnight_record_in_both_files_is_counted_once(self):
-        # 実データ (2026-10 検証): AutoSync の sleep_analysis/{日付}.hae は「その日に
-        # 重なる」レコードを含むので、前日 21:54 → 当日 01:17 のセッションは前日
-        # ファイルと当日ファイルの両方に同一レコードとして入る。結合 payload で
-        # 二重計上しない (旧実装は 3.4 + 3.4 + 1.8 = 8.6h と過大になっていた)。
+        # AutoSync の sleep_analysis/{日付}.hae は「その日に重なる」レコードを含むので、
+        # 前日 22:00 → 当日 01:00 のセッションは前日ファイルと当日ファイルの両方に
+        # 同一レコードとして入る。結合 payload で二重計上しない
+        # (重複除去が無いと 3.0 + 3.0 + 2.0 = 8.0h と過大になる)。値は合成。
         start = _mac_seconds_at_jst(2026, 4, 21, 22)
         end = _mac_seconds_at_jst(2026, 4, 22, 1)
         src = [{"identifier": "com.example.sleeptracker"}]
-        shared = {"asleep": 3.4, "start": start, "end": end, "sources": src}
+        shared = {"asleep": 3.0, "start": start, "end": end, "sources": src}
         today = [dict(shared),
-                 {"asleep": 1.8, "start": end + 1800,
+                 {"asleep": 2.0, "start": end + 1800,
                   "end": _mac_seconds_at_jst(2026, 4, 22, 4), "sources": src}]
         prev = [dict(shared)]
         payload = {"data": [*today, *prev]}
-        self.assertAlmostEqual(parse_sleep_hours(payload, self.CTX), 5.2)
+        self.assertAlmostEqual(parse_sleep_hours(payload, self.CTX), 5.0)
 
     def test_distinct_records_with_same_end_are_both_counted(self):
         # start が違えば別レコード (重複除去の対象外)

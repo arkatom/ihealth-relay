@@ -16,9 +16,11 @@ AutoSync は 1 メトリクス / 1 日単位にファイルを分割して吐き
 
 from __future__ import annotations
 
+import json
 import logging
 import math
 import os
+import struct
 import subprocess
 import time
 from dataclasses import dataclass, field
@@ -306,6 +308,14 @@ def decompress_hae(src: Path, dst: Path) -> None:
 
     dst.parent.mkdir(parents=True, exist_ok=True)
     try:
+        with open(src, "rb") as handle:
+            magic = handle.read(len(_HAE1_MAGIC))
+    except OSError as exc:
+        raise SourceError(f".hae を開けません: src={src}: {exc}") from exc
+    if magic == _HAE1_MAGIC:
+        _decompress_hae1(src, dst)
+        return
+    try:
         result = subprocess.run(
             [
                 str(COMPRESSION_TOOL),
@@ -342,6 +352,89 @@ def decompress_hae(src: Path, dst: Path) -> None:
             f"({size / 1024 / 1024:.1f} MB > "
             f"{_MAX_DECODED_SIZE_BYTES / 1024 / 1024:.0f} MB): src={src}"
         )
+
+
+#: AutoSync が追記型で書く .hae のコンテナ形式 (2026-10 実データで確認)。
+#: ``b"HAE1"`` の後に ``[uint32 big-endian 長さ][LZFSE stream]`` が繰り返され、
+#: 各 stream は 1 時間ぶんの ``{"data": [...], "metric": ..., "date": ...}`` JSON。
+#: ``compression_tool -i`` は先頭の magic を解釈できず
+#: ``decode failed (buffer mode ...)`` で失敗するので、segment ごとに解凍して
+#: ``data`` を連結した 1 つの JSON にする。
+_HAE1_MAGIC = b"HAE1"
+
+
+def _decompress_hae1(src: Path, dst: Path) -> None:
+    """HAE1 コンテナの .hae を segment ごとに LZFSE 解凍し、data を連結して書き出す。"""
+    try:
+        raw = src.read_bytes()
+    except OSError as exc:
+        raise SourceError(f".hae の読み込みに失敗: src={src}: {exc}") from exc
+    position = len(_HAE1_MAGIC)
+    merged: "dict | None" = None
+    records: "list" = []
+    total = 0
+    while position < len(raw):
+        if position + 4 > len(raw):
+            raise SourceError(f"HAE1 の segment 長が途中で切れています: src={src}")
+        (length,) = struct.unpack(">I", raw[position:position + 4])
+        position += 4
+        segment = raw[position:position + length]
+        position += length
+        if len(segment) != length:
+            raise SourceError(f"HAE1 の segment が途中で切れています: src={src}")
+        try:
+            result = subprocess.run(
+                [str(COMPRESSION_TOOL), "-decode", "-a", "lzfse"],
+                input=segment,
+                capture_output=True,
+                timeout=_DECOMPRESS_TIMEOUT_SEC,
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise SourceError(
+                f"compression_tool がタイムアウトしました (HAE1 segment): src={src}"
+            ) from exc
+        if result.returncode != 0:
+            stderr = result.stderr.decode("utf-8", errors="replace").strip()
+            raise SourceError(
+                f"compression_tool が失敗しました (HAE1 segment, "
+                f"returncode={result.returncode}): src={src} stderr={stderr!r}"
+            )
+        total += len(result.stdout)
+        if total > _MAX_DECODED_SIZE_BYTES:
+            raise SourceError(f"解凍後サイズが上限を超えました (HAE1): src={src}")
+        try:
+            document = json.loads(result.stdout)
+        except (ValueError, RecursionError) as exc:
+            # UnicodeDecodeError / JSONDecodeError は ValueError のサブクラス
+            raise SourceError(f"HAE1 segment が JSON ではありません: src={src}: {exc}") from exc
+        if not isinstance(document, dict):
+            raise SourceError(f"HAE1 segment の構造が不正です: src={src}")
+        if merged is None:
+            merged = {key: value for key, value in document.items() if key != "data"}
+        data = document.get("data")
+        if data is None:
+            continue
+        if not isinstance(data, list):
+            # 黙って捨てると「その時間帯のデータが無い」と区別できず過少集計になる
+            raise SourceError(
+                f"HAE1 segment の data が配列ではありません "
+                f"({type(data).__name__}): src={src}"
+            )
+        records.extend(data)
+    if merged is None:
+        raise SourceError(f"HAE1 に segment がありません: src={src}")
+    merged["data"] = records
+    # 一時ファイルに書いて置換 (途中で失敗しても壊れた dst を残さない)
+    tmp = dst.with_name(dst.name + ".tmp")
+    try:
+        tmp.write_text(json.dumps(merged, ensure_ascii=False), encoding="utf-8")
+        os.replace(tmp, dst)
+    except OSError as exc:
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+        raise SourceError(f"HAE1 の解凍結果を書き込めません: dst={dst}: {exc}") from exc
 
 
 def _hae_filename(target_date: date) -> str:

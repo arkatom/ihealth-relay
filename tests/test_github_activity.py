@@ -1,9 +1,10 @@
 """github_activity.py のテスト。
 
 ネットワークには一切出ない: ``GitHubClient`` に ``opener`` を注入し、本モジュールの
-GraphQL クエリ 3 種 (IhealthViewer / IhealthOwnerRepos / IhealthRepoActivity) だけを
-解釈する最小エミュレータ :class:`FakeGitHub` が応答する。``gh`` も ``runner`` 注入で
-実行しない。データはすべて合成 (実在の repo 名・token・活動は使わない)。
+GraphQL クエリ 4 種 (IhealthViewer / IhealthViewerLogin / IhealthOwnerRepos /
+IhealthRepoActivity) だけを解釈する最小エミュレータ :class:`FakeGitHub` が応答する。
+``gh`` も ``runner`` 注入で実行しない。データはすべて合成 (実在の repo 名・token・活動は
+使わない)。
 """
 
 from __future__ import annotations
@@ -19,7 +20,7 @@ import unittest
 import urllib.error
 from datetime import date, datetime, timezone
 from email.message import Message
-from typing import Iterator, Sequence
+from typing import Callable, Iterator, Sequence
 
 from ihealth.github_activity import (
     JST,
@@ -106,6 +107,7 @@ class FakeGitHub:
         self.repo_errors: "dict[str, list[dict]]" = {}
         self.owner_errors: "dict[str, list[dict]]" = {}
         self.viewer_exception: "Exception | None" = None
+        self.viewer_login_exception: "Exception | None" = None
         self.calls: "list[tuple[str, dict]]" = []
         self.queries: "list[str]" = []
 
@@ -192,6 +194,10 @@ class FakeGitHub:
         self.queries.append(query)
         if op == "IhealthViewer":
             body = self._viewer(variables)
+        elif op == "IhealthViewerLogin":
+            if self.viewer_login_exception is not None:
+                raise self.viewer_login_exception
+            body = {"data": {"rateLimit": self._rate(), "viewer": {"login": self.viewer}}}
         elif op == "IhealthOwnerRepos":
             body = self._owner_repos(variables)
         elif op == "IhealthRepoActivity":
@@ -350,6 +356,44 @@ class ScriptedOpener:
 
 
 OK_RESPONSE = {"data": {"rateLimit": {"cost": 3, "remaining": 4000}, "viewer": {"login": "x"}}}
+
+#: GitHub がクエリ timeout 時に返す GraphQL エラー (実際の文面に準拠した合成値)
+TIMEOUT_GRAPHQL_ERROR = {
+    "data": None,
+    "errors": [{
+        "message": "Something went wrong while executing your query. This may be the "
+                   "result of a timeout, or it could be a GitHub bug.",
+    }],
+}
+
+
+class FaultInjector:
+    """:class:`FakeGitHub` の opener を包み、RepoActivity request に障害を差し込む。
+
+    ``fault(variables)`` が Exception を返せば raise、dict を返せばその JSON を応答、
+    ``None`` なら FakeGitHub が通常応答する。失敗した試行も含めて RepoActivity の
+    variables を ``repo_calls`` に記録する。
+    """
+
+    def __init__(self, fake: FakeGitHub, fault: "Callable[[dict], object]") -> None:
+        self.fake = fake
+        self.fault = fault
+        self.repo_calls: "list[dict]" = []
+
+    def __call__(self, req: object, timeout: float) -> bytes:
+        payload = json.loads(req.data.decode("utf-8"))  # type: ignore[attr-defined]
+        if "query IhealthRepoActivity" in payload["query"]:
+            variables = dict(payload.get("variables") or {})
+            self.repo_calls.append(variables)
+            injected = self.fault(variables)
+            if isinstance(injected, Exception):
+                raise injected
+            if isinstance(injected, dict):
+                return json.dumps(injected).encode("utf-8")
+        return self.fake.opener(req, timeout)
+
+    def history_firsts(self) -> "list[int]":
+        return [v["historyFirst"] for v in self.repo_calls]
 
 
 class _ListHandler(logging.Handler):
@@ -595,8 +639,67 @@ class TestGitHubClient(unittest.TestCase):
         with self.assertRaises(GitHubError) as cm:
             client.graphql("query Q { x }")
         self.assertEqual(cm.exception.status, 502)
+        self.assertTrue(cm.exception.server_timeout)
         self.assertEqual(len(sleeps), 3)
         self.assertEqual(client.request_count, 4)
+
+    def test_server_timeout_flag_by_failure_kind(self) -> None:
+        cases: "list[tuple[str, Callable[[], object], bool]]" = [
+            ("http 504", lambda: http_error(504), True),
+            ("http 502", lambda: http_error(502), True),
+            ("http 503", lambda: http_error(503), False),
+            ("http 500", lambda: http_error(500), False),
+            ("graphql timeout", lambda: TIMEOUT_GRAPHQL_ERROR, True),
+            ("connection", lambda: urllib.error.URLError("down"), False),
+            ("not found", lambda: {"errors": [{"type": "NOT_FOUND", "message": "nope"}]}, False),
+            ("bad credentials", lambda: http_error(401, {"message": "Bad credentials"}), False),
+        ]
+        for label, make, expected in cases:
+            with self.subTest(label):
+                client = make_client(ScriptedOpener(*[make() for _ in range(4)]))
+                with self.assertRaises(GitHubError) as cm:
+                    client.graphql("query Q { x }")
+                self.assertIs(cm.exception.server_timeout, expected)
+
+    def test_timeout_retries_limits_only_github_side_timeouts(self) -> None:
+        # 502 は timeout_retries=0 なら再送せず server_timeout で即失敗 (呼び出し側が縮小する)
+        sleeps: "list[float]" = []
+        client = make_client(ScriptedOpener(http_error(502), OK_RESPONSE), sleeps=sleeps)
+        with self.assertRaises(GitHubError) as cm:
+            client.graphql("query Q { x }", timeout_retries=0)
+        self.assertTrue(cm.exception.server_timeout)
+        self.assertEqual((client.request_count, sleeps), (1, []))
+
+        # GraphQL の timeout 系エラーも同じ扱い
+        client = make_client(ScriptedOpener(TIMEOUT_GRAPHQL_ERROR, OK_RESPONSE))
+        with self.assertRaises(GitHubError) as cm:
+            client.graphql("query Q { x }", timeout_retries=0)
+        self.assertTrue(cm.exception.server_timeout)
+        self.assertEqual(client.request_count, 1)
+
+        # timeout_retries=1 → 1 回だけ再送
+        client = make_client(ScriptedOpener(http_error(504), http_error(504), OK_RESPONSE))
+        with self.assertRaises(GitHubError):
+            client.graphql("query Q { x }", timeout_retries=1)
+        self.assertEqual(client.request_count, 2)
+
+        # 回帰: 接続エラー・503・レート制限の再試行は timeout_retries で減らさない
+        # (以前の server_retries は全種の失敗を数えていたので、縮小可能な request
+        # = 各 repo の初回 request で通常の接続エラー再試行が 1 回に減っていた)
+        sleeps = []
+        client = make_client(
+            ScriptedOpener(
+                urllib.error.URLError("reset"), http_error(503),
+                http_error(429, None, {"Retry-After": "5"}), OK_RESPONSE,
+            ),
+            sleeps=sleeps,
+        )
+        self.assertEqual(
+            client.graphql("query Q { x }", timeout_retries=0)["viewer"]["login"], "x",
+        )
+        self.assertEqual(client.request_count, 4)
+        self.assertEqual(len(sleeps), 3)
+        self.assertEqual(sleeps[2], 5.0)
 
     def test_url_error_is_retried(self) -> None:
         opener = ScriptedOpener(urllib.error.URLError("connection refused"), OK_RESPONSE)
@@ -716,7 +819,7 @@ class TestRepoEnumeration(unittest.TestCase):
         self.assertTrue(any("repositoryOwner" in q and "ownerAffiliations: [OWNER]" in q
                             for q in fake.queries))
         self.assertEqual(
-            [item.repo for item in activity.days[D18]], ["beta", "alpha"],  # pushedAt 降順
+            [item.repo for item in activity.days[D18]], ["beta", "alpha"],  # 最終イベント降順
         )
         self.assertEqual(activity.repos_listed, 2)
         self.assertEqual(activity.repos_scanned, 2)
@@ -767,6 +870,104 @@ class TestRepoEnumeration(unittest.TestCase):
         self.assertEqual(activity.status, "partial")
         self.assertTrue(any("no-such-owner" in e for e in activity.errors))
         self.assertEqual(fake.scanned(), ["octo-user/alpha"])
+
+
+class TestOwnerAndExcludeArguments(unittest.TestCase):
+    """``owners`` / ``exclude_repos`` は list のほかカンマ区切りの str (.env の値そのまま)
+    も受け付ける。回帰: str を Sequence として 1 文字ずつ owner / 除外名にしていた。"""
+
+    def _fake(self) -> FakeGitHub:
+        fake = FakeGitHub(viewer="octo-user", orgs=["octo-org"])
+        alpha = fake.add_repo("octo-user", "alpha", pushed_at=at_jst(2026, 7, 18, 9))
+        beta = fake.add_repo("octo-org", "beta", pushed_at=at_jst(2026, 7, 18, 10))
+        fake.add_pr(alpha, 1, at_jst(2026, 7, 18, 9))
+        fake.add_pr(beta, 2, at_jst(2026, 7, 18, 10))
+        return fake
+
+    def test_single_owner_as_str(self) -> None:
+        fake = self._fake()
+        activity = collect(fake, D18, D18, owners="octo-org")
+        self.assertTrue(activity.complete, activity.errors)
+        self.assertEqual(fake.ops("IhealthViewer"), [])
+        self.assertEqual([v["login"] for v in fake.ops("IhealthOwnerRepos")], ["octo-org"])
+        self.assertEqual(fake.scanned(), ["octo-org/beta"])
+        self.assertEqual([(i.repo, i.number) for i in activity.days[D18]], [("beta", 2)])
+
+    def test_comma_separated_owners_with_spaces_and_blanks(self) -> None:
+        fake = self._fake()
+        activity = collect(fake, D18, D18, owners=" octo-user , OCTO-ORG ,, octo-org,")
+        self.assertTrue(activity.complete, activity.errors)
+        self.assertEqual(
+            [v["login"] for v in fake.ops("IhealthOwnerRepos")], ["octo-user", "OCTO-ORG"],
+        )
+        self.assertEqual(sorted(fake.scanned()), ["octo-org/beta", "octo-user/alpha"])
+
+    def test_list_elements_are_split_on_commas_too(self) -> None:
+        fake = self._fake()
+        collect(fake, D18, D18, owners=["octo-user,octo-org"])
+        self.assertEqual(
+            [v["login"] for v in fake.ops("IhealthOwnerRepos")], ["octo-user", "octo-org"],
+        )
+
+    def test_blank_owner_str_means_viewer_and_orgs(self) -> None:
+        fake = self._fake()
+        activity = collect(fake, D18, D18, owners=" , ")
+        self.assertTrue(activity.complete)
+        self.assertEqual(len(fake.ops("IhealthViewer")), 1)
+        self.assertEqual(sorted(fake.scanned()), ["octo-org/beta", "octo-user/alpha"])
+
+    def test_exclude_repos_as_str(self) -> None:
+        fake = self._fake()
+        activity = collect(fake, D18, D18, exclude_repos="octo-org/beta")
+        self.assertTrue(activity.complete)
+        self.assertEqual(fake.scanned(), ["octo-user/alpha"])
+        self.assertEqual([(i.repo, i.number) for i in activity.days[D18]], [("alpha", 1)])
+
+    def test_comma_separated_exclude_repos(self) -> None:
+        fake = self._fake()
+        activity = collect(fake, D18, D18, exclude_repos=" Octo-Org/BETA , octo-user/alpha ")
+        self.assertTrue(activity.complete)
+        self.assertEqual(fake.scanned(), [])
+        self.assertEqual(activity.text_for(D18), "該当なし")
+
+    def test_invalid_owner_raises_before_any_request(self) -> None:
+        for bad in ("octo-org/beta", "https://github.com/octo-org", "octo org", "-octo",
+                    "@octo-user", "x" * 40):
+            with self.subTest(owner=bad):
+                fake = self._fake()
+                with self.assertRaises(ValueError):
+                    collect(fake, D18, D18, owners=f"octo-user,{bad}")
+                self.assertEqual(fake.calls, [])
+
+    def test_invalid_exclude_raises_before_any_request(self) -> None:
+        for bad in ("beta", "octo-org/", "/beta", "octo-org/beta/extra", "octo org/beta",
+                    "octo-org/be ta"):
+            with self.subTest(exclude=bad):
+                fake = self._fake()
+                with self.assertRaises(ValueError):
+                    collect(fake, D18, D18, exclude_repos=["octo-user/alpha", bad])
+                self.assertEqual(fake.calls, [])
+
+    def test_non_str_entry_raises_type_error(self) -> None:
+        fake = self._fake()
+        with self.assertRaises(TypeError):
+            collect(fake, D18, D18, owners=["octo-org", 42])
+        with self.assertRaises(TypeError):
+            collect(fake, D18, D18, exclude_repos=[None])
+        self.assertEqual(fake.calls, [])
+
+    def test_valid_login_and_repo_name_shapes_are_accepted(self) -> None:
+        fake = FakeGitHub(viewer="octo-user", orgs=[])
+        activity = collect(
+            fake, D18, D18,
+            owners="a,Octo-User,octo_shortcode,x" + "y" * 38,
+            exclude_repos="octo-user/.github,octo-user/my_repo.v2,octo-user/A-b",
+        )
+        self.assertEqual(
+            [v["login"] for v in fake.ops("IhealthOwnerRepos")],
+            ["a", "Octo-User", "octo_shortcode", "x" + "y" * 38],
+        )
+        self.assertFalse(activity.complete)  # Fake に存在しない owner は不完全扱い
 
 
 class TestWindowBoundaries(unittest.TestCase):
@@ -905,30 +1106,89 @@ class TestCommitRules(unittest.TestCase):
 
 
 class TestOrdering(unittest.TestCase):
-    def test_issue_pr_commit_order_by_repo_push_order_and_number_desc(self) -> None:
+    """日内の並び: 種別 → repo (その日の最終イベント時刻の降順, 同時刻は owner/name 昇順)
+    → number 降順。現在の pushedAt には依存しない (lookback 再実行で過去日が揺れない)。"""
+
+    def test_kind_then_repo_by_last_event_of_the_day_then_number_desc(self) -> None:
         fake = FakeGitHub(viewer="octo-user", orgs=["octo-org"])
-        x = fake.add_repo("octo-user", "xray", pushed_at=at_jst(2026, 7, 18, 22))
+        # pushedAt は xray が最新だが、18 日のイベントは yankee のほうが遅い
+        x = fake.add_repo("octo-user", "xray", pushed_at=at_jst(2026, 7, 18, 23))
         y = fake.add_repo("octo-org", "yankee", pushed_at=at_jst(2026, 7, 18, 21), branch="trunk")
-        t = at_jst(2026, 7, 18, 10)
-        fake.add_issue(x, 2, t)
-        fake.add_issue(x, 9, t)
-        fake.add_issue(y, 4, t)
-        fake.add_pr(x, 3, t)
-        fake.add_pr(y, 8, t)
-        fake.add_pr(y, 10, t)
-        fake.add_commit(y, "y1", t, additions=5, deletions=1)
-        fake.add_commit(x, "x1", t, additions=7)
+        fake.add_issue(x, 2, at_jst(2026, 7, 18, 9))
+        fake.add_issue(x, 9, at_jst(2026, 7, 18, 8))
+        fake.add_issue(y, 4, at_jst(2026, 7, 18, 7))
+        fake.add_pr(x, 3, at_jst(2026, 7, 18, 10))
+        fake.add_pr(y, 8, at_jst(2026, 7, 18, 11))
+        fake.add_pr(y, 10, at_jst(2026, 7, 18, 6))
+        # yankee の最終イベント = commit 20:00 (種別をまたいで repo 順を決める)
+        fake.add_commit(y, "y1", at_jst(2026, 7, 18, 20), additions=5, deletions=1)
+        fake.add_commit(x, "x1", at_jst(2026, 7, 18, 12), additions=7)
         activity = collect(fake, D18, D18)
         self.assertEqual(
             [(i.kind, i.repo, i.number) for i in activity.days[D18]],
             [
-                ("issue", "xray", 9), ("issue", "xray", 2), ("issue", "yankee", 4),
-                ("pr", "xray", 3), ("pr", "yankee", 10), ("pr", "yankee", 8),
-                ("commit", "xray", None), ("commit", "yankee", None),
+                ("issue", "yankee", 4), ("issue", "xray", 9), ("issue", "xray", 2),
+                ("pr", "yankee", 10), ("pr", "yankee", 8), ("pr", "xray", 3),
+                ("commit", "yankee", None), ("commit", "xray", None),
             ],
         )
         self.assertEqual(
-            activity.days[D18][-1].url, "https://github.com/octo-org/yankee/commits/trunk",
+            activity.days[D18][6].url, "https://github.com/octo-org/yankee/commits/trunk",
+        )
+
+    def test_each_day_has_its_own_repo_order(self) -> None:
+        fake = FakeGitHub(viewer="octo-user", orgs=[])
+        a = fake.add_repo("octo-user", "alpha", pushed_at=at_jst(2026, 7, 19, 23))
+        b = fake.add_repo("octo-user", "bravo", pushed_at=at_jst(2026, 7, 19, 22))
+        fake.add_pr(a, 1, at_jst(2026, 7, 18, 9))
+        fake.add_pr(b, 2, at_jst(2026, 7, 18, 10))   # 18 日は bravo が後
+        fake.add_pr(a, 3, at_jst(2026, 7, 19, 15))   # 19 日は alpha が後
+        fake.add_pr(b, 4, at_jst(2026, 7, 19, 14))
+        activity = collect(fake, D18, D19)
+        self.assertEqual([i.number for i in activity.days[D18]], [2, 1])
+        self.assertEqual([i.number for i in activity.days[D19]], [3, 4])
+
+    def test_past_day_text_does_not_change_after_unrelated_later_push(self) -> None:
+        # 回帰: 以前は repo 順 = 実行時点の pushedAt 降順だったため、20 日の無関係な
+        # push だけで 18 日の行順が入れ替わり、内容が同じノートを毎回書き換えていた
+        def run(alpha_pushed_last: bool) -> "GitHubActivity":
+            fake = FakeGitHub(viewer="octo-user", orgs=["octo-org"])
+            a = fake.add_repo("octo-user", "alpha",
+                              pushed_at=at_jst(2026, 7, 20 if alpha_pushed_last else 18, 22))
+            b = fake.add_repo("octo-org", "bravo",
+                              pushed_at=at_jst(2026, 7, 18 if alpha_pushed_last else 20, 22))
+            fake.add_pr(a, 5, at_jst(2026, 7, 18, 9))
+            fake.add_pr(b, 7, at_jst(2026, 7, 18, 10))
+            fake.add_commit(a, "a1", at_jst(2026, 7, 18, 11), additions=3)
+            fake.add_commit(b, "b1", at_jst(2026, 7, 18, 8), additions=4)
+            later = a if alpha_pushed_last else b
+            fake.add_commit(later, "late", at_jst(2026, 7, 20, 21), additions=99)
+            return collect(fake, D18, D20)
+
+        first, second = run(True), run(False)
+        self.assertEqual(first.text_for(D18), second.text_for(D18))
+        self.assertEqual(
+            first.text_for(D18),
+            # 18 日の最終イベント: alpha = commit 11:00, bravo = PR 10:00 → alpha が先
+            "[🔀 alpha:PR #5: synthetic pr 5](https://github.com/octo-user/alpha/pull/5)\n"
+            "[🔀 bravo:PR #7: synthetic pr 7](https://github.com/octo-org/bravo/pull/7)\n"
+            "[📝 alpha:変更行数:+3-0 (1 commits)](https://github.com/octo-user/alpha/commits/main)\n"
+            "[📝 bravo:変更行数:+4-0 (1 commits)](https://github.com/octo-org/bravo/commits/main)",
+        )
+
+    def test_same_last_event_time_ties_break_by_owner_name_ascending(self) -> None:
+        fake = FakeGitHub(viewer="octo-user", orgs=["octo-org"])
+        t = at_jst(2026, 7, 18, 10)
+        # 列挙順・pushedAt 順とは逆の owner/name 順になることを確認する
+        z = fake.add_repo("octo-user", "Zulu", pushed_at=at_jst(2026, 7, 18, 23))
+        m = fake.add_repo("octo-user", "mike", pushed_at=at_jst(2026, 7, 18, 22))
+        o = fake.add_repo("octo-org", "oscar", pushed_at=at_jst(2026, 7, 18, 21))
+        for nwo, number in ((z, 1), (m, 2), (o, 3)):
+            fake.add_pr(nwo, number, t)
+        activity = collect(fake, D18, D18)
+        self.assertEqual(
+            [i.repo for i in activity.days[D18]],
+            ["oscar", "mike", "Zulu"],  # octo-org/oscar < octo-user/mike < octo-user/zulu
         )
 
 
@@ -1068,6 +1328,291 @@ class TestFailures(unittest.TestCase):
         activity = collect(fake, D18, D18)
         self.assertFalse(activity.complete)
         self.assertTrue(any("additions" in e for e in activity.errors))
+
+
+class TestHistoryPageShrink(unittest.TestCase):
+    """GitHub 側 timeout (502/504 / GraphQL timeout) で history の page 件数を
+    100 → 50 → 25 → 10 と縮小し、同じ cursor から取り直す。"""
+
+    def _fake_with_commits(self, count: int) -> "tuple[FakeGitHub, str]":
+        fake = FakeGitHub(viewer="octo-user", orgs=[])
+        nwo = fake.add_repo("octo-user", "alpha", pushed_at=at_jst(2026, 7, 18, 23))
+        for n in range(count):
+            fake.add_commit(nwo, f"c{n:03d}", at_jst(2026, 7, 18, 1 + n // 60, n % 60),
+                            additions=2, deletions=1)
+        return fake, nwo
+
+    def _collect(
+        self, injector: FaultInjector, sleeps: "list[float] | None" = None, **kwargs: object,
+    ) -> GitHubActivity:
+        client = make_client(injector, sleeps=sleeps)
+        return collect_github_activity(
+            client, D18, D18, logger=logging.getLogger("test.github_activity"),
+            **kwargs,  # type: ignore[arg-type]
+        )
+
+    def test_shrinks_from_same_cursor_and_stays_shrunk_for_the_repo(self) -> None:
+        fake, _nwo = self._fake_with_commits(60)
+        injector = FaultInjector(
+            fake,
+            lambda v: http_error(502) if v["withHistory"] and v["historyFirst"] > 25 else None,
+        )
+        with self.assertLogs("test.github_activity", level="WARNING") as cm:
+            activity = self._collect(injector)
+        self.assertTrue(activity.complete, activity.errors)
+        # 100 で 1 回再送 → 50 で 1 回再送 → 25 で成功、以降の page も 25 のまま
+        self.assertEqual(injector.history_firsts(), [100, 100, 50, 50, 25, 25, 25])
+        self.assertEqual(
+            [v["historyAfter"] for v in injector.repo_calls],
+            [None, None, None, None, None, "25", "50"],
+        )
+        commit = activity.days[D18][0]
+        self.assertEqual(
+            (commit.commit_count, commit.additions, commit.deletions), (60, 120, 60),
+        )
+        self.assertEqual(sum("縮小" in line for line in cm.output), 2)
+
+    def test_timeout_on_a_later_page_resumes_from_that_cursor(self) -> None:
+        fake, _nwo = self._fake_with_commits(130)
+        injector = FaultInjector(
+            fake,
+            lambda v: (http_error(504) if v["historyAfter"] == "100" and v["historyFirst"] == 100
+                       else None),
+        )
+        activity = self._collect(injector)
+        self.assertTrue(activity.complete, activity.errors)
+        self.assertEqual(injector.history_firsts(), [100, 100, 100, 50])
+        self.assertEqual(
+            [v["historyAfter"] for v in injector.repo_calls], [None, "100", "100", "100"],
+        )
+        self.assertEqual(activity.days[D18][0].commit_count, 130)
+
+    def test_graphql_timeout_error_also_shrinks(self) -> None:
+        fake, _nwo = self._fake_with_commits(3)
+        injector = FaultInjector(
+            fake, lambda v: TIMEOUT_GRAPHQL_ERROR if v["historyFirst"] == 100 else None,
+        )
+        activity = self._collect(injector)
+        self.assertTrue(activity.complete, activity.errors)
+        self.assertEqual(injector.history_firsts(), [100, 100, 50])
+        self.assertEqual(activity.days[D18][0].commit_count, 3)
+
+    def test_smallest_page_gets_full_retries_then_the_repo_fails(self) -> None:
+        fake, _nwo = self._fake_with_commits(3)
+        injector = FaultInjector(fake, lambda v: http_error(502))
+        sleeps: "list[float]" = []
+        activity = self._collect(injector, sleeps=sleeps)
+        self.assertEqual(
+            injector.history_firsts(), [100, 100, 50, 50, 25, 25, 10, 10, 10, 10],
+        )
+        self.assertEqual(len(sleeps), 1 + 1 + 1 + 3)
+        self.assertFalse(activity.complete)
+        self.assertEqual(activity.status, "failed")
+        self.assertTrue(any("502" in e for e in activity.errors))
+        self.assertIsNone(activity.text_for(D18))
+
+    def test_non_timeout_errors_do_not_shrink(self) -> None:
+        cases: "list[tuple[str, Callable[[dict], object], int]]" = [
+            ("http 503", lambda v: http_error(503), 4),
+            ("connection", lambda v: urllib.error.URLError("down"), 4),
+            ("forbidden", lambda v: {"data": {"repository": None},
+                                     "errors": [{"type": "FORBIDDEN", "message": "no"}]}, 1),
+        ]
+        for label, fault, attempts in cases:
+            with self.subTest(label):
+                fake, _nwo = self._fake_with_commits(3)
+                injector = FaultInjector(fake, fault)
+                activity = self._collect(injector)
+                self.assertEqual(injector.history_firsts(), [100] * attempts)
+                self.assertFalse(activity.complete)
+
+    def test_requests_without_history_are_not_shrunk(self) -> None:
+        fake, nwo = self._fake_with_commits(1)
+        for n in range(1, 52):  # PR 2 page 目は history なしの request になる
+            fake.add_pr(nwo, n, at_jst(2026, 7, 18, 11, n % 60))
+        injector = FaultInjector(
+            fake, lambda v: http_error(502) if not v["withHistory"] else None,
+        )
+        activity = self._collect(injector)
+        self.assertFalse(activity.complete)
+        later = injector.repo_calls[1:]
+        self.assertEqual(len(later), 4)  # 通常の再試行 (初回 + 3 回)、縮小しない
+        self.assertTrue(all(not v["withHistory"] and v["prsAfter"] == "50" for v in later))
+
+    def test_page_cap_counts_history_in_default_page_units(self) -> None:
+        # 50 件に縮小した後は max_pages=1 で 2 page (= 100 commit 相当) まで取れる
+        fake, _nwo = self._fake_with_commits(100)
+        injector = FaultInjector(
+            fake, lambda v: http_error(504) if v["historyFirst"] == 100 else None,
+        )
+        activity = self._collect(injector, max_pages=1)
+        self.assertTrue(activity.complete, activity.errors)
+        self.assertEqual(injector.history_firsts(), [100, 100, 50, 50])
+        self.assertEqual(activity.days[D18][0].commit_count, 100)
+
+        fake, _nwo = self._fake_with_commits(150)
+        injector = FaultInjector(
+            fake, lambda v: http_error(504) if v["historyFirst"] == 100 else None,
+        )
+        activity = self._collect(injector, max_pages=1)
+        self.assertFalse(activity.complete)
+        self.assertTrue(any("pagination" in e for e in activity.errors))
+        self.assertEqual(injector.history_firsts(), [100, 100, 50, 50])
+
+
+class TestForkCommits(unittest.TestCase):
+    """fork repo の default branch commit は viewer が author のものだけ数える (既定)。
+    upstream の同期で他人の commit が元の committer date のまま過去日に載るのを防ぐ。"""
+
+    def _fake(
+        self, viewer: str = "octo-user", my_login: str = "octo-user",
+    ) -> "tuple[FakeGitHub, str]":
+        fake = FakeGitHub(viewer=viewer, orgs=[])
+        nwo = fake.add_repo("octo-user", "forked-oss", pushed_at=at_jst(2026, 7, 18, 20),
+                            fork=True)
+        t = at_jst(2026, 7, 18, 10)
+        fake.add_commit(nwo, "up1", t, additions=12000, deletions=800, login="upstream-dev",
+                        name="Upstream Dev", email="dev@upstream.example")
+        fake.add_commit(nwo, "me1", t, additions=3, deletions=1, login=my_login)
+        # GitHub アカウントに紐付いていないメールの commit (author.user = null)
+        fake.add_commit(nwo, "nolink", t, additions=40, deletions=4, login=None,
+                        name="Octo User", email="octo@laptop.local")
+        fake.add_pr(nwo, 3, at_jst(2026, 7, 18, 11))
+        fake.add_issue(nwo, 2, at_jst(2026, 7, 18, 12))
+        return fake, nwo
+
+    def test_default_counts_only_viewer_authored_commits(self) -> None:
+        fake, _nwo = self._fake()
+        activity = collect(fake, D18, D18)
+        self.assertTrue(activity.complete, activity.errors)
+        self.assertEqual(
+            activity.text_for(D18),
+            "[🎫 forked-oss:Issue #2: synthetic issue 2]"
+            "(https://github.com/octo-user/forked-oss/issues/2)\n"
+            "[🔀 forked-oss:PR #3: synthetic pr 3](https://github.com/octo-user/forked-oss/pull/3)\n"
+            "[📝 forked-oss:変更行数:+3-1 (1 commits)]"
+            "(https://github.com/octo-user/forked-oss/commits/main)",
+        )
+        self.assertEqual(fake.ops("IhealthViewerLogin"), [])  # viewer は列挙時に取得済み
+
+    def test_fork_all_authors_counts_every_author(self) -> None:
+        fake, _nwo = self._fake()
+        commit = collect(fake, D18, D18, fork_all_authors=True).days[D18][-1]
+        self.assertEqual(
+            (commit.commit_count, commit.additions, commit.deletions), (3, 12043, 805),
+        )
+
+    def test_viewer_login_match_is_case_insensitive(self) -> None:
+        # viewer / commit author の login の大文字小文字が両方とも異なっても本人扱い
+        for owners in (None, "octo-user"):  # 列挙時に取得 / IhealthViewerLogin で取得
+            with self.subTest(owners=owners):
+                fake, _nwo = self._fake(viewer="Octo-User", my_login="OCTO-USER")
+                commit = collect(fake, D18, D18, owners=owners).days[D18][-1]
+                self.assertEqual(
+                    (commit.kind, commit.commit_count, commit.additions), ("commit", 1, 3),
+                )
+
+    def test_fork_with_only_upstream_commits_has_no_commit_line(self) -> None:
+        fake = FakeGitHub(viewer="octo-user", orgs=[])
+        nwo = fake.add_repo("octo-user", "synced", pushed_at=at_jst(2026, 7, 19), fork=True)
+        for n in range(5):  # Sync fork で入った upstream の commit (committer date は過去日)
+            fake.add_commit(nwo, f"u{n}", at_jst(2026, 7, 18, 9 + n), additions=10000,
+                            login="upstream-dev")
+        activity = collect(fake, D18, D19)
+        self.assertTrue(activity.complete)
+        self.assertEqual(activity.text_for(D18), "該当なし")
+
+    def test_non_fork_repo_still_counts_all_authors(self) -> None:
+        fake = FakeGitHub(viewer="octo-user", orgs=[])
+        nwo = fake.add_repo("octo-user", "team", pushed_at=at_jst(2026, 7, 18, 20))
+        fake.add_commit(nwo, "c1", at_jst(2026, 7, 18, 9), additions=5, login="colleague")
+        fake.add_commit(nwo, "c2", at_jst(2026, 7, 18, 10), additions=7, login=None)
+        commit = collect(fake, D18, D18).days[D18][0]
+        self.assertEqual((commit.commit_count, commit.additions), (2, 12))
+
+    def test_owners_given_resolves_viewer_login_only_when_a_fork_is_scanned(self) -> None:
+        fake, _nwo = self._fake()
+        fake.add_repo("octo-user", "fork-two", pushed_at=at_jst(2026, 7, 18, 21), fork=True)
+        fake.add_repo("octo-user", "plain", pushed_at=at_jst(2026, 7, 18, 22))
+        activity = collect(fake, D18, D18, owners="octo-user")
+        self.assertTrue(activity.complete, activity.errors)
+        self.assertEqual(len(fake.ops("IhealthViewerLogin")), 1)
+        self.assertEqual(fake.ops("IhealthViewer"), [])
+        self.assertEqual(activity.days[D18][-1].commit_count, 1)
+
+        fake.calls.clear()
+        collect(fake, D18, D18, owners="octo-user", fork_all_authors=True)
+        self.assertEqual(fake.ops("IhealthViewerLogin"), [])
+
+        no_fork = FakeGitHub(viewer="octo-user", orgs=[])
+        no_fork.add_repo("octo-user", "plain", pushed_at=at_jst(2026, 7, 18, 22))
+        collect(no_fork, D18, D18, owners="octo-user")
+        self.assertEqual(no_fork.ops("IhealthViewerLogin"), [])
+
+    def test_viewer_login_failure_skips_only_fork_repos(self) -> None:
+        fake, _fork = self._fake()
+        plain = fake.add_repo("octo-user", "plain", pushed_at=at_jst(2026, 7, 18, 22))
+        fake.add_pr(plain, 9, at_jst(2026, 7, 18, 9))
+        fake.viewer_login_exception = http_error(401, {"message": "Bad credentials"})
+        activity = collect(fake, D18, D18, owners="octo-user")
+        self.assertFalse(activity.complete)
+        self.assertEqual(activity.status, "partial")
+        self.assertEqual(fake.scanned(), ["octo-user/plain"])
+        self.assertEqual((activity.repos_scanned, activity.repos_failed), (1, 1))
+        self.assertTrue(any("fork" in e and "octo-user/forked-oss" in e for e in activity.errors))
+        self.assertIsNone(activity.text_for(D18))
+
+        only_fork, _nwo = self._fake()
+        only_fork.viewer_login_exception = http_error(401, {"message": "Bad credentials"})
+        self.assertEqual(collect(only_fork, D18, D18, owners="octo-user").status, "failed")
+
+
+class TestStatus(unittest.TestCase):
+    """``status``: complete / partial (一部でも取れた) / failed (使えるデータ無し)。"""
+
+    def test_all_candidate_scans_failing_is_failed(self) -> None:
+        fake = FakeGitHub(viewer="octo-user", orgs=[])
+        for n in range(3):
+            nwo = fake.add_repo("octo-user", f"r{n}", pushed_at=at_jst(2026, 7, 18, 10 + n))
+            fake.repo_errors[nwo.lower()] = [{"type": "FORBIDDEN", "message": "no access"}]
+        activity = collect(fake, D18, D18)
+        self.assertFalse(activity.complete)
+        self.assertEqual(
+            (activity.repos_scanned, activity.repos_failed, activity.repos_listed), (0, 3, 3),
+        )
+        self.assertEqual(activity.status, "failed")
+
+    def test_network_down_after_listing_is_failed(self) -> None:
+        fake = FakeGitHub(viewer="octo-user", orgs=[])
+        for n in range(2):
+            fake.add_repo("octo-user", f"r{n}", pushed_at=at_jst(2026, 7, 18, 10 + n))
+        injector = FaultInjector(fake, lambda v: urllib.error.URLError("network down"))
+        client = make_client(injector)
+        activity = collect_github_activity(
+            client, D18, D18, logger=logging.getLogger("test.github_activity"),
+        )
+        self.assertEqual(activity.status, "failed")
+
+    def test_some_owner_listed_without_candidates_and_another_failed_is_partial(self) -> None:
+        fake = FakeGitHub(viewer="octo-user", orgs=["octo-org"])
+        fake.add_repo("octo-user", "stale", pushed_at=at_jst(2026, 6, 1))
+        fake.owner_errors["octo-org"] = [{"type": "FORBIDDEN", "message": "SAML enforcement"}]
+        activity = collect(fake, D18, D18)
+        self.assertFalse(activity.complete)
+        self.assertEqual((activity.owners_listed, activity.repos_scanned), (1, 0))
+        self.assertEqual(activity.status, "partial")
+
+    def test_every_owner_listing_failing_is_failed(self) -> None:
+        fake = FakeGitHub(viewer="octo-user", orgs=["octo-org"])
+        for owner in ("octo-user", "octo-org"):
+            fake.owner_errors[owner] = [{"type": "FORBIDDEN", "message": "no"}]
+        activity = collect(fake, D18, D18)
+        self.assertEqual(activity.owners_listed, 0)
+        self.assertEqual(activity.status, "failed")
+
+    def test_status_of_bare_constructed_activity(self) -> None:
+        self.assertEqual(GitHubActivity(days={}, complete=True).status, "complete")
+        self.assertEqual(GitHubActivity(days={}, complete=False).status, "failed")
 
 
 if __name__ == "__main__":

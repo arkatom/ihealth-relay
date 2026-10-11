@@ -18,8 +18,10 @@ from ihealth.automation_parser import (
     HEALTH_FIELDS,
     SLEEP_MODE_AGGREGATED,
     SLEEP_MODE_SEGMENTS,
+    WORKOUTS_LABEL,
     build_activity_detail,
     extract_workouts,
+    has_data_for,
     has_metrics,
     needs_prev_payload,
     parse_automation_day,
@@ -124,7 +126,12 @@ class TestAggregatedFixture(unittest.TestCase):
         self.assertAlmostEqual(h.body_fat_percentage, 18.5)
 
     def test_metadata(self):
-        self.assertEqual(self.result.activity_detail, "瞑想6分")
+        # 現役設定はワークアウトを出力しない (data.workouts が無い) → ワークアウトの有無を
+        # 判断できないので「瞑想6分」と断定せず書かない (None)
+        self.assertIsNone(self.result.activity_detail)
+        self.assertFalse(self.result.workouts_included)
+        self.assertIsNone(self.result.workouts)
+        self.assertNotIn(WORKOUTS_LABEL, self.result.failed_metrics)
         self.assertTrue(self.result.has_metrics)
         self.assertEqual(self.result.sleep_mode, SLEEP_MODE_AGGREGATED)
         self.assertEqual(self.result.errors, ())
@@ -135,7 +142,17 @@ class TestAggregatedFixture(unittest.TestCase):
     def test_tuple_api(self):
         health, activity = parse_automation_day(self.payload, D, _ctx(D, 180.0))
         self.assertEqual(health, self.result.health)
-        self.assertEqual(activity, "瞑想6分")
+        self.assertIsNone(activity)
+
+    def test_activity_detail_when_workouts_are_exported(self):
+        # ワークアウトも書き出す設定 (data.workouts あり、その日は 0 件) なら瞑想だけで確定できる
+        payload = json.loads(json.dumps(self.payload))
+        payload["data"]["workouts"] = []
+        result = parse_automation_day_detailed(payload, D, _ctx(D, 180.0), logger=_LOGGER)
+        self.assertTrue(result.workouts_included)
+        self.assertEqual(result.workouts, ())
+        self.assertEqual(result.activity_detail, "瞑想6分")
+        self.assertEqual(parse_automation_day(payload, D, _ctx(D, 180.0))[1], "瞑想6分")
 
     def test_other_date_gives_nothing(self):
         # ファイルの中身と違う日付を指定 → 対象日の record が無いので全 None
@@ -177,11 +194,12 @@ class TestRecordDateFiltering(unittest.TestCase):
 
 class TestTolerance(unittest.TestCase):
     def test_malformed_records_and_metrics_are_ignored(self):
+        # 個々の壊れた record / 名前の無い metric は黙って skip (tolerant)
         payload = {"data": {"metrics": [
             "not a dict",
             {"units": "count", "data": []},                  # name 無し
             {"name": "", "data": []},
-            {"name": "heart_rate", "units": "count/min", "data": "oops"},
+            {"name": "resting_heart_rate", "units": "count/min"},   # data 無し = record 0 件
             _metric(
                 "step_count", "count",
                 "junk",
@@ -194,8 +212,22 @@ class TestTolerance(unittest.TestCase):
         ]}}
         result = _parse(payload)
         self.assertEqual(result.health.step_count, 3)
-        self.assertIsNone(result.health.heart_rate_avg)
+        self.assertIsNone(result.health.heart_rate_resting)
         self.assertEqual(result.errors, ())
+        self.assertEqual(result.failed_metrics, ())
+
+    def test_metric_whose_data_is_not_a_list_is_an_error(self):
+        # 名前のある metric の data が配列でない = 書式変更。黙って None にせず報告する
+        payload = _payload(
+            {"name": "heart_rate", "units": "count/min", "data": "oops"},
+            _metric("step_count", "count", _rec("2030-01-15 10:00:00 +0900", qty=3)),
+        )
+        with self.assertLogs(_LOGGER, level="WARNING"):
+            result = _parse(payload)
+        self.assertIsNone(result.health.heart_rate_avg)
+        self.assertEqual(result.health.step_count, 3)
+        self.assertEqual(result.failed_metrics, ("heart_rate",))
+        self.assertIn("配列ではありません", result.errors[0])
 
     def test_no_metrics(self):
         for payload in ({"data": {}}, {"data": {"metrics": []}}, {}, {"data": None}):
@@ -246,9 +278,15 @@ class TestUnits(unittest.TestCase):
         self.assertAlmostEqual(self._distance("KM", 1.0), 1.0)
 
     def test_unknown_distance_unit_is_not_guessed(self):
+        payload = _payload(_metric("walking_running_distance", "furlong",
+                                   _rec("2030-01-15 10:00:00 +0900", qty=3.0)))
         with self.assertLogs(_LOGGER, level="WARNING") as logs:
-            self.assertIsNone(self._distance("furlong", 3.0))
+            result = _parse(payload)
+        self.assertIsNone(result.health.distance_km)
         self.assertIn("未対応", logs.output[0])
+        # 黙って「データなし」にせずエラーとして報告する (status が partial / failed になる)
+        self.assertEqual(result.failed_metrics, ("walking_running_distance",))
+        self.assertIn("furlong", result.errors[0])
 
     def _energy(self, units: str, qty: float) -> "float | None":
         payload = _payload(_metric("active_energy", units,
@@ -264,6 +302,14 @@ class TestUnits(unittest.TestCase):
     def test_small_calorie_is_not_treated_as_kcal(self):
         with self.assertLogs(_LOGGER, level="WARNING"):
             self.assertIsNone(self._energy("cal", 250000.0))
+
+    def test_unknown_weight_unit_is_an_error(self):
+        payload = _payload(_metric("weight_body_mass", "st",
+                                   _rec("2030-01-15 07:00:00 +0900", qty=9.5)))
+        with self.assertLogs(_LOGGER, level="WARNING"):
+            result = _parse(payload)
+        self.assertIsNone(result.health.body_mass_kg)
+        self.assertEqual(result.failed_metrics, ("weight_body_mass",))
 
     def test_weight_units(self):
         for units, qty, expected in (("kg", 60.0, 60.0), ("lb", 132.0, 59.874193),
@@ -431,7 +477,8 @@ class TestMindful(unittest.TestCase):
     def test_sessions_and_minutes(self):
         payload = _payload(_metric("mindful_minutes", "min",
                                    _rec("2030-01-15 06:00:00 +0900", qty=10.0),
-                                   _rec("2030-01-15 21:00:00 +0900", qty=3.4)))
+                                   _rec("2030-01-15 21:00:00 +0900", qty=3.4)),
+                           workouts=[])
         result = _parse(payload)
         self.assertEqual(result.health.mindful_sessions, 2)
         self.assertAlmostEqual(result.health.mindful_minutes, 13.4)
@@ -458,18 +505,36 @@ class TestMindful(unittest.TestCase):
 
     def test_under_one_minute_is_not_in_activity_detail(self):
         payload = _payload(_metric("mindful_minutes", "min",
-                                   _rec("2030-01-15 06:00:00 +0900", qty=0.4)))
+                                   _rec("2030-01-15 06:00:00 +0900", qty=0.4)),
+                           workouts=[])
         result = _parse(payload)
         self.assertEqual(result.health.mindful_sessions, 1)
         self.assertAlmostEqual(result.health.mindful_minutes, 0.4)
         self.assertEqual(result.activity_detail, "なし")
 
     def test_no_mindful_but_other_metrics(self):
-        payload = _payload(_metric("step_count", "count", _rec("2030-01-15 06:00:00 +0900", qty=5)))
+        payload = _payload(_metric("step_count", "count", _rec("2030-01-15 06:00:00 +0900", qty=5)),
+                           workouts=[])
         result = _parse(payload)
         self.assertIsNone(result.health.mindful_sessions)
         self.assertIsNone(result.health.mindful_minutes)
         self.assertEqual(result.activity_detail, "なし")
+
+    def test_without_workouts_key_activity_is_unknown_not_nashi(self):
+        # ワークアウトを出力しない設定 (data.workouts が無い) では、その日の運動を
+        # 「なし」とも「瞑想N分」だけとも言えない → 書かない (既存の値を保持する)
+        for metrics in (
+            (_metric("step_count", "count", _rec("2030-01-15 06:00:00 +0900", qty=5)),),
+            (_metric("mindful_minutes", "min", _rec("2030-01-15 06:00:00 +0900", qty=24.0)),
+             _metric("apple_exercise_time", "min", _rec("2030-01-15 07:00:00 +0900", qty=21.0))),
+        ):
+            with self.subTest(metrics=[m["name"] for m in metrics]):
+                result = _parse(_payload(*metrics))
+                self.assertIsNone(result.activity_detail)
+                self.assertIsNone(result.workouts)
+                self.assertFalse(result.workouts_included)
+                self.assertEqual(result.errors, ())
+                self.assertEqual(extract_workouts(_payload(*metrics), D), [])
 
 
 class TestAggregatedSleep(unittest.TestCase):
@@ -669,6 +734,367 @@ class TestValidationDrop(unittest.TestCase):
         self.assertIsNone(result.health.heart_rate_resting)
         self.assertIsNone(result.health.body_fat_percentage)
         self.assertEqual(result.dropped_fields, ("heart_rate_resting", "body_fat_percentage"))
+
+
+
+class TestUninterpretableData(unittest.TestCase):
+    """書式 / 単位のドリフトを「データなし」と取り違えず errors に残す。"""
+
+    def test_unparseable_dates_are_errors_not_nodata(self):
+        payload = _payload(
+            _metric("step_count", "count", {"date": "2030-01-15 7:00:00 PM +0900", "qty": 10}),
+            _metric("heart_rate", "count/min",
+                    {"date": "2030-01-15 7:00:00 PM +0900", "Avg": 70, "Max": 80}),
+        )
+        with self.assertLogs(_LOGGER, level="WARNING"):
+            result = _parse(payload)
+        self.assertTrue(all(getattr(result.health, n) is None for n in HEALTH_FIELDS))
+        self.assertEqual(set(result.failed_metrics), {"step_count", "heart_rate"})
+        self.assertTrue(all("日時" in error for error in result.errors))
+        self.assertIsNone(result.activity_detail)
+
+    def test_some_broken_records_are_still_skipped_silently(self):
+        payload = _payload(_metric(
+            "step_count", "count",
+            {"date": "garbage", "qty": 1000},
+            _rec("2030-01-15 10:00:00 +0900", qty=10),
+        ))
+        result = _parse(payload)
+        self.assertEqual(result.health.step_count, 10)
+        self.assertEqual(result.errors, ())
+
+    def test_target_day_records_without_numeric_values_are_errors(self):
+        payload = _payload(
+            _metric("step_count", "count",
+                    _rec("2030-01-15 10:00:00 +0900", qty="12"),
+                    _rec("2030-01-15 10:01:00 +0900", value=3)),
+            _metric("resting_heart_rate", "count/min",
+                    _rec("2030-01-15 00:01:00 +0900", qty=None)),
+            _metric("heart_rate", "count/min", _rec("2030-01-15 07:00:00 +0900", bpm=70)),
+        )
+        with self.assertLogs(_LOGGER, level="WARNING"):
+            result = _parse(payload)
+        self.assertIsNone(result.health.step_count)
+        self.assertIsNone(result.health.heart_rate_resting)
+        self.assertIsNone(result.health.heart_rate_avg)
+        self.assertEqual(
+            set(result.failed_metrics), {"step_count", "resting_heart_rate", "heart_rate"},
+        )
+
+    def test_mindful_unknown_unit_does_not_claim_no_activity(self):
+        payload = _payload(
+            _metric("mindful_minutes", "minutes",
+                    _rec("2030-01-15 06:00:00 +0900", qty=10.0),
+                    _rec("2030-01-15 21:00:00 +0900", qty=5.0)),
+            _metric("step_count", "count", _rec("2030-01-15 10:00:00 +0900", qty=100)),
+        )
+        with self.assertLogs(_LOGGER, level="WARNING"):
+            result = _parse(payload)
+        self.assertIsNone(result.health.mindful_sessions)
+        self.assertIsNone(result.health.mindful_minutes)
+        # 「瞑想回数 2 / アクティビティ詳細 なし」のような矛盾を書かない
+        self.assertIsNone(result.activity_detail)
+        self.assertEqual(result.failed_metrics, ("mindful_minutes",))
+        self.assertEqual(result.health.step_count, 100)
+
+    def test_mindful_records_without_duration_are_errors(self):
+        payload = _payload(_metric("mindful_minutes", "min", _rec("2030-01-15 06:00:00 +0900")))
+        with self.assertLogs(_LOGGER, level="WARNING"):
+            result = _parse(payload)
+        self.assertIsNone(result.health.mindful_sessions)
+        self.assertEqual(result.failed_metrics, ("mindful_minutes",))
+        self.assertIsNone(result.activity_detail)
+
+    def test_aggregated_sleep_without_parseable_anchor_is_error(self):
+        payload = _payload(_metric("sleep_analysis", "hr", {
+            "date": "15/01/2030", "totalSleep": 7.0, "sleepEnd": "15/01/2030 06:00",
+            "source": "Sample Watch",
+        }))
+        with self.assertLogs(_LOGGER, level="WARNING"):
+            result = _parse(payload)
+        self.assertIsNone(result.health.sleep_hours)
+        self.assertEqual(result.failed_metrics, ("sleep_analysis",))
+
+    def test_sleep_records_of_unknown_shape_are_error(self):
+        payload = _payload(_metric("sleep_analysis", "hr",
+                                   _rec("2030-01-15 06:00:00 +0900", qty=7.0)))
+        with self.assertLogs(_LOGGER, level="WARNING"):
+            result = _parse(payload)
+        self.assertIsNone(result.health.sleep_hours)
+        self.assertEqual(result.failed_metrics, ("sleep_analysis",))
+
+    def test_unknown_sleep_unit_is_error(self):
+        payload = _payload(_metric("sleep_analysis", "fortnight", _rec(
+            "2030-01-15 00:00:00 +0900", totalSleep=7.0, sleepEnd="2030-01-15 06:00:00 +0900",
+        )))
+        with self.assertLogs(_LOGGER, level="WARNING"):
+            result = _parse(payload)
+        self.assertIsNone(result.health.sleep_hours)
+        self.assertEqual(result.failed_metrics, ("sleep_analysis",))
+
+    def test_undated_workouts_make_activity_unknown(self):
+        payload = _payload(
+            _metric("step_count", "count", _rec("2030-01-15 10:00:00 +0900", qty=100)),
+            workouts=[{"name": "Yoga", "duration": 1200}],
+        )
+        with self.assertLogs(_LOGGER, level="WARNING"):
+            result = _parse(payload)
+        self.assertEqual(result.failed_metrics, (WORKOUTS_LABEL,))
+        self.assertIsNone(result.workouts)
+        self.assertIsNone(result.activity_detail)
+        self.assertEqual(result.health.step_count, 100)
+        # 公開関数は日付を判定できないワークアウトをどの日にも数えない
+        self.assertEqual(extract_workouts(payload, D), [])
+
+
+class TestEdgeRules(unittest.TestCase):
+    """境界・分岐の固定 (変異テストで素通りした箇所)。"""
+
+    def test_oxygen_fraction_is_converted_per_value(self):
+        payload = _payload(_metric("blood_oxygen_saturation", "%",
+                                   _rec("2030-01-15 01:00:00 +0900", qty=0.97),
+                                   _rec("2030-01-15 02:00:00 +0900", qty=99)))
+        self.assertAlmostEqual(_parse(payload).health.oxygen_saturation, 98.0)
+
+    def test_oxygen_exactly_one_is_a_fraction(self):
+        payload = _payload(_metric("blood_oxygen_saturation", "%",
+                                   _rec("2030-01-15 01:00:00 +0900", qty=1.0)))
+        self.assertAlmostEqual(_parse(payload).health.oxygen_saturation, 100.0)
+
+    def test_body_fat_exactly_one_is_a_fraction(self):
+        # 1.0 は 100% と解釈 → 妥当範囲 (<= 60%) 外として落とす (1% とは読まない)
+        payload = _payload(_metric("body_fat_percentage", "%",
+                                   _rec("2030-01-15 07:00:00 +0900", qty=1.0)))
+        with self.assertLogs("ihealth.automation_parser", level="WARNING"):
+            result = parse_automation_day_detailed(payload, D, _ctx(D))
+        self.assertIsNone(result.health.body_fat_percentage)
+        self.assertEqual(result.dropped_fields, ("body_fat_percentage",))
+
+    def test_zero_mindful_total_is_none_not_zero(self):
+        payload = _payload(_metric("mindful_minutes", "min",
+                                   _rec("2030-01-15 06:00:00 +0900", qty=0.0)),
+                           workouts=[])
+        result = _parse(payload)
+        self.assertEqual(result.health.mindful_sessions, 1)
+        self.assertIsNone(result.health.mindful_minutes)
+        self.assertEqual(result.activity_detail, "なし")
+
+    def test_workout_belongs_to_its_start_date(self):
+        payload = _payload(
+            _metric("step_count", "count",
+                    _rec("2030-01-14 10:00:00 +0900", qty=1),
+                    _rec("2030-01-15 10:00:00 +0900", qty=1)),
+            workouts=[{"name": "Yoga", "start": "2030-01-14 23:30:00 +0900",
+                       "end": "2030-01-15 00:30:00 +0900", "duration": 3600}],
+        )
+        self.assertEqual(_parse(payload).activity_detail, "なし")
+        prev_day = date(2030, 1, 14)
+        self.assertEqual(_parse(payload, prev_day).activity_detail, "ヨガ60分")
+
+
+def _seg(start: str, end: str, value: str = "Core", source: str = "Sample Watch",
+         **extra: object) -> dict:
+    return {"startDate": start, "endDate": end, "value": value, "source": source, **extra}
+
+
+class TestSegmentClassification(unittest.TestCase):
+    """非集計 segment: 夜主睡眠 / 昼寝は segment ごとの終了時刻で分類する。
+
+    セッション (間隔 2h 以内) は 0 時前に終わる前半を翌朝へ繰り越す判定にだけ使い、
+    後続の segment が先行 segment の分類を変えない。
+    """
+
+    DAY = date(2030, 2, 2)
+    PREV = date(2030, 2, 1)
+
+    def _parse_segments(self, records, target: date, prev_records=None):
+        payload = _payload(_metric("sleep_analysis", "hr", *records))
+        prev = (_payload(_metric("sleep_analysis", "hr", *prev_records))
+                if prev_records is not None else None)
+        return parse_automation_day_detailed(
+            payload, target, _ctx(target), prev_payload=prev, logger=_LOGGER,
+        )
+
+    def test_nap_window_ends_at_20h(self):
+        # SPEC §2: end.hour ∈ [14, 20) → 昼寝。19:59 に終わる睡眠は昼寝、20:xx に終わる睡眠は
+        # (翌朝の夜主睡眠に繋がらなければ) どの日にも数えない
+        nap = self._parse_segments([
+            _seg("2030-02-02 19:00:00 +0900", "2030-02-02 19:59:00 +0900"),
+        ], self.DAY)
+        self.assertAlmostEqual(nap.health.nap_hours, 59 / 60)
+        self.assertIsNone(nap.health.sleep_hours)
+        evening = self._parse_segments([
+            _seg("2030-02-02 19:30:00 +0900", "2030-02-02 20:00:00 +0900"),
+            _seg("2030-02-02 20:05:00 +0900", "2030-02-02 20:59:00 +0900"),
+        ], self.DAY)
+        self.assertIsNone(evening.health.nap_hours)
+        self.assertIsNone(evening.health.sleep_hours)
+
+    def test_main_sleep_window_ends_at_14h(self):
+        # end.hour ∈ [0, 14) → 夜主睡眠 (13:59 終了)、14:00 終了は昼寝
+        main = self._parse_segments([
+            _seg("2030-02-02 06:00:00 +0900", "2030-02-02 13:59:00 +0900"),
+        ], self.DAY)
+        self.assertAlmostEqual(main.health.sleep_hours, 7 + 59 / 60)
+        self.assertIsNone(main.health.nap_hours)
+        afternoon = self._parse_segments([
+            _seg("2030-02-02 13:00:00 +0900", "2030-02-02 14:00:00 +0900"),
+        ], self.DAY)
+        self.assertAlmostEqual(afternoon.health.nap_hours, 1.0)
+        self.assertIsNone(afternoon.health.sleep_hours)
+
+    def test_long_morning_sleep_then_nap_is_not_merged_into_a_nap(self):
+        result = self._parse_segments([
+            _seg("2030-02-02 01:00:00 +0900", "2030-02-02 12:00:00 +0900"),
+            _seg("2030-02-02 13:30:00 +0900", "2030-02-02 14:15:00 +0900"),
+        ], self.DAY)
+        self.assertAlmostEqual(result.health.sleep_hours, 11.0)
+        self.assertAlmostEqual(result.health.nap_hours, 0.75)
+
+    def test_awake_bridged_morning_then_afternoon_nap(self):
+        result = self._parse_segments([
+            _seg("2030-02-02 03:00:00 +0900", "2030-02-02 07:00:00 +0900"),
+            _seg("2030-02-02 07:00:00 +0900", "2030-02-02 07:10:00 +0900", "Awake"),
+            _seg("2030-02-02 07:10:00 +0900", "2030-02-02 13:30:00 +0900"),
+            _seg("2030-02-02 15:00:00 +0900", "2030-02-02 16:00:00 +0900"),
+        ], self.DAY)
+        self.assertAlmostEqual(result.health.sleep_hours, 4.0 + 6 + 20 / 60)
+        self.assertAlmostEqual(result.health.nap_hours, 1.0)
+
+    def test_late_main_sleep_and_nap_after_short_gap(self):
+        result = self._parse_segments([
+            _seg("2030-02-02 03:00:00 +0900", "2030-02-02 12:30:00 +0900"),
+            _seg("2030-02-02 14:00:00 +0900", "2030-02-02 15:00:00 +0900"),
+        ], self.DAY)
+        self.assertAlmostEqual(result.health.sleep_hours, 9.5)
+        self.assertAlmostEqual(result.health.nap_hours, 1.0)
+
+    def test_previous_day_nap_is_not_absorbed_into_the_next_night(self):
+        records = [
+            _seg("2030-02-01 15:00:00 +0900", "2030-02-01 16:00:00 +0900"),
+            _seg("2030-02-01 17:30:00 +0900", "2030-02-02 06:00:00 +0900"),
+        ]
+        prev_day = self._parse_segments(records, self.PREV)
+        self.assertAlmostEqual(prev_day.health.nap_hours, 1.0)
+        self.assertIsNone(prev_day.health.sleep_hours)
+        day = self._parse_segments(records, self.DAY)
+        self.assertAlmostEqual(day.health.sleep_hours, 12.5)
+        self.assertIsNone(day.health.nap_hours)
+
+    def test_pre_midnight_part_is_carried_to_the_wake_up_day(self):
+        records = [
+            _seg("2030-02-01 22:00:00 +0900", "2030-02-01 23:30:00 +0900"),
+            _seg("2030-02-01 23:30:00 +0900", "2030-02-01 23:50:00 +0900", "Awake"),
+            _seg("2030-02-01 23:50:00 +0900", "2030-02-02 06:00:00 +0900", "Deep"),
+        ]
+        day = self._parse_segments(records, self.DAY)
+        self.assertAlmostEqual(day.health.sleep_hours, 1.5 + 6 + 10 / 60)
+        self.assertIsNone(self._parse_segments(records, self.PREV).health.sleep_hours)
+
+    def test_main_sleep_window_flags(self):
+        near_midnight = self._parse_segments([
+            _seg("2030-02-02 00:30:00 +0900", "2030-02-02 06:00:00 +0900"),
+        ], self.DAY)
+        self.assertTrue(near_midnight.main_sleep_needs_prev)
+        self.assertEqual(near_midnight.main_sleep_end,
+                         parse_hae_datetime("2030-02-02 06:00:00 +0900"))
+        late_start = self._parse_segments([
+            _seg("2030-02-02 03:00:00 +0900", "2030-02-02 09:00:00 +0900"),
+        ], self.DAY)
+        self.assertFalse(late_start.main_sleep_needs_prev)
+        self.assertAlmostEqual(late_start.health.sleep_hours, 6.0)
+        # 0 時台の Awake で始まるセッションも前日の segment が繋がりうる
+        awake_first = self._parse_segments([
+            _seg("2030-02-02 00:10:00 +0900", "2030-02-02 02:30:00 +0900", "Awake"),
+            _seg("2030-02-02 02:30:00 +0900", "2030-02-02 07:00:00 +0900"),
+        ], self.DAY)
+        self.assertTrue(awake_first.main_sleep_needs_prev)
+        nap_only = self._parse_segments([
+            _seg("2030-02-02 15:00:00 +0900", "2030-02-02 16:00:00 +0900"),
+        ], self.DAY)
+        self.assertFalse(nap_only.main_sleep_needs_prev)
+        self.assertIsNone(nap_only.main_sleep_end)
+
+    def test_switch_day_from_aggregated_to_segments(self):
+        # 前日ファイルは aggregateSleep=true (翌日付の途中経過レコードも含む)、当日から segment
+        prev_records = [
+            _rec("2030-02-01 00:00:00 +0900", totalSleep=7.0,
+                 sleepStart="2030-01-31 23:00:00 +0900", sleepEnd="2030-02-01 06:00:00 +0900"),
+            _rec("2030-02-02 00:00:00 +0900", totalSleep=0.5,
+                 sleepStart="2030-02-01 17:30:00 +0900", sleepEnd="2030-02-01 18:00:00 +0900"),
+        ]
+        result = self._parse_segments([
+            _seg("2030-02-02 00:30:00 +0900", "2030-02-02 06:30:00 +0900"),
+        ], self.DAY, prev_records=prev_records)
+        self.assertEqual(result.sleep_mode, SLEEP_MODE_SEGMENTS)
+        self.assertAlmostEqual(result.health.sleep_hours, 6.0)
+
+    def test_previous_day_aggregated_record_is_never_used_for_the_day(self):
+        # 当日ファイルに睡眠が無い日、前日ファイルの「翌日付」集計レコード (途中経過) は使わない
+        payload = _payload(_metric("step_count", "count", _rec("2030-02-02 10:00:00 +0900", qty=5)))
+        prev = _payload(_metric("sleep_analysis", "hr", _rec(
+            "2030-02-02 00:00:00 +0900", totalSleep=0.5,
+            sleepStart="2030-02-01 17:30:00 +0900", sleepEnd="2030-02-01 18:00:00 +0900",
+        )))
+        result = parse_automation_day_detailed(
+            payload, self.DAY, _ctx(self.DAY), prev_payload=prev, logger=_LOGGER,
+        )
+        self.assertIsNone(result.health.sleep_hours)
+        self.assertIsNone(result.sleep_mode)
+
+    def test_night_only_in_previous_day_file(self):
+        # 当日ファイルに睡眠 metric が無く、夜全体が前日ファイルの 1 segment に入っている
+        payload = _payload(_metric("step_count", "count", _rec("2030-02-02 10:00:00 +0900", qty=5)))
+        self.assertTrue(needs_prev_payload(payload))
+        prev = _payload(_metric("sleep_analysis", "hr", _seg(
+            "2030-02-01 22:00:00 +0900", "2030-02-02 06:00:00 +0900", "Asleep",
+        )))
+        result = parse_automation_day_detailed(
+            payload, self.DAY, _ctx(self.DAY), prev_payload=prev, logger=_LOGGER,
+        )
+        self.assertAlmostEqual(result.health.sleep_hours, 8.0)
+        self.assertTrue(result.main_sleep_needs_prev)
+
+
+class TestCandidateHelpers(unittest.TestCase):
+    def test_needs_prev_payload(self):
+        aggregated = _payload(_metric("sleep_analysis", "hr", _rec(
+            "2030-01-16 00:00:00 +0900", totalSleep=0.5, sleepEnd="2030-01-15 18:30:00 +0900",
+        )))
+        self.assertFalse(needs_prev_payload(aggregated))
+        no_sleep = _payload(_metric("step_count", "count", _rec("2030-01-15 10:00:00 +0900", qty=1)))
+        self.assertTrue(needs_prev_payload(no_sleep))
+        segments = _payload(_metric("sleep_analysis", "hr", _seg(
+            "2030-01-15 01:00:00 +0900", "2030-01-15 06:00:00 +0900",
+        )))
+        self.assertTrue(needs_prev_payload(segments))
+
+    def test_has_data_for(self):
+        other_day_only = _payload(_metric(
+            "apple_sleeping_wrist_temperature", "degC",
+            _rec("2030-01-14 22:30:00 +0900", qty=36.1),
+        ))
+        self.assertFalse(has_data_for(other_day_only, D))
+        self.assertTrue(has_data_for(other_day_only, date(2030, 1, 14)))
+        self.assertFalse(has_data_for({"data": {"metrics": []}}, D))
+        self.assertFalse(has_data_for({}, D))
+        # ワークアウトだけのファイルは metric を持つ候補を隠さない
+        self.assertFalse(has_data_for(
+            _payload(workouts=[{"name": "Yoga", "start": "2030-01-15 07:00:00 +0900"}]), D,
+        ))
+        # 日付をまたぐ segment は終了日のデータでもある
+        self.assertTrue(has_data_for(_payload(_metric("sleep_analysis", "hr", _seg(
+            "2030-01-14 23:00:00 +0900", "2030-01-15 01:00:00 +0900",
+        ))), D))
+
+    def test_has_data_for_treats_uninterpretable_as_maybe(self):
+        # 日時を解釈できない record / 配列でない data は「ありうる」(集計側でエラー報告させる)
+        self.assertTrue(has_data_for(_payload(_metric(
+            "step_count", "count", {"date": "15/01/2030", "qty": 1},
+        )), D))
+        self.assertTrue(has_data_for(
+            _payload({"name": "step_count", "units": "count", "data": "oops"}), D,
+        ))
 
 
 if __name__ == "__main__":

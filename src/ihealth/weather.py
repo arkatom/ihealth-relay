@@ -35,23 +35,34 @@ BeautifulSoup) を **標準ライブラリだけ** (``urllib.request`` + ``html.
    書いていた. 合計系 (降水量 / 日照時間) は 1 時間でも欠測があると合計が過小に
    なるので、欠測が 1 つでもあれば ``None`` にする.
 2. **日の完全性**: 24 時の行に気温と海面気圧があり、天気 (img alt) が 1 件以上
-   あるときだけ ``is_complete=True``. 未完成の日は全キー ``None`` で返す
-   (当日・未公開日のページには表そのものが無い).
-3. **品質記号** (気象庁「値欄の記号の説明」): ``)`` 準正常値は正常値として採用.
+   あるときだけ ``is_complete=True``. 未完成の日は全キー ``None`` で返す.
+   当日・未来日のページには表そのものが無く、前日分は数値の行が先に出て天気欄が
+   後から埋まる (前身が朝の実行では天気を取れず、実行を午後に移した理由).
+   そのため :func:`fetch_weather` は、観測所の日付 (JST) で今日から
+   ``_PUBLICATION_GRACE_DAYS`` 日以内の未完成を「公開待ち」(``pending``,
+   ``status == "nodata"`` = 想定内の遅延) とし、それより古い日の未完成だけを
+   ``"partial"`` (確定済みのはずの日が埋まらない = 気象庁の欠測か、天気欄の形式など
+   ページ仕様の変更) として警告ログに出す.
+3. **品質記号** (気象庁「値欄の記号の説明」): ``)`` 準正常値は記号を除いた値を正常値
+   として採用 (``--)`` は「該当現象なし」の準正常値).
    ``]`` 資料不足値 (「値そのものを信用することはできず、通常は上位の統計に用いません」),
    ``#`` 疑問値 (値は表示されない), ``×`` / ``///`` 欠測, 空欄 (未観測・通信障害)
    は欠測扱い. ``--`` (該当現象なし) は降水量 / 日照時間では 0.
    日照時間の空欄は夜間 (観測対象外) なら 0 として正しいので、数値のある時間帯の
    内側にある空欄と、全国どこでも日中である 8〜16 時の欠落だけを欠測とみなす.
-4. **1 時の行を使う**: 前身は見出し行のスキップ判定 ``if i > 2`` が 1 行ずれていて
-   (見出しは 2 行), 1 時 (0:00〜1:00) の行を読み捨てていた. 本実装は 1〜24 時を全て使う.
-   このため 1-6 時の気圧平均・夜の気温/湿度平均 (1 時が極値の日は最高/最低, 1 時に
-   降水がある日は夜の降水量も) が前身の値と異なる. 実データ 71 日分を前身の出力
-   (過去ノート) と突き合わせ、差は気象庁の事後修正 1 件と前身が天気を書けなかった
-   2 件を除いて全てこの 1 時の行で説明できることを確認済み.
+4. **1 時の行を使う** (``_FIRST_HOUR = 1``): 前身は見出し行のスキップ判定 ``if i > 2``
+   が 1 行ずれていて (見出しは 2 行), 1 時 (0:00〜1:00) の行を読み捨てていた.
+   本実装は 1〜24 時を全て使う. このため 1-6 時の気圧平均・夜の気温/湿度平均 (1 時が
+   極値の日は最高/最低, 1 時に降水がある日は夜の降水量, 稀に気圧マークも) が前身の値
+   (= 移行済みの過去ノート) と異なる. 実ページ 72 日分を前身 (bs4 版) そのもので処理した
+   結果と比べ、差は全てこの 1 時の行で説明できる. ``_FIRST_HOUR = 2`` にすると前身と
+   完全に同じ集計になる (tests の ``LegacyParityTest`` が両方の設定を前身の逐語転写と
+   突き合わせている).
 5. **列位置は見出しから特定**: rowspan / colspan を展開した見出しラベルから
    海面気圧 / 降水量 / 気温 / 湿度 / 日照 / 天気 の列を一意に探す. 見つからない /
    複数ある場合は :class:`WeatherError` (レイアウト変更を黙って誤パースしない).
+   時刻列も同様で、数字を含むのに整数として読めない時刻 (``1時`` / ``00:00`` 等) や、
+   データ行があるのに時刻を 1 つも読めない表は :class:`WeatherError`.
 6. ページ見出しの日付 (``2026年10月10日``) が要求日と違えば :class:`WeatherError`.
 
 ネットワークに出るのは :func:`fetch_weather` だけ. 呼び出し側 (diary 統合) は
@@ -71,7 +82,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass, field
-from datetime import date
+from datetime import date, datetime, timedelta, timezone
 from html.parser import HTMLParser
 from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
@@ -101,6 +112,20 @@ WEATHER_FIELDS: "tuple[str, ...]" = (
 #: 未公開日 (当日・未来日) のページに出る案内文の一部.
 #: 例: 「2026年10月11日のページを表示しましたが、閲覧可能な日は、昨日2026年10月10日までです。」
 _UNAVAILABLE_MARKER = "閲覧可能な日"
+
+#: 気象庁の日付 (観測所は全て日本標準時).
+_JST = timezone(timedelta(hours=9), "JST")
+
+#: 未完成のページを「公開待ち (想定内)」とみなす日数. 今日 (JST) − 対象日 がこの日数以下なら
+#: 未完成でも ``status == "nodata"``. 前日分は数値の行が先に公開され天気欄が後から埋まる
+#: (前身は JST 8 時の実行では天気を取れず 15 時に移し、さらに前々日も毎回取り直していた).
+#: それより古い日の未完成は確定済みのはずなので ``"partial"`` (警告) にする.
+_PUBLICATION_GRACE_DAYS = 2
+
+#: 集計に使う最初の時刻行. 1 = 1〜24 時を全て使う (前身の 1 時欠落 off-by-one を直した値).
+#: 2 にすると前身 (``if i > 2`` で 1 時の行を読み捨てる) と完全に同じ集計になる.
+#: 1-6 時の気圧 span の見出し (``1-6時``) はどちらでも同じ.
+_FIRST_HOUR = 1
 
 #: 応答本文の上限 (実ページは 25KB 程度). 想定外の巨大応答でメモリを食わない.
 _MAX_BODY_BYTES = 5 * 1024 * 1024
@@ -138,8 +163,10 @@ _PRESSURE_RISE_MARK = (
 
 #: 日照時間の「全国どこでも日中を含む」時刻の行 (8〜16 時 = 7:00〜16:00).
 #: 日本で最も遅い日の出 (1 月の八重山, 7 時半頃) でも 8 時の行 (7:00〜8:00) に、最も早い
-#: 日の入り (12 月の根室, 15 時 40 分頃) でも 16 時の行 (15:00〜16:00) に日中が含まれ、
-#: 日中を一部でも含む行は 0.0 でも数値が出る (実ページで確認). ここが空欄なら欠測とみなす.
+#: 日の入り (12 月の根室, 15 時 40 分頃) でも 16 時の行 (15:00〜16:00) に数十分の日中が含まれる.
+#: 日中を 15 分程度以上含む行は 0.0 でも数値が出る (東京・札幌の実ページの 6 時の行などで確認) が、
+#: 日の出 / 日の入り前後の数分しか含まない行は空欄になりうる (札幌 2026-10-10 の 18 時の行).
+#: そのため端の時間帯は必須にせず、この 8〜16 時が空欄のときだけ欠測とみなす.
 _SUNSHINE_CORE_HOURS: "tuple[int, ...]" = tuple(range(8, 17))
 
 #: 天気 alt → 絵文字. 前身 ``get_weather_emoji`` と同じ判定順 (部分一致, 先勝ち).
@@ -165,8 +192,13 @@ _COLUMN_KEYWORDS: "tuple[tuple[str, str], ...]" = (
 #: 時刻列の見出し (完全一致).
 _HOUR_COLUMN_LABEL = "時"
 
-#: 数値 + 任意の準正常値記号 ``)``. ``]`` / ``#`` 付きや ``×`` ``///`` は一致しない (= 欠測).
-_VALUE_RE = re.compile(r"^([+-]?(?:\d+(?:\.\d*)?|\.\d+))\s*\)?$")
+#: 準正常値記号 (値の後ろに付く. 前に空白を挟むことがある: ``12.3 )`` / ``--)``).
+_QUASI_NORMAL_MARK = ")"
+#: 数値 (符号・小数可). 準正常値記号は除去済みの文字列に当てる. ``]`` / ``#`` 付きや
+#: ``×`` ``///`` は一致しない (= 欠測).
+_NUMBER_RE = re.compile(r"[+-]?(?:\d+(?:\.\d*)?|\.\d+)")
+#: 時刻列のセルが「時刻らしい」(数字を含む) か. 整数として読めない時刻はレイアウト変更とみなす.
+_DIGIT_RE = re.compile(r"\d")
 #: 見出しの日付 (例: ``東京（東京都)　2026年10月10日　（１時間ごとの値）``).
 _PAGE_DATE_RE = re.compile(r"(\d{4})\s*年\s*(\d{1,2})\s*月\s*(\d{1,2})\s*日")
 #: ``<meta charset=...>`` / ``<meta http-equiv=... content="...; charset=...">``.
@@ -226,6 +258,7 @@ class WeatherSummary:
     sunshine: "str | None"       # 日照時間
     is_complete: bool            # 24 時の気温・海面気圧 + 天気 1 件以上 (SPEC v2 §4.3)
     observed_hours: int = 0      # 表から読めた時間行の数 (0 = 未公開ページ)
+    pending: bool = False        # 未完成なのは公開待ち (直近の日) のため = 想定内. 完成した日は常に False
 
     @property
     def missing_keys(self) -> "tuple[str, ...]":
@@ -236,16 +269,24 @@ class WeatherSummary:
     def status(self) -> str:
         """SPEC v2 §4.1 の完全性ステータス.
 
-        - ``"nodata"``: ページに観測行が 1 つも無い (当日・未公開日)
         - ``"complete"``: 日が完成していて 6 キー全て値がある
-        - ``"partial"``: それ以外 (日が未完成 / 一部キーが欠測)
+        - ``"nodata"``: 日が未完成で、それが想定内 = 公開待ちの期間内 (``pending``:
+          当日・未来日のページには観測行が無く、前日分は天気欄が後から埋まる).
+          何も書かず、通知もしない (次回以降の実行で埋まる)
+        - ``"partial"``: 完成した日の一部キーが欠測 (そのキーだけ書かない), または
+          確定済みのはずの日 (``pending=False``) が未完成 (何も書かない. 気象庁の欠測か
+          ページ仕様の変更の可能性があるので、続くようなら利用者に知らせる).
+          観測行が 1 つも無い場合も、公開待ちの期間を過ぎていれば ``"partial"``
+          (廃止・休止した観測所 / ``JMA_PREC_NO`` / ``JMA_BLOCK_NO`` の誤り /
+          過去日なのに「閲覧可能な日は…」の案内が返る障害を、黙って「データなし」に
+          しない. 統合側の「2 日以上続けて未完成なら通知」に乗る)
 
         取得自体の失敗 (``"failed"``) は :class:`WeatherError` として raise される.
         """
-        if self.observed_hours == 0 and not self.is_complete:
+        if self.is_complete:
+            return "complete" if not self.missing_keys else "partial"
+        if self.pending:
             return "nodata"
-        if self.is_complete and not self.missing_keys:
-            return "complete"
         return "partial"
 
 
@@ -511,20 +552,23 @@ def _locate_columns(labels: "Dict[int, str]") -> "Dict[str, int]":
 
 
 def _classify(text: str) -> "Tuple[str, Optional[float]]":
-    """セル文字列を (分類, 数値) にする. 数値は ``_KIND_VALUE`` のときだけ."""
+    """セル文字列を (分類, 数値) にする. 数値は ``_KIND_VALUE`` のときだけ.
+
+    準正常値記号 ``)`` は 1 つだけ外してから判定する (``12.3 )`` → 12.3, ``--)`` →
+    該当現象なし). 記号だけ (``)``) や ``]`` / ``#`` 付き, ``×`` / ``///`` は欠測.
+    """
     stripped = text.strip()
     if not stripped:
         return _KIND_BLANK, None
-    if stripped == "--":
+    core = stripped
+    if core.endswith(_QUASI_NORMAL_MARK):
+        core = core[: -len(_QUASI_NORMAL_MARK)].rstrip()
+    if core == "--":
         return _KIND_NONE, None
-    match = _VALUE_RE.match(stripped)
-    if match is None:
+    if _NUMBER_RE.fullmatch(core) is None:
         return _KIND_MISSING, None
-    try:
-        value = float(match.group(1))
-    except ValueError:
-        return _KIND_MISSING, None
-    if not math.isfinite(value):
+    value = float(core)
+    if not math.isfinite(value):  # 桁数が極端に多い数字列は inf になる
         return _KIND_MISSING, None
     return _KIND_VALUE, value
 
@@ -592,13 +636,21 @@ def _observations_from_table(table: _TableBuilder) -> "List[HourlyObservation]":
 
     observations: "List[HourlyObservation]" = []
     seen_hours: "set[int]" = set()
+    data_rows = 0
     for raw_row, row in zip(table.rows[header_count:], grid[header_count:]):
         if not any(cell.tag == "td" for cell in raw_row):
             continue  # 途中に挟まった見出し行など
+        data_rows += 1
         hour_text = text_at(row, "hour")
         try:
             hour = int(hour_text)
         except ValueError:
+            if _DIGIT_RE.search(hour_text):
+                # "1時" / "00:00" のような時刻の書式変更. 区間の意味 ((N-1)時〜N時) が
+                # 変わった可能性もあるので読み替えずに止める.
+                raise WeatherError(
+                    f"気象庁 hourly 表の時刻列を読めません: {hour_text!r} (レイアウト変更の可能性)"
+                ) from None
             continue  # 合計行など時刻でない行
         if not 1 <= hour <= 24:
             raise WeatherError(f"気象庁 hourly 表に 1〜24 以外の時刻行があります: {hour_text!r}")
@@ -622,6 +674,12 @@ def _observations_from_table(table: _TableBuilder) -> "List[HourlyObservation]":
                 sunshine_missing=sunshine_missing,
                 weather=weather,
             )
+        )
+    if data_rows and not observations:
+        # データ行はあるのに時刻を 1 つも読めない = 時刻列の仕様変更. 「行が 0 件」(未公開)
+        # と取り違えて黙って nodata にしないよう失敗にする.
+        raise WeatherError(
+            f"気象庁 hourly 表のデータ行 {data_rows} 行から時刻を 1 つも読めません (レイアウト変更の可能性)"
         )
     return observations
 
@@ -721,9 +779,10 @@ def _format_humidity(rows: "Sequence[HourlyObservation]") -> "Optional[str]":
 
 
 def _format_precipitation(by_hour: "Dict[int, HourlyObservation]") -> "Optional[str]":
-    # 合計は 1 時間でも欠測があると過小になるので、1〜24 時が全て値 (``--`` = 0) のときだけ出す.
+    # 合計は 1 時間でも欠測があると過小になるので、集計対象の全時刻 (_FIRST_HOUR〜24 時) が
+    # 値 (``--`` = 0) のときだけ出す.
     totals: "Dict[str, float]" = {name: 0.0 for name in _SEGMENTS}
-    for hour in range(1, 25):
+    for hour in range(_FIRST_HOUR, 25):
         row = by_hour.get(hour)
         if row is None or row.precipitation is None:
             return None
@@ -794,29 +853,52 @@ def _format_weather(rows: "Sequence[HourlyObservation]") -> "Optional[str]":
     return ", ".join(items) if items else None
 
 
-def _is_day_complete(by_hour: "Dict[int, HourlyObservation]") -> bool:
-    last = by_hour.get(24)
-    if last is None or last.temperature is None or last.sea_level_pressure is None:
-        return False
-    return any(row.weather for row in by_hour.values())
-
-
-def summarize_weather(obs: "Sequence[HourlyObservation]", d: date) -> WeatherSummary:
-    """時間ごとの観測値を前身と同一書式の 6 文字列にまとめる.
-
-    - 日が未完成 (24 時の気温 / 海面気圧が無い, 天気が 1 件も無い) なら
-      ``is_complete=False`` で全文字列 ``None``.
-    - 完成している日でも、キーの元データが区分単位で全欠測 (合計系は 1 時間でも欠測)
-      ならそのキーだけ ``None``.
-    - 1〜24 以外の時刻は無視し、同じ時刻が複数あれば最初の行を使う.
-    """
+def _index_by_hour(obs: "Sequence[HourlyObservation]") -> "Dict[int, HourlyObservation]":
+    """1〜24 時の行を 時刻 → 行 にする (範囲外は無視, 同じ時刻は最初の行)."""
     by_hour: "Dict[int, HourlyObservation]" = {}
     for row in obs:
         if 1 <= row.hour <= 24 and row.hour not in by_hour:
             by_hour[row.hour] = row
-    rows = [by_hour[hour] for hour in sorted(by_hour)]
+    return by_hour
 
-    if not _is_day_complete(by_hour):
+
+def _incomplete_reasons(by_hour: "Dict[int, HourlyObservation]") -> "List[str]":
+    """日が未完成である理由 (SPEC v2 §4.3). 空リストなら完成した日."""
+    if not by_hour:
+        return ["観測行なし"]
+    reasons: "List[str]" = []
+    last = by_hour.get(24)
+    if last is None:
+        reasons.append("24時の行なし")
+    else:
+        if last.temperature is None:
+            reasons.append("24時の気温が欠測")
+        if last.sea_level_pressure is None:
+            reasons.append("24時の海面気圧が欠測")
+    if not any(row.weather for row in by_hour.values()):
+        reasons.append("天気 (画像の alt) が 0 件")
+    return reasons
+
+
+def summarize_weather(
+    obs: "Sequence[HourlyObservation]",
+    d: date,
+    *,
+    pending: bool = False,
+) -> WeatherSummary:
+    """時間ごとの観測値を前身と同一書式の 6 文字列にまとめる.
+
+    - 日が未完成 (観測行が無い, 24 時の気温 / 海面気圧が無い, 天気が 1 件も無い) なら
+      ``is_complete=False`` で全文字列 ``None``. ``pending=True`` (公開待ちの期間内,
+      :func:`fetch_weather` が日付から判定する) なら ``status == "nodata"``、それ以外は
+      ``"partial"`` (観測行が 0 件でも. :attr:`WeatherSummary.status` 参照).
+    - 完成している日でも、キーの元データが区分単位で全欠測 (合計系は 1 時間でも欠測)
+      ならそのキーだけ ``None``.
+    - 1〜24 以外の時刻は無視し、同じ時刻が複数あれば最初の行を使う.
+      集計には ``_FIRST_HOUR``〜24 時の行を使う.
+    """
+    by_hour = _index_by_hour(obs)
+    if _incomplete_reasons(by_hour):
         return WeatherSummary(
             date=d,
             weather=None,
@@ -826,18 +908,21 @@ def summarize_weather(obs: "Sequence[HourlyObservation]", d: date) -> WeatherSum
             pressure=None,
             sunshine=None,
             is_complete=False,
-            observed_hours=len(rows),
+            observed_hours=len(by_hour),
+            pending=pending,
         )
+    used = {hour: row for hour, row in by_hour.items() if hour >= _FIRST_HOUR}
+    rows = [used[hour] for hour in sorted(used)]
     return WeatherSummary(
         date=d,
         weather=_format_weather(rows),
         temperature=_format_temperature(rows),
         humidity=_format_humidity(rows),
-        precipitation=_format_precipitation(by_hour),
+        precipitation=_format_precipitation(used),
         pressure=_format_pressure(rows),
-        sunshine=_format_sunshine(by_hour),
+        sunshine=_format_sunshine(used),
         is_complete=True,
-        observed_hours=len(rows),
+        observed_hours=len(by_hour),
     )
 
 
@@ -887,6 +972,11 @@ def _decode_html(body: bytes, log: logging.Logger) -> str:
 
 def _backoff_seconds(attempt: int) -> float:
     return min(_BACKOFF_BASE_SEC * (2 ** attempt), _BACKOFF_MAX_SEC)
+
+
+def _jst_today(clock: "Callable[[], float]" = time.time) -> date:
+    """気象庁の日付 (JST) での今日. 実行環境のタイムゾーン設定には依存しない."""
+    return datetime.fromtimestamp(clock(), _JST).date()
 
 
 def _download(
@@ -943,14 +1033,22 @@ def fetch_weather(
     opener: "Opener | None" = None,
     logger: "logging.Logger | None" = None,
     sleep: "Callable[[float], None]" = time.sleep,
+    today: "date | None" = None,
 ) -> WeatherSummary:
     """気象庁から ``d`` の 1 時間ごとの値を取得して :class:`WeatherSummary` にする.
 
     - 5xx / 429 / 通信エラー / タイムアウトは ``retries`` 回まで指数 backoff
       (1, 2, 4 … 秒, 上限 30 秒) で再試行. 4xx はすぐ失敗.
     - 当日・未公開日 (表が無く「閲覧可能な日は…」の案内がある) は
-      ``is_complete=False`` / ``status == "nodata"`` の空サマリを返す (例外にしない).
-    - 表も案内も無いページ (メンテナンス / 仕様変更), 見出しの不一致, ページ日付の
+      ``is_complete=False`` の空サマリを返す (例外にしない). 公開待ちの期間内なら
+      ``status == "nodata"`` (info ログ)、それより古い日なのに案内が返ったときは
+      ``status == "partial"`` (warning ログ. 気象庁側の障害や観測所番号の誤りを
+      「データなし」と取り違えない).
+    - 表はあるが日が未完成のとき: ``today − d`` が ``_PUBLICATION_GRACE_DAYS`` 日以内なら
+      公開待ち (``pending=True``, ``status == "nodata"``, info ログ). それより古い日は
+      ``status == "partial"`` で warning ログ (気象庁の欠測か、天気欄の形式などページ仕様の
+      変更の可能性. 統合側は続くようなら利用者に知らせる).
+    - 表も案内も無いページ (メンテナンス / 仕様変更), 見出しや時刻列の不一致, ページ日付の
       不一致, 取得失敗は :class:`WeatherError`.
 
     Args:
@@ -961,8 +1059,11 @@ def fetch_weather(
         opener: ``(Request, timeout) -> bytes``. テストでモックを注入する.
         logger: 省略時は ``ihealth.weather``.
         sleep: backoff 待ち関数 (テスト用に差し替え可能).
+        today: 公開待ち判定に使う今日の日付 (JST). 省略時は現在時刻から求める.
     """
     log = logger or logging.getLogger(__name__)
+    reference = today if today is not None else _jst_today()
+    pending = (reference - d).days <= _PUBLICATION_GRACE_DAYS
     url = jma_hourly_url(d, prec_no, block_no)
     log.debug("気象庁 hourly 取得: %s", url)
     body = _download(
@@ -978,8 +1079,15 @@ def fetch_weather(
 
     if not page.table_found:
         if _UNAVAILABLE_MARKER in html:
-            log.info("気象庁 %s のページはまだ公開されていません (閲覧可能なのは前日まで)", d.isoformat())
-            return summarize_weather([], d)
+            if pending:
+                log.info("気象庁 %s のページはまだ公開されていません (閲覧可能なのは前日まで)", d.isoformat())
+            else:
+                log.warning(
+                    "気象庁 %s: 公開済みのはずの日なのに「閲覧可能な日は…」の案内が返りました "
+                    "(気象庁側の障害 / 観測所番号の誤りの可能性): %s",
+                    d.isoformat(), url,
+                )
+            return summarize_weather([], d, pending=pending)
         raise WeatherError(
             f"気象庁ページに観測表も未公開の案内もありません (メンテナンス / 仕様変更の可能性): {url}"
         )
@@ -988,15 +1096,23 @@ def fetch_weather(
             f"気象庁ページの日付 {page.page_date.isoformat()} が要求日 {d.isoformat()} と一致しません: {url}"
         )
 
-    summary = summarize_weather(page.observations, d)
+    summary = summarize_weather(page.observations, d, pending=pending)
     if summary.is_complete:
         log.info(
             "気象庁 %s: %d 時間分, 欠測キー=%s",
             d.isoformat(), summary.observed_hours, ",".join(summary.missing_keys) or "なし",
         )
-    else:
+        return summary
+    reasons = "、".join(_incomplete_reasons(_index_by_hour(page.observations)))
+    if summary.status == "nodata":
         log.info(
-            "気象庁 %s: 日が未完成のため書き込み対象外 (%d 時間分)",
-            d.isoformat(), summary.observed_hours,
+            "気象庁 %s: まだ確定していないため書き込み対象外 (%s, %d 時間分). 次回以降の実行で埋まる見込み",
+            d.isoformat(), reasons, summary.observed_hours,
+        )
+    else:
+        log.warning(
+            "気象庁 %s: 確定済みのはずの日が未完成のため書き込み対象外 (%s, %d 時間分). "
+            "気象庁の欠測か、ページ仕様の変更 (天気欄の形式など) の可能性: %s",
+            d.isoformat(), reasons, summary.observed_hours, url,
         )
     return summary

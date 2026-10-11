@@ -1,14 +1,24 @@
 #!/bin/bash
 # ihealth-relay LaunchAgent インストーラ。
 #
+# 使い方:
+#   ./bin/install-launchd.sh                 # 登録 (冪等)
+#   ./bin/install-launchd.sh --print-plist   # 登録する plist を標準出力に出すだけ (何も変更しない)
+#
 # 動作:
 #   1. $HOME/Library/Logs/ihealth-relay/ を作成 (launchd の StandardOutPath が指す)
 #   2. LaunchAgent/com.ihealthrelay.daemon.plist の
 #      __PROJECT_ROOT__ / __HOME__ を実パスに sed 置換
-#   3. ~/Library/LaunchAgents/ に配置
-#   4. 既存ジョブがあれば unload してから load (冪等)
+#   3. 起動時刻を .env の IHEALTH_PUBLISHER で決める:
+#      obsidian → 毎日 07:00 / 12:00 / 21:00 (今日の暫定値の更新・遅れて届く前日分の取り込み)
+#      それ以外 (未設定 = notion を含む) → 毎日 07:00 のみ (従来どおり。Slack の重複投稿や、
+#      データ未到着の通知・再試行待ちが 1 日 3 回に増えるのを防ぐ)
+#   4. ~/Library/LaunchAgents/ に配置
+#   5. 既存ジョブがあれば unload してから load (冪等)
 #
-# 実行後、毎朝 07:00 に `bin/ihealth-run` が走る (内部で python3 -m ihealth)。
+# launchd は引数なしで `bin/ihealth-run` を実行する (内部で python3 -m ihealth)。publisher は
+# .env の IHEALTH_PUBLISHER (未設定なら notion)。Obsidian 日記なら IHEALTH_PUBLISHER=obsidian で
+# 「昨日から lookback 日分 + 今日の暫定値」。IHEALTH_PUBLISHER を変えたら本スクリプトを再実行する。
 # 手動実行も `./bin/ihealth-run`。
 #
 # 経緯メモ (2026-04-26 ~ 27 実機検証):
@@ -26,6 +36,22 @@
 
 set -euo pipefail
 
+MODE="install"
+for arg in "$@"; do
+    case "$arg" in
+        --print-plist) MODE="print" ;;
+        -h|--help)
+            echo "使い方: $0 [--print-plist]"
+            echo "  --print-plist  登録する plist (起動時刻を含む) を標準出力に出すだけ。何も変更しない"
+            exit 0
+            ;;
+        *)
+            echo "エラー: 不明な引数です: $arg (使い方: $0 [--print-plist])" >&2
+            exit 2
+            ;;
+    esac
+done
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 PLIST_LABEL="com.ihealthrelay.daemon"
@@ -39,6 +65,58 @@ if [ ! -f "$PLIST_SRC" ]; then
     echo "エラー: plist テンプレートが見つかりません: $PLIST_SRC" >&2
     exit 1
 fi
+
+# sed の区切り文字は `|` を使うので PROJECT_ROOT / HOME に `|` が含まれるとズレる。
+# さらに sed の置換文字列では `&` がマッチ全体を意味するため、パスに `&` があると
+# 置換が壊れる (plist XML 的にも `&` は不正)。`\` もエスケープ文字なので危険。
+for var_name in PROJECT_ROOT HOME; do
+    var_value="${!var_name}"
+    case "$var_value" in
+        *"|"* | *"&"* | *"\\"*)
+            echo "エラー: $var_name に '|', '&', '\\' のいずれかが含まれるためインストールできません: $var_value" >&2
+            echo "別のパスに移動してから再実行してください。" >&2
+            exit 1
+            ;;
+    esac
+done
+
+# launchd が実行する publisher = .env の IHEALTH_PUBLISHER (未設定なら notion)。
+# obsidian のときだけ 12:00 / 21:00 の起動を残す (テンプレートの
+# IHEALTH_OBSIDIAN_EXTRA_RUNS_BEGIN 〜 END の範囲)。
+ENV_FILE="$PROJECT_ROOT/.env"
+PUBLISHER_VALUE=""
+if [ -f "$ENV_FILE" ]; then
+    PUBLISHER_LINE="$(grep -E '^[[:space:]]*IHEALTH_PUBLISHER[[:space:]]*=' "$ENV_FILE" | tail -n 1 || true)"
+    if [ -n "$PUBLISHER_LINE" ]; then
+        PUBLISHER_VALUE="$(printf '%s' "${PUBLISHER_LINE#*=}" | tr -d "\"' \r\t" | tr '[:upper:]' '[:lower:]')"
+    fi
+fi
+if [ "$PUBLISHER_VALUE" = "obsidian" ]; then
+    SCHEDULE_LABEL="毎日 07:00 / 12:00 / 21:00"
+    SCHEDULE_SED=""
+else
+    SCHEDULE_LABEL="毎日 07:00"
+    SCHEDULE_SED='/IHEALTH_OBSIDIAN_EXTRA_RUNS_BEGIN/,/IHEALTH_OBSIDIAN_EXTRA_RUNS_END/d'
+fi
+
+render_plist() {
+    if [ -n "$SCHEDULE_SED" ]; then
+        sed -e "s|__PROJECT_ROOT__|$PROJECT_ROOT|g" \
+            -e "s|__HOME__|$HOME|g" \
+            -e "$SCHEDULE_SED" \
+            "$PLIST_SRC"
+    else
+        sed -e "s|__PROJECT_ROOT__|$PROJECT_ROOT|g" \
+            -e "s|__HOME__|$HOME|g" \
+            "$PLIST_SRC"
+    fi
+}
+
+if [ "$MODE" = "print" ]; then
+    render_plist
+    exit 0
+fi
+
 if [ ! -x /usr/bin/python3 ]; then
     echo "エラー: /usr/bin/python3 が実行できません。Xcode Command Line Tools を" \
          "インストールしてください (xcode-select --install)" >&2
@@ -62,28 +140,13 @@ mkdir -p "$LAUNCHD_LOG_DIR"
 
 mkdir -p "$LAUNCH_AGENTS_DIR"
 
-# __PROJECT_ROOT__ / __HOME__ を sed 置換してコピー。
-# sed の区切り文字は `|` を使うので PROJECT_ROOT / HOME に `|` が含まれるとズレる。
-# さらに sed の置換文字列では `&` がマッチ全体を意味するため、パスに `&` があると
-# 置換が壊れる (plist XML 的にも `&` は不正)。`\` もエスケープ文字なので危険。
-for var_name in PROJECT_ROOT HOME; do
-    var_value="${!var_name}"
-    case "$var_value" in
-        *"|"* | *"&"* | *"\\"*)
-            echo "エラー: $var_name に '|', '&', '\\' のいずれかが含まれるためインストールできません: $var_value" >&2
-            echo "別のパスに移動してから再実行してください。" >&2
-            exit 1
-            ;;
-    esac
-done
+# __PROJECT_ROOT__ / __HOME__ を sed 置換 (+ 起動時刻の選択) してコピー。
 # PLIST_DST が万一テンプレ本体への symlink だった場合、`> "$PLIST_DST"` は symlink を
 # 辿って実体 (= LaunchAgent/com.ihealthrelay.daemon.plist) を truncate してしまい、
 # テンプレ自体を破壊する。一時ファイルに書いてから mv で atomic に置き換える。
 PLIST_TMP="$(/usr/bin/mktemp "${TMPDIR:-/tmp}/${PLIST_NAME}.XXXXXX")"
 trap 'rm -f "$PLIST_TMP"' EXIT
-sed -e "s|__PROJECT_ROOT__|$PROJECT_ROOT|g" \
-    -e "s|__HOME__|$HOME|g" \
-    "$PLIST_SRC" > "$PLIST_TMP"
+render_plist > "$PLIST_TMP"
 mv -f "$PLIST_TMP" "$PLIST_DST"
 trap - EXIT
 
@@ -137,7 +200,11 @@ else
 fi
 
 echo "登録完了: $PLIST_DST"
-echo "次回自動実行: 翌朝 07:00"
+echo "自動実行: $SCHEDULE_LABEL (IHEALTH_PUBLISHER=${PUBLISHER_VALUE:-未設定 = notion})"
+if [ "$PUBLISHER_VALUE" != "obsidian" ]; then
+    echo "       Obsidian 日記 (IHEALTH_PUBLISHER=obsidian) にすると 07:00 / 12:00 / 21:00 の 3 回になります"
+    echo "       (.env を変えたら本スクリプトを再実行してください)。"
+fi
 echo "手動実行: $PROJECT_ROOT/bin/ihealth-run"
 echo "launchd ログ: $LAUNCHD_LOG_DIR/launchd.log (起動失敗時はここを確認)"
 echo "アプリログ:   $PROJECT_ROOT/logs/run.log (TimedRotatingFileHandler)"

@@ -20,6 +20,9 @@ ExportVersion.v2 / exportFileLength=day) は、ユーザーが付けたオート
   ``.hae`` があっても高速。``stat`` は iCloud dataless ファイルの materialize を
   起こさない (``ihealth.source._is_dataless`` の実機確認と同じ)。
 * ``.`` 始まりの隠しディレクトリは降りない。symlink はたどらない (循環対策)。
+* 読めないディレクトリ (権限 / TCC 拒否など) は探索を続けつつ
+  :attr:`AutomationIndex.errors` に記録する。黙って空の索引にすると「ファイルが
+  無い = nodata」と区別できず、失敗が通知されなくなるため。
 * 実ファイルはほぼ全て iCloud **dataless** (placeholder)。``open()`` は File Provider
   の download 待ちで長時間 block しうるので、読む前に必ず
   :func:`ihealth.source._ensure_materialized` (``brctl download`` + polling) を通す。
@@ -41,7 +44,7 @@ from ihealth.source import SourceError, _ensure_materialized
 
 
 #: オートメーション出力ファイル名。日付部分を group(1) で取り出す。
-#: iCloud の競合コピー (``HealthAutoExport-2026-10-10 2.json``) は対象外。
+#: iCloud の競合コピー (``HealthAutoExport-2030-01-15 2.json``) は対象外。
 AUTOMATION_FILE_RE = re.compile(r"^HealthAutoExport-(\d{4}-\d{2}-\d{2})\.json$")
 
 #: 探索の深さ上限。root 直下のディレクトリが深さ 1
@@ -71,10 +74,14 @@ class AutomationIndex:
             → path 順) になるよう sort 済み。
         mtimes: path → 探索時点の ``st_mtime``。:meth:`newest_mtime` 用。
             テスト等で ``files`` だけ与えて構築した場合は空でよい。
+        errors: 探索中に読めなかったディレクトリ / エントリの説明。空でなければ
+            索引は不完全 (候補を取りこぼしている可能性がある) なので、呼び出し側は
+            「候補なし」を nodata ではなく失敗として扱うこと
     """
 
     files: "Mapping[date, tuple[Path, ...]]" = field(default_factory=_empty_mapping)
     mtimes: "Mapping[Path, float]" = field(default_factory=_empty_mapping)
+    errors: "tuple[str, ...]" = ()
 
     def best(self, d: date) -> "Path | None":
         """``d`` の最良候補 (無ければ ``None``)。"""
@@ -110,12 +117,12 @@ def discover_automation_files(
     """``root`` 以下 ``max_depth`` 階層までを探索して :class:`AutomationIndex` を返す。
 
     - 名前が :data:`AUTOMATION_FILE_RE` に一致する通常ファイルだけを候補にする
-      (日付として不正な ``2026-13-45`` 等は除外)
+      (日付として不正な ``2030-13-45`` 等は除外)
     - ``.`` 始まりのディレクトリは降りない。symlink はディレクトリ・ファイルとも
       たどらない (``follow_symlinks=False``: 循環 symlink / vault 外への逸脱対策)
-    - 読めないディレクトリ (権限など) は skip して続行する。``root`` 自体が
-      存在しない / 読めない場合も例外にせず空の索引を返す (呼び出し側が
-      ``root.is_dir()`` で設定不備を判定する)
+    - 読めないディレクトリ (権限など) は skip して続行し、理由を
+      :attr:`AutomationIndex.errors` に記録して WARNING ログを出す。``root``
+      自体が存在しない / 読めない場合も例外にはせず、errors 付きの空の索引を返す
 
     ``stat`` は名前が一致したファイルにだけ発行する (dataless でも materialize は
     起きない)。
@@ -123,6 +130,7 @@ def discover_automation_files(
     log = logger or logging.getLogger(__name__)
     found: "dict[date, list[tuple[float, int, str, Path]]]" = {}
     mtimes: "dict[Path, float]" = {}
+    errors: "list[str]" = []
 
     stack: "list[tuple[Path, int]]" = [(Path(root), 0)]
     while stack:
@@ -131,16 +139,24 @@ def discover_automation_files(
             with os.scandir(directory) as iterator:
                 entries = list(iterator)
         except OSError as exc:
-            level = logging.WARNING if depth == 0 else logging.DEBUG
-            log.log(level, "オートメーション探索: ディレクトリを読めません: %s (%s)",
-                    directory, exc)
+            log.warning("オートメーション探索: ディレクトリを読めません: %s (%s)",
+                        directory, exc)
+            errors.append(
+                f"ディレクトリを読めません: {directory}: {type(exc).__name__}: {exc}"
+            )
             continue
 
         for entry in entries:
             name = entry.name
             try:
                 is_dir = entry.is_dir(follow_symlinks=False)
-            except OSError:
+            except OSError as exc:
+                log.warning("オートメーション探索: 種別を判定できません: %s (%s)",
+                            entry.path, exc)
+                errors.append(
+                    f"エントリの種別を判定できません: {entry.path}: "
+                    f"{type(exc).__name__}: {exc}"
+                )
                 continue
             if is_dir:
                 if name.startswith("."):
@@ -161,7 +177,11 @@ def discover_automation_files(
                     continue
                 st = entry.stat(follow_symlinks=False)
             except OSError as exc:
-                log.debug("オートメーション探索: stat 失敗: %s (%s)", entry.path, exc)
+                log.warning("オートメーション探索: stat 失敗: %s (%s)", entry.path, exc)
+                errors.append(
+                    f"候補ファイルを stat できません: {entry.path}: "
+                    f"{type(exc).__name__}: {exc}"
+                )
                 continue
             path = Path(entry.path)
             found.setdefault(file_date, []).append(
@@ -176,12 +196,13 @@ def discover_automation_files(
         files[file_date] = tuple(item[3] for item in items)
 
     log.debug(
-        "オートメーション探索: root=%s dates=%d files=%d",
-        root, len(files), len(mtimes),
+        "オートメーション探索: root=%s dates=%d files=%d errors=%d",
+        root, len(files), len(mtimes), len(errors),
     )
     return AutomationIndex(
         files=MappingProxyType(files),
         mtimes=MappingProxyType(mtimes),
+        errors=tuple(errors),
     )
 
 

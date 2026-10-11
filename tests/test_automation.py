@@ -90,6 +90,7 @@ class TestAutomationIndex(unittest.TestCase):
     def test_newest_mtime(self):
         index = AutomationIndex(mtimes={Path("/a"): 10.0, Path("/b"): 30.0})
         self.assertEqual(index.newest_mtime(), 30.0)
+        self.assertEqual(index.errors, ())
 
 
 class TestDiscover(unittest.TestCase):
@@ -110,6 +111,7 @@ class TestDiscover(unittest.TestCase):
         self.assertEqual(index.best(date(2030, 1, 2)), b)
         self.assertEqual(index.dates(), (date(2030, 1, 1), date(2030, 1, 2)))
         self.assertEqual(index.latest_date(), date(2030, 1, 2))
+        self.assertEqual(index.errors, ())
 
     def test_file_directly_under_root_is_found(self):
         a = _write(self.root / "HealthAutoExport-2030-01-01.json")
@@ -187,12 +189,15 @@ class TestDiscover(unittest.TestCase):
         a = _write(self.root / "x" / "HealthAutoExport-2030-01-01.json")
         self.assertEqual(discover_automation_files(self.root).best(date(2030, 1, 1)), a)
 
-    def test_missing_root_returns_empty_index(self):
+    def test_missing_root_returns_empty_index_with_error(self):
         with self.assertLogs(_LOGGER, level="WARNING") as logs:
             index = discover_automation_files(self.root / "does-not-exist", logger=_LOGGER)
         self.assertEqual(index.dates(), ())
         self.assertIsNone(index.latest_date())
         self.assertIn("ディレクトリを読めません", logs.output[0])
+        # 空の索引でも「ファイルが無い」とは区別できるよう理由を残す
+        self.assertEqual(len(index.errors), 1)
+        self.assertIn("does-not-exist", index.errors[0])
 
     @unittest.skipIf(hasattr(os, "geteuid") and os.geteuid() == 0, "root は権限を無視する")
     def test_unreadable_subdirectory_is_skipped(self):
@@ -201,11 +206,28 @@ class TestDiscover(unittest.TestCase):
         _write(locked / "HealthAutoExport-2030-01-02.json")
         locked.chmod(0)
         try:
-            index = discover_automation_files(self.root)
+            with self.assertLogs(_LOGGER, level="WARNING") as logs:
+                index = discover_automation_files(self.root, logger=_LOGGER)
         finally:
             locked.chmod(0o755)
         self.assertEqual(index.best(date(2030, 1, 1)), ok)
         self.assertIsNone(index.best(date(2030, 1, 2)))
+        # 読めないフォルダは探索を続けつつ errors に残す (WARNING も出す)
+        self.assertEqual(len(index.errors), 1)
+        self.assertIn("locked", index.errors[0])
+        self.assertIn("locked", logs.output[0])
+
+    @unittest.skipIf(hasattr(os, "geteuid") and os.geteuid() == 0, "root は権限を無視する")
+    def test_unlistable_root_is_recorded(self):
+        _write(self.root / "x" / "HealthAutoExport-2030-01-01.json")
+        self.root.chmod(0o311)       # stat / 移動はできるが一覧できない
+        try:
+            with self.assertLogs(_LOGGER, level="WARNING"):
+                index = discover_automation_files(self.root, logger=_LOGGER)
+        finally:
+            self.root.chmod(0o755)
+        self.assertEqual(index.dates(), ())
+        self.assertEqual(len(index.errors), 1)
 
     def test_discovery_does_not_read_file_contents(self):
         # 名前と stat だけで索引を作る (dataless を materialize しない前提)。

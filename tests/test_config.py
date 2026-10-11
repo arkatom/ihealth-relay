@@ -384,5 +384,181 @@ class TestSlackWebhookUrl(unittest.TestCase):
             self.assertIn("SLACK_WEBHOOK_URL", str(ctx.exception))
 
 
+class TestDiarySettings(unittest.TestCase):
+    """Obsidian 日記用の optional キー (SPEC §2-E / v2 §4.6)."""
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.tmp_path = Path(self._tmp.name)
+        self.health = self.tmp_path / "AutoSync"
+        self.health.mkdir()
+        self.env_path = self.tmp_path / ".env"
+
+    def tearDown(self) -> None:
+        self._tmp.cleanup()
+
+    def load(self, extra: str = "", *, require_notion: bool = False) -> Config:
+        _write_env(self.env_path, _minimum_env(self.health, extra=extra))
+        return load_config(self.env_path, require_notion=require_notion)
+
+    def assert_error(self, extra: str, *fragments: str) -> None:
+        with self.assertRaises(ConfigError) as ctx:
+            self.load(extra)
+        for fragment in fragments:
+            self.assertIn(fragment, str(ctx.exception))
+
+    def test_defaults_keep_existing_behaviour(self):
+        from datetime import timedelta, timezone
+        cfg = self.load()
+        self.assertIsNone(cfg.default_publisher)
+        self.assertIsNone(cfg.obsidian_vault_dir)
+        self.assertEqual(cfg.obsidian_diary_dir, "日記")
+        self.assertIsNone(cfg.obsidian_template)
+        self.assertEqual(cfg.effective_create_missing(), "never")
+        self.assertEqual(cfg.obsidian_create_min_age_days, 2)
+        self.assertEqual(cfg.lookback_days, 7)
+        self.assertTrue(cfg.include_today)
+        self.assertEqual(cfg.sources, ("health", "weather", "github"))
+        self.assertEqual((cfg.jma_prec_no, cfg.jma_block_no), (44, 47662))
+        self.assertIsNone(cfg.github_token)
+        self.assertIsNone(cfg.github_owners)
+        self.assertEqual(cfg.diary_tz, timezone(timedelta(hours=9)))
+        self.assertEqual(cfg.network_grace_sec, 60.0)
+        self.assertEqual(cfg.logs_dir.name, "logs")
+        self.assertEqual(cfg.obsidian_backup_dir(), cfg.archive_root.parent / "obsidian-backup")
+
+    def test_full_settings(self):
+        from datetime import timedelta, timezone
+        vault = self.tmp_path / "vault"
+        vault.mkdir()
+        cfg = self.load(
+            "IHEALTH_PUBLISHER=Obsidian\n"
+            f"OBSIDIAN_VAULT_DIR={vault}\n"
+            "OBSIDIAN_DIARY_DIR=Journal/Daily/\n"
+            "OBSIDIAN_TEMPLATE=テンプレート/毎日の習慣.md\n"
+            "OBSIDIAN_CREATE_MIN_AGE_DAYS=0\n"
+            "IHEALTH_LOOKBACK_DAYS=3\n"
+            "IHEALTH_INCLUDE_TODAY=no\n"
+            "IHEALTH_SOURCES= GitHub , health ,github\n"
+            "IHEALTH_TZ_OFFSET=-05:30\n"
+            "IHEALTH_NETWORK_GRACE_SEC=0\n"
+            "JMA_PREC_NO=62\n"
+            "JMA_BLOCK_NO=47772\n"
+            "GITHUB_TOKEN=ghp_synthetic\n"
+            "GITHUB_OWNERS=octo, demo-org\n"
+            "GITHUB_EXCLUDE_REPOS=octo/archive\n"
+        )
+        self.assertEqual(cfg.default_publisher, "obsidian")
+        self.assertEqual(cfg.obsidian_vault_dir, vault)
+        self.assertEqual(cfg.obsidian_diary_dir, "Journal/Daily")
+        self.assertEqual(cfg.obsidian_template, Path("テンプレート/毎日の習慣.md"))
+        self.assertEqual(cfg.effective_create_missing(), "template")
+        self.assertEqual(cfg.obsidian_create_min_age_days, 0)
+        self.assertEqual(cfg.lookback_days, 3)
+        self.assertFalse(cfg.include_today)
+        self.assertEqual(cfg.sources, ("health", "github"))
+        self.assertEqual(cfg.diary_tz, timezone(-timedelta(hours=5, minutes=30)))
+        self.assertEqual(cfg.network_grace_sec, 0.0)
+        self.assertEqual((cfg.jma_prec_no, cfg.jma_block_no), (62, 47772))
+        self.assertEqual(cfg.github_token, "ghp_synthetic")
+        self.assertEqual(cfg.github_owners, "octo, demo-org")
+        self.assertEqual(cfg.github_exclude_repos, "octo/archive")
+
+    def test_secrets_not_in_repr(self):
+        cfg = self.load(
+            "GITHUB_TOKEN=ghp_synthetic_secret\n"
+            "SLACK_WEBHOOK_URL=https://hooks.slack.com/services/T0/B0/slacksecret\n"
+        )
+        text = repr(cfg)
+        self.assertNotIn("ghp_synthetic_secret", text)
+        self.assertNotIn("slacksecret", text)
+        self.assertNotIn("secret_token", text)  # NOTION_SECRET
+
+    def test_template_path_forms(self):
+        self.assertEqual(
+            self.load("OBSIDIAN_TEMPLATE=~/tpl.md\n").obsidian_template, Path.home() / "tpl.md",
+        )
+        self.assertEqual(
+            self.load("OBSIDIAN_TEMPLATE=/abs/tpl.md\n").obsidian_template, Path("/abs/tpl.md"),
+        )
+        self.assert_error("OBSIDIAN_TEMPLATE=~root/tpl.md\n", "OBSIDIAN_TEMPLATE")
+
+    def test_create_missing_modes(self):
+        cfg = self.load("OBSIDIAN_CREATE_MISSING=minimal\n")
+        self.assertEqual(cfg.effective_create_missing(), "minimal")
+        cfg = self.load("OBSIDIAN_TEMPLATE=t.md\nOBSIDIAN_CREATE_MISSING=NEVER\n")
+        self.assertEqual(cfg.effective_create_missing(), "never")
+        self.assert_error("OBSIDIAN_CREATE_MISSING=always\n", "OBSIDIAN_CREATE_MISSING")
+        self.assert_error("OBSIDIAN_CREATE_MISSING=template\n", "OBSIDIAN_TEMPLATE")
+
+    def test_invalid_values_rejected(self):
+        cases = [
+            ("IHEALTH_PUBLISHER=evernote\n", "IHEALTH_PUBLISHER"),
+            ("OBSIDIAN_VAULT_DIR=relative/vault\n", "OBSIDIAN_VAULT_DIR"),
+            ("OBSIDIAN_DIARY_DIR=/abs/diary\n", "OBSIDIAN_DIARY_DIR"),
+            ("OBSIDIAN_DIARY_DIR=../outside\n", "OBSIDIAN_DIARY_DIR"),
+            ("OBSIDIAN_DIARY_DIR=日記/../..\n", "OBSIDIAN_DIARY_DIR"),
+            ("OBSIDIAN_CREATE_MIN_AGE_DAYS=-1\n", "OBSIDIAN_CREATE_MIN_AGE_DAYS"),
+            ("IHEALTH_LOOKBACK_DAYS=seven\n", "IHEALTH_LOOKBACK_DAYS"),
+            ("IHEALTH_LOOKBACK_DAYS=-1\n", "IHEALTH_LOOKBACK_DAYS"),
+            ("IHEALTH_LOOKBACK_DAYS=367\n", "IHEALTH_LOOKBACK_DAYS"),
+            ("IHEALTH_LOOKBACK_DAYS=0\nIHEALTH_INCLUDE_TODAY=false\n", "対象日"),
+            ("IHEALTH_INCLUDE_TODAY=maybe\n", "IHEALTH_INCLUDE_TODAY"),
+            ("IHEALTH_SOURCES=health,calendar\n", "calendar"),
+            ("IHEALTH_SOURCES=,\n", "IHEALTH_SOURCES"),
+            ("IHEALTH_TZ_OFFSET=JST\n", "IHEALTH_TZ_OFFSET"),
+            ("IHEALTH_TZ_OFFSET=+25:00\n", "IHEALTH_TZ_OFFSET"),
+            ("IHEALTH_NETWORK_GRACE_SEC=601\n", "IHEALTH_NETWORK_GRACE_SEC"),
+            ("JMA_PREC_NO=0\n", "JMA_PREC_NO"),
+            ("JMA_BLOCK_NO=tokyo\n", "JMA_BLOCK_NO"),
+        ]
+        for extra, fragment in cases:
+            with self.subTest(extra=extra):
+                self.assert_error(extra, fragment)
+
+    def test_vault_dir_must_not_be_a_file(self):
+        file_path = self.tmp_path / "vault.md"
+        file_path.write_text("x", encoding="utf-8")
+        self.assert_error(f"OBSIDIAN_VAULT_DIR={file_path}\n", "OBSIDIAN_VAULT_DIR")
+
+    def test_tz_offset_forms(self):
+        from datetime import timedelta, timezone
+        self.assertEqual(self.load("IHEALTH_TZ_OFFSET=Z\n").diary_tz, timezone.utc)
+        self.assertEqual(
+            self.load("IHEALTH_TZ_OFFSET=+0900\n").diary_tz, timezone(timedelta(hours=9)),
+        )
+
+    def test_github_token_not_in_error_messages(self):
+        # 他キーの検証エラーでも token は出さない
+        with self.assertRaises(ConfigError) as ctx:
+            self.load("GITHUB_TOKEN=ghp_synthetic_secret\nJMA_PREC_NO=x\n")
+        self.assertNotIn("ghp_synthetic_secret", str(ctx.exception))
+
+    def test_ensure_notion_settings(self):
+        from ihealth.config import ensure_notion_settings
+        _write_env(
+            self.env_path,
+            f"HEALTH_EXPORT_DIR={self.health}\nBIRTH_DATE=1990-01-01\nDATABASE_ID=db\n",
+        )
+        cfg = load_config(self.env_path, require_notion=False)
+        with self.assertRaises(ConfigError) as ctx:
+            ensure_notion_settings(cfg)
+        self.assertIn("NOTION_SECRET", str(ctx.exception))
+        self.assertNotIn("DATABASE_ID", str(ctx.exception))
+        ensure_notion_settings(self.load())  # 両方あれば何もしない
+
+    def test_parse_sources(self):
+        from ihealth.config import parse_sources
+        self.assertEqual(parse_sources("weather"), ("weather",))
+        self.assertEqual(parse_sources("github,HEALTH"), ("health", "github"))
+        with self.assertRaises(ValueError):
+            parse_sources(" , ")
+
+    def test_publisher_kinds_shared_with_workflow(self):
+        from ihealth import config, workflow
+        self.assertIs(workflow.PUBLISHER_KINDS, config.PUBLISHER_KINDS)
+        self.assertIn("obsidian", config.PUBLISHER_KINDS)
+
+
 if __name__ == "__main__":
     unittest.main()

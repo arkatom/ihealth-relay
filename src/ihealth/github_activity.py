@@ -15,13 +15,20 @@ GitHub GraphQL API (``https://api.github.com/graphql``) を ``urllib.request`` �
 
 ``owners`` を渡すとその owner (user / org) の repo だけに絞る (``GITHUB_OWNERS``)。
 ``owners`` / ``exclude_repos`` は list のほか **カンマ区切りの str** も受け付ける
-(``.env`` の値をそのまま渡しても 1 文字ずつ owner 扱いされない)。
+(``.env`` の値をそのまま渡しても 1 文字ずつ owner 扱いされない。list の各要素も
+カンマで分割する)。前後空白・空要素は捨て、大文字小文字無視で重複除去する。
+GitHub の login として不正な owner (``/`` ・空白・URL など) や ``owner/name`` 形式で
+ない exclude は **API を呼ぶ前に** ``ValueError`` (黙って範囲が変わった値を書かない)。
 
 例外: **fork repo の commit は viewer 本人が author のものだけ数える**
 (``fork_all_authors=False`` 既定)。fork の default branch は upstream の同期 (Sync fork /
-fast-forward) で他人の commit が **元の committer date のまま** 入ってくるため、lookback
-再実行や backfill で過去日に upstream の変更行数が大量に載ってしまう。fork の Issue / PR
-(fork 自身のもの) は従来どおり全作者。``fork_all_authors=True`` で SPEC どおり全作者に戻せる。
+fast-forward) や fork 直後の状態で他人の commit が **元の committer date のまま** 入って
+くるため、lookback 再実行や backfill で過去日に upstream の変更行数が大量に載ってしまう。
+判定は ``author.user.login`` と viewer の login の一致 (大文字小文字無視) なので、GitHub
+アカウントに紐付いていないメールで作った本人 commit は fork では数えない。fork の
+Issue / PR (fork 自身のもの) は従来どおり全作者。``fork_all_authors=True`` で SPEC
+どおり全作者に戻せる。``owners`` 指定時は viewer の login を知らないので、fork が対象に
+入ったときだけ 1 request で取得する (取れなければ fork repo だけ失敗扱い)。
 
 ## repo 列挙 (SPEC §2-C からの意図的な逸脱あり)
 
@@ -58,12 +65,12 @@ until は **committer date** 基準 (実測確認済み)。日付への bucket �
 
 その日の items を **種別 (issue → PR → commit) → repo → number 降順** に並べる。repo の
 順序は「**その日のその repo の最終イベント時刻** (表示する Issue の ``closedAt`` / PR の
-``mergedAt`` / 数えた commit の ``committedDate`` の最大) の降順、同時刻は ``owner/name``
-昇順」。SPEC の「repo 順 = (現在の) pushedAt 降順」は、lookback 再実行 (1 日 3 回 × 過去
-7 日) のたびに **後日の無関係な push で過去日の行順が入れ替わり**、内容が同じなのに
-ノートが書き換わる (= バックアップ・Sync・レポート上の update が毎回出る) ため採らない。
-この順序はその日のデータだけで決まるので、内容が変わらない限り文字列も変わらない
-(前身の「実行時点の updated_at 順」にも近い: 実測で保存済みの値との行順一致が増える)。
+``mergedAt`` / 数えた commit の ``committedDate`` の最大。種別をまたいで共通) の降順、
+同時刻は ``owner/name`` 昇順 (大文字小文字無視)」。SPEC の「repo 順 = (現在の) pushedAt
+降順」は、lookback 再実行 (1 日 3 回 × 過去 7 日) のたびに **後日の無関係な push で過去日の
+行順が入れ替わり**、内容が同じなのにノートが書き換わる (= バックアップ・Sync・レポート上の
+update が毎回出る) ため採らない。この順序はその日のデータだけで決まるので、内容が変わら
+ない限り文字列も変わらない (前身の「翌朝の実行時点の updated_at 順」にも近い)。
 
 ## 完全性 (SPEC §4.4)
 
@@ -72,6 +79,8 @@ until は **committer date** 基準 (実測確認済み)。日付への bucket �
 pagination 上限での打ち切りは ``False`` (``errors`` に理由)。呼び出し側は
 ``complete=False`` のとき ``Github`` キーを書かない (既存値保持)。
 ``complete=True`` かつ活動なしの日だけ ``"該当なし"`` を書く (:meth:`GitHubActivity.text_for`)。
+``status`` は通知・レポート用に ``complete`` / ``partial`` (一部でも取れた) / ``failed``
+(viewer 取得失敗・全 owner の列挙失敗・走査が必要な repo が全滅のいずれか) を返す。
 
 ## GitHub 側 timeout への対処
 
@@ -79,9 +88,12 @@ GitHub GraphQL はサーバ側でおよそ 10 秒を超えたクエリを打ち�
 ``"Something went wrong ... timeout"``)。default branch history の 1 page (100 commit 分の
 ``additions``/``deletions`` = diff 統計) は巨大 commit を含むと超えることがある (実測:
 長期 backfill の 1 page 目で 10.8 秒 → 502)。GitHub は打ち切られた計算も cache するので、
-まず同じクエリを 1 回だけ再送し、それでも timeout なら **同じ cursor から page 件数を
-100 → 50 → 25 → 10 と縮小** して取り直す (最小件数では通常どおり最大 3 回再試行)。
+history を含む request は、まず同じクエリを 1 回だけ再送し、それでも timeout なら **同じ
+cursor から page 件数を 100 → 50 → 25 → 10 と縮小** して取り直す (最小件数では通常どおり
+最大 3 回再試行)。縮小した件数はその repo の残りの page にも使う (同じ repo で timeout を
+繰り返さない)。pagination 上限は history だけ「既定 page 件数 (100) 換算」で数える。
 1 repo の 1 page が全段階で失敗したときだけ、その repo を失敗 (= ``complete=False``) とする。
+500 / 503 / 接続エラー / レート制限は timeout とみなさず縮小しない (通常の再試行回数のまま)。
 
 ## 秘密情報
 
@@ -100,6 +112,7 @@ import json
 import logging
 import math
 import random
+import re
 import subprocess
 import time
 import urllib.error
@@ -146,7 +159,8 @@ _HISTORY_PAGE_SIZES: "tuple[int, ...]" = (100, 50, 25, 10)
 _HISTORY_PAGE_SIZE = _HISTORY_PAGE_SIZES[0]
 #: 縮小できる段階で、縮小前に同じ page 件数で再送する回数 (GitHub は timeout した計算も
 #: cache するので同一クエリの再送で通ることが多い。実測: 502 (10.8s) → 200 (5.0s))。
-_SHRINK_SERVER_RETRIES = 1
+#: GitHub 側 timeout (502/504 / GraphQL timeout 系) にだけ効く (他の再試行は減らさない)。
+_SHRINK_TIMEOUT_RETRIES = 1
 #: commit ごとの associatedPullRequests 取得件数 (SPEC §4.4)。
 _ASSOC_PR_FIRST = 10
 #: 1 connection あたりの最大 page 数。超えたら打ち切り = complete=False (cursor 異常時の
@@ -161,6 +175,14 @@ _MAX_PAGES_PER_CONNECTION = 100
 _MAX_REPO_PAGES = 50
 #: viewer.organizations の最大 page 数 (100 × 10 = 1000 org)。
 _MAX_ORG_PAGES = 10
+
+# ---------- 引数検証 ----------
+
+#: GitHub の user / org の login (英数字始まり、英数字・``-``、最大 39 文字。Enterprise
+#: Managed User の ``_`` も許す)。``owner/name`` や URL・空白入りの設定ミスを弾く用途。
+_LOGIN_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,38}")
+#: GitHub の repo 名 (英数字・``.`` ・ ``-`` ・ ``_``、最大 100 文字)。
+_REPO_NAME_RE = re.compile(r"[A-Za-z0-9._-]{1,100}")
 
 # ---------- HTTP / リトライ ----------
 
@@ -371,7 +393,7 @@ class GitHubClient:
         query: str,
         variables: "dict | None" = None,
         *,
-        server_retries: "int | None" = None,
+        timeout_retries: "int | None" = None,
     ) -> dict:
         """GraphQL を 1 回実行して ``data`` dict を返す。
 
@@ -380,11 +402,12 @@ class GitHubClient:
         - 403 / 429 のレート制限 (``Retry-After`` / ``x-ratelimit-reset``) は最大
           ``max_retries`` 回まで待って再試行。1 回の待機が ``max_wait_sec`` を超えるなら待たずに失敗
         - 500/502/503/504・接続エラー・GraphQL の一時エラー ("Something went wrong" 等) は
-          指数バックオフで再試行。``server_retries`` を渡すと **この種の再試行回数だけ** を
-          それ以下に絞る (レート制限の待機は絞らない)。呼び出し側が page 縮小などで自前に
-          取り直すとき用
-        - GitHub 側 timeout と見られる失敗 (HTTP 502/504 / GraphQL の timeout 系) で諦めた
-          場合は ``GitHubError.server_timeout=True``
+          指数バックオフで最大 ``max_retries`` 回再試行
+        - ``timeout_retries`` を渡すと、そのうち **GitHub 側 timeout と見られる失敗**
+          (HTTP 502/504 / GraphQL の timeout 系) の再試行回数だけをそれ以下に絞る
+          (500/503・接続エラー・レート制限の再試行は絞らない)。呼び出し側が page 縮小で
+          自前に取り直すとき用
+        - GitHub 側 timeout と見られる失敗で諦めた場合は ``GitHubError.server_timeout=True``
         - 送信前の ``ValueError`` (ヘッダ値・URL の不正) は再試行せず、元の例外文 (ヘッダ値 =
           token を含みうる) を一切残さない :class:`GitHubError` にする
         """
@@ -392,10 +415,10 @@ class GitHubClient:
             {"query": query, "variables": variables or {}}, ensure_ascii=False,
         ).encode("utf-8")
         attempts = self._max_retries + 1
-        server_budget = self._max_retries
-        if server_retries is not None:
-            server_budget = max(0, min(int(server_retries), self._max_retries))
-        server_failures = 0
+        timeout_budget = self._max_retries
+        if timeout_retries is not None:
+            timeout_budget = max(0, min(int(timeout_retries), self._max_retries))
+        timeout_failures = 0
         for attempt in range(1, attempts + 1):
             req = urllib.request.Request(
                 self._endpoint,
@@ -416,9 +439,9 @@ class GitHubClient:
             except urllib.error.HTTPError as exc:
                 error_body = _read_error_body(exc)
                 wait, too_long = self._retry_wait(exc, error_body, attempt)
-                if exc.code in _RETRYABLE_STATUS:
-                    server_failures += 1
-                    if server_failures > server_budget:
+                if exc.code in _SERVER_TIMEOUT_STATUS:
+                    timeout_failures += 1
+                    if timeout_failures > timeout_budget:
                         wait = None
                 if wait is not None and attempt < attempts:
                     self._logger.warning(
@@ -430,9 +453,10 @@ class GitHubClient:
                 raise self._http_error(exc.code, error_body, too_long) from None
             except (OSError, http.client.HTTPException) as exc:
                 # OSError は URLError / socket.timeout / TimeoutError / ConnectionError /
-                # ssl.SSLError (read 中の TLS 断) をまとめて含む (HTTPError は上で処理済み)
-                server_failures += 1
-                if attempt < attempts and server_failures <= server_budget:
+                # ssl.SSLError (read 中の TLS 断) をまとめて含む (HTTPError は上で処理済み)。
+                # クライアント側 timeout (30s) は GitHub 側 timeout (~10s で 502) ではないので
+                # timeout_retries の対象外 (page 縮小では直らない)
+                if attempt < attempts:
                     wait = _backoff_sec(attempt)
                     self._logger.warning(
                         "GitHub API 接続エラー (%s), %.1fs 後に再試行 (%d/%d)",
@@ -460,9 +484,9 @@ class GitHubClient:
             errors = payload.get("errors")
             if errors:
                 gql_error = _graphql_error(errors, payload.get("data"))
-                if _is_transient_graphql(errors):
-                    server_failures += 1
-                    if attempt < attempts and server_failures <= server_budget:
+                if gql_error.server_timeout:
+                    timeout_failures += 1
+                    if attempt < attempts and timeout_failures <= timeout_budget:
                         wait = _backoff_sec(attempt)
                         self._logger.warning(
                             "GitHub GraphQL 一時エラー, %.1fs 後に再試行 (%d/%d): %s",
@@ -523,7 +547,7 @@ class GitHubClient:
           待たずに失敗 (2 つ目の値に必要秒を入れて返す)
         """
         code = exc.code
-        if code in (500, 502, 503, 504):
+        if code in _RETRYABLE_STATUS:
             return _backoff_sec(attempt), None
         if code not in (403, 429):
             return None, None
@@ -560,7 +584,12 @@ class GitHubClient:
                 f" (レート制限: 待機 {too_long:.0f}s が上限 "
                 f"{self._max_wait_sec:.0f}s を超えるため中断)"
             )
-        return GitHubError(text, status=status, rate_limited=rate_limited)
+        return GitHubError(
+            text,
+            status=status,
+            rate_limited=rate_limited,
+            server_timeout=status in _SERVER_TIMEOUT_STATUS,
+        )
 
 
 def _backoff_sec(attempt: int) -> float:
@@ -673,6 +702,9 @@ def _graphql_error(errors: object, data: object) -> GitHubError:
         error_types=types,
         data=data if isinstance(data, dict) else None,
         rate_limited="RATE_LIMITED" in types,
+        # "Something went wrong while executing your query. This may be the result of a
+        # timeout ..." 等 = GitHub 側のクエリ timeout (クエリを軽くすれば通る見込み)
+        server_timeout=_is_transient_graphql(errors),
     )
 
 
@@ -726,6 +758,8 @@ class GitHubActivity:
         repos_listed: 列挙できた repo 総数 (絞り込み前)
         requests: この収集で発行した HTTP 試行回数
         cost: この収集で消費した GraphQL rate limit point
+        repos_failed: 走査が必要だったのに失敗した repo 数
+        owners_listed: repo 一覧の取得に成功した owner 数
     """
 
     days: "dict[date, list[GitHubItem]]"
@@ -735,17 +769,27 @@ class GitHubActivity:
     repos_listed: int = 0
     requests: int = 0
     cost: int = 0
+    repos_failed: int = 0
+    owners_listed: int = 0
 
     @property
     def status(self) -> str:
         """``"complete"`` / ``"partial"`` (一部失敗) / ``"failed"`` (何も取れていない)。
+
+        - ``complete``: 全部取れた
+        - ``failed``: viewer の取得失敗 / 全 owner の repo 一覧取得失敗 / 走査が必要な
+          repo が 1 つ以上あって全部失敗 のいずれか (= 使えるデータが無い)
+        - ``partial``: 上記以外の失敗 (走査に成功した repo がある、または一部 owner の
+          一覧は取れてその範囲に走査対象が無かった)
 
         ``complete`` 以外は日記に書かない前提 (:meth:`text_for`)。``partial`` /
         ``failed`` の区別は通知文面・実行レポート用。
         """
         if self.complete:
             return "complete"
-        if self.repos_scanned == 0 and self.repos_listed == 0:
+        if self.repos_scanned > 0:
+            return "partial"
+        if self.repos_failed > 0 or self.owners_listed == 0:
             return "failed"
         return "partial"
 
@@ -818,6 +862,14 @@ query IhealthViewer($orgsAfter: String) {
       nodes { login }
     }
   }
+}
+"""
+
+#: ``owners`` 指定時に fork の commit 作者判定のためだけに viewer の login を引く。
+_VIEWER_LOGIN_QUERY = """
+query IhealthViewerLogin {
+  rateLimit { cost remaining resetAt }
+  viewer { login }
 }
 """
 
@@ -938,6 +990,14 @@ class _RepoScan:
     #: 日付 → [additions, deletions, commit 数]
     commits: "dict[date, list[int]]" = field(default_factory=dict)
     default_branch: "str | None" = None
+    #: 日付 → その日に表示する item (issue close / PR merge / 数えた commit) の最終時刻。
+    #: 日内の repo 順 (モジュール docstring「並び順」) に使う
+    last_event: "dict[date, datetime]" = field(default_factory=dict)
+
+    def note_event(self, day: date, moment: datetime) -> None:
+        current = self.last_event.get(day)
+        if current is None or moment > current:
+            self.last_event[day] = moment
 
 
 class _ShapeError(GitHubError):
@@ -1147,6 +1207,15 @@ def _is_candidate(repo: _RepoRef, window: _Window, include_archived: bool) -> bo
     return max(stamps) >= window.start
 
 
+def _author_login(author: object) -> "str | None":
+    """commit の ``author.user.login`` (小文字化)。GitHub アカウント未紐付けなら ``None``。"""
+    if not isinstance(author, dict):
+        return None
+    user = author.get("user")
+    login = user.get("login") if isinstance(user, dict) else None
+    return login.lower() if isinstance(login, str) and login else None
+
+
 def _consume_closed(
     conn: dict,
     time_key: str,
@@ -1155,6 +1224,7 @@ def _consume_closed(
     out: "list[tuple[date, int, str, str]]",
     seen: "set[int]",
     where: str,
+    scan: _RepoScan,
 ) -> "tuple[bool, str | None]":
     """closed issue / merged PR の 1 page を処理し (続きが必要か, cursor) を返す。
 
@@ -1181,7 +1251,9 @@ def _consume_closed(
         if not isinstance(title, str):
             raise _ShapeError(f"{where}: title が文字列ではありません (#{number})")
         url = _req_str(node, "url", where)
-        out.append((moment.astimezone(tz).date(), number, title, url))
+        day = moment.astimezone(tz).date()
+        out.append((day, number, title, url))
+        scan.note_event(day, moment)
     has_next, cursor = _page_info(conn, where)
     return has_next and not reached_older, cursor
 
@@ -1191,11 +1263,17 @@ def _consume_history(
     window: _Window,
     tz: tzinfo,
     include_bots: bool,
-    totals: "dict[date, list[int]]",
+    fork_author: "str | None",
+    scan: _RepoScan,
     seen: "set[str]",
     where: str,
     log: logging.Logger,
 ) -> "tuple[bool, str | None]":
+    """default branch history の 1 page を処理し (続きがあるか, cursor) を返す。
+
+    ``fork_author`` (小文字の login) を渡すと、その author の commit だけを数える
+    (fork repo の upstream 由来 commit を除外する用途)。
+    """
     for node in conn["nodes"]:
         oid = _req_str(node, "oid", where)
         if oid in seen:
@@ -1214,15 +1292,18 @@ def _consume_history(
             continue  # merge commit
         if not include_bots and _is_bot_author(node.get("author")):
             continue
+        if fork_author is not None and _author_login(node.get("author")) != fork_author:
+            continue  # fork: viewer 以外が author (upstream の同期で入った commit 等)
         if _is_pr_branch_commit(node, oid, where, log):
             continue
         additions = _req_int(node, "additions", where)
         deletions = _req_int(node, "deletions", where)
         day = committed.astimezone(tz).date()
-        bucket = totals.setdefault(day, [0, 0, 0])
+        bucket = scan.commits.setdefault(day, [0, 0, 0])
         bucket[0] += additions
         bucket[1] += deletions
         bucket[2] += 1
+        scan.note_event(day, committed)
     return _page_info(conn, where)
 
 
@@ -1234,11 +1315,17 @@ def _scan_repo(
     include_bots: bool,
     max_pages: int,
     log: logging.Logger,
+    *,
+    fork_author: "str | None" = None,
 ) -> _RepoScan:
     """1 repo の closed issue / merged PR / default branch history を最後まで取得する。
 
     1 request で 3 connection の 1 page 目をまとめて取り、続きが必要な connection だけ
-    ``@include`` で絞って追加 page を取る。
+    ``@include`` で絞って追加 page を取る。history を含む request が GitHub 側 timeout で
+    失敗したら、history の page 件数を ``_HISTORY_PAGE_SIZES`` に沿って縮小し同じ cursor
+    から取り直す (縮小後の件数はこの repo の残りの page にも使う)。
+
+    ``fork_author`` (小文字の login) を渡すと history はその author の commit だけ数える。
     """
     where = repo.name_with_owner
     scan = _RepoScan(default_branch=repo.default_branch)
@@ -1258,12 +1345,33 @@ def _scan_repo(
         "historyAfter": None,
         "assocFirst": _ASSOC_PR_FIRST,
     }
-    pages = {"issues": 0, "prs": 0, "history": 0}
+    pages = {"issues": 0, "prs": 0}
+    #: 取得要求した history の commit 数 (pagination 上限は既定 page 件数換算で判定)
+    history_requested = 0
+    size_index = 0
     seen_issues: "set[int]" = set()
     seen_prs: "set[int]" = set()
     seen_commits: "set[str]" = set()
     while variables["withIssues"] or variables["withPrs"] or variables["withHistory"]:
-        data = client.graphql(_REPO_ACTIVITY_QUERY, dict(variables))
+        history_first = _HISTORY_PAGE_SIZES[size_index]
+        variables["historyFirst"] = history_first
+        shrinkable = bool(variables["withHistory"]) and size_index + 1 < len(_HISTORY_PAGE_SIZES)
+        try:
+            data = client.graphql(
+                _REPO_ACTIVITY_QUERY,
+                dict(variables),
+                timeout_retries=_SHRINK_TIMEOUT_RETRIES if shrinkable else None,
+            )
+        except GitHubError as exc:
+            if not (shrinkable and exc.server_timeout):
+                raise
+            size_index += 1
+            log.warning(
+                "GitHub: %s の history 取得が GitHub 側で timeout (%s)。page 件数を "
+                "%d → %d に縮小して同じ位置から取り直します",
+                where, exc, history_first, _HISTORY_PAGE_SIZES[size_index],
+            )
+            continue
         repo_node = data.get("repository")
         if not isinstance(repo_node, dict):
             raise GitHubError(f"{where}: repository が取得できません (権限 / 削除?)")
@@ -1273,6 +1381,7 @@ def _scan_repo(
             conn = _connection(repo_node, "issues", f"{where} issues")
             more, cursor = _consume_closed(
                 conn, "closedAt", window, tz, scan.issues, seen_issues, f"{where} issues",
+                scan,
             )
             _check_page_limit(more, pages["issues"], max_pages, f"{where} issues")
             variables["withIssues"] = more
@@ -1283,13 +1392,13 @@ def _scan_repo(
             conn = _connection(repo_node, "pullRequests", f"{where} pullRequests")
             more, cursor = _consume_closed(
                 conn, "mergedAt", window, tz, scan.prs, seen_prs, f"{where} pullRequests",
+                scan,
             )
             _check_page_limit(more, pages["prs"], max_pages, f"{where} pullRequests")
             variables["withPrs"] = more
             variables["prsAfter"] = cursor
 
         if variables["withHistory"]:
-            pages["history"] += 1
             branch_node = repo_node.get("defaultBranchRef")
             target = branch_node.get("target") if isinstance(branch_node, dict) else None
             if isinstance(branch_node, dict) and isinstance(branch_node.get("name"), str):
@@ -1300,10 +1409,15 @@ def _scan_repo(
             else:
                 conn = _connection(target, "history", f"{where} history")
                 more, cursor = _consume_history(
-                    conn, window, tz, include_bots, scan.commits, seen_commits,
+                    conn, window, tz, include_bots, fork_author, scan, seen_commits,
                     f"{where} history", log,
                 )
-                _check_page_limit(more, pages["history"], max_pages, f"{where} history")
+                history_requested += history_first
+                if more and history_requested >= max_pages * _HISTORY_PAGE_SIZE:
+                    raise GitHubError(
+                        f"{where} history: pagination 上限 ({max_pages} page 相当 = "
+                        f"{max_pages * _HISTORY_PAGE_SIZE} commit) に達したため打ち切り"
+                    )
                 variables["withHistory"] = more
                 variables["historyAfter"] = cursor
     return scan
@@ -1325,17 +1439,88 @@ def _date_range(start: date, end: date) -> "list[date]":
     return days
 
 
-def _normalize_names(names: "Iterable[str] | None") -> "list[str]":
-    if names is None:
-        return []
+def _dedupe_names(names: "Iterable[str]") -> "list[str]":
+    """前後空白除去・空要素除去・大文字小文字無視の重複除去 (先勝ち・順序保持)。"""
     result: "list[str]" = []
+    seen: "set[str]" = set()
     for raw in names:
-        if not isinstance(raw, str):
-            continue
         name = raw.strip()
-        if name and name.lower() not in {n.lower() for n in result}:
+        if name and name.lower() not in seen:
+            seen.add(name.lower())
             result.append(name)
     return result
+
+
+def _split_names(names: "Iterable[str] | str | None", what: str) -> "list[str]":
+    """``owners`` / ``exclude_repos`` 引数を list に正規化する。
+
+    list / tuple のほか **カンマ区切りの str** (``.env`` の値そのまま) を受け付ける。
+    str を ``Sequence[str]`` として 1 文字ずつ回すと 1 文字の owner を大量に問い合わせる
+    (実在する 1 文字 login の他人の活動を書きかねない) ため、str は必ずカンマで分割する。
+    list の各要素もカンマで分割する。str 以外の要素は ``TypeError``。
+    """
+    if names is None:
+        return []
+    raw_items: "Iterable[object]" = [names] if isinstance(names, str) else names
+    parts: "list[str]" = []
+    for raw in raw_items:
+        if not isinstance(raw, str):
+            raise TypeError(f"{what} の要素は str で指定してください: {type(raw).__name__}")
+        parts.extend(raw.split(","))
+    return _dedupe_names(parts)
+
+
+def _normalize_owners(owners: "Sequence[str] | str | None") -> "list[str]":
+    """``owners`` を検証済みの login list にする (不正値は ``ValueError``)。"""
+    names = _split_names(owners, "owners")
+    bad = [name for name in names if not _LOGIN_RE.fullmatch(name)]
+    if bad:
+        raise ValueError(
+            f"owners に GitHub の user / org 名として不正な値があります: {bad!r} "
+            "(login 名をカンマ区切りで指定。例: 'octo-user,octo-org')"
+        )
+    return names
+
+
+def _normalize_excludes(exclude_repos: "Sequence[str] | str | None") -> "set[str]":
+    """``exclude_repos`` を小文字の ``owner/name`` 集合にする (不正値は ``ValueError``)。"""
+    names = _split_names(exclude_repos, "exclude_repos")
+    bad: "list[str]" = []
+    for name in names:
+        owner, sep, repo = name.partition("/")
+        if not sep or not _LOGIN_RE.fullmatch(owner) or not _REPO_NAME_RE.fullmatch(repo):
+            bad.append(name)
+    if bad:
+        raise ValueError(
+            f"exclude_repos は owner/name 形式で指定してください: {bad!r} "
+            "(例: 'octo-user/some-repo,octo-org/other')"
+        )
+    return {name.lower() for name in names}
+
+
+def _viewer_login(client: GitHubClient) -> str:
+    """viewer (token の持ち主) の login を 1 request で取得する。"""
+    data = client.graphql(_VIEWER_LOGIN_QUERY)
+    return _req_str(data.get("viewer"), "login", "viewer")
+
+
+#: 日内の種別順 (issue → PR → commit)。
+_KIND_ORDER = {"issue": 0, "pr": 1, "commit": 2}
+
+
+def _row_key(
+    scan: _RepoScan, repo: _RepoRef, day: date, item: GitHubItem,
+) -> "tuple[date, int, float, str, str, int]":
+    """日別の並びキー: 日付 → 種別 → その日のその repo の最終イベント時刻 (降順) →
+    ``owner/name`` (大文字小文字無視 → 完全一致の昇順) → number 降順。
+
+    その日のデータだけで決まる (後日の push や実行時刻に依存しない) ので、lookback で
+    同じ日を何度処理しても内容が同じなら同じ文字列になる。
+    """
+    last = scan.last_event.get(day)
+    stamp = last.timestamp() if last is not None else 0.0
+    nwo = repo.name_with_owner
+    return (day, _KIND_ORDER[item.kind], -stamp, nwo.lower(), nwo, -(item.number or 0))
 
 
 def collect_github_activity(
@@ -1344,10 +1529,11 @@ def collect_github_activity(
     end: date,
     *,
     tz: tzinfo = JST,
-    owners: "Sequence[str] | None" = None,
-    exclude_repos: "Sequence[str]" = (),
+    owners: "Sequence[str] | str | None" = None,
+    exclude_repos: "Sequence[str] | str | None" = (),
     include_bots: bool = False,
     include_archived: bool = True,
+    fork_all_authors: bool = False,
     max_pages: int = _MAX_PAGES_PER_CONNECTION,
     logger: "logging.Logger | None" = None,
 ) -> GitHubActivity:
@@ -1360,21 +1546,33 @@ def collect_github_activity(
         client: :class:`GitHubClient`
         start / end: 対象期間 (``start <= end``)
         tz: 日付境界の tz (既定 JST)
-        owners: 対象 owner (user / org の login)。``None`` なら viewer + 所属 org 全部
-        exclude_repos: 除外する ``owner/name`` (大文字小文字無視の完全一致)
+        owners: 対象 owner (user / org の login)。list またはカンマ区切りの str。
+            ``None`` / 空なら viewer + 所属 org 全部
+        exclude_repos: 除外する ``owner/name`` (大文字小文字無視の完全一致)。list または
+            カンマ区切りの str
         include_bots: bot の commit も数えるなら ``True``
         include_archived: archived repo も時刻条件を満たせば走査する (既定 ``True``)
-        max_pages: 1 connection あたりの最大 page 数 (超えたら打ち切り = incomplete)
+        fork_all_authors: fork repo の commit も全作者分数えるなら ``True`` (既定
+            ``False`` = viewer が author の commit だけ)
+        max_pages: 1 connection あたりの最大 page 数 (超えたら打ち切り = incomplete)。
+            history は既定 page 件数 (100 commit) 換算
         logger: 注入ロガー
 
     Returns:
         :class:`GitHubActivity` (``days`` は期間の全日付をキーに持つ)
+
+    Raises:
+        ValueError: ``end < start`` / ``max_pages < 1`` / ``owners`` ・ ``exclude_repos``
+            の書式不正 (いずれも API を呼ぶ前に検出)
+        TypeError: ``owners`` / ``exclude_repos`` に str 以外の要素
     """
     log = logger or _logger
     if end < start:
         raise ValueError(f"期間の開始が終了より後です: {start} > {end}")
     if max_pages < 1:
         raise ValueError(f"max_pages は 1 以上: {max_pages}")
+    owner_filter = _normalize_owners(owners)
+    excluded = _normalize_excludes(exclude_repos)
     window = _Window(
         start=datetime.combine(start, dt_time(0, 0), tzinfo=tz),
         end=datetime.combine(end + timedelta(days=1), dt_time(0, 0), tzinfo=tz),
@@ -1383,9 +1581,11 @@ def collect_github_activity(
     cost_before = client.cost_total
     days: "dict[date, list[GitHubItem]]" = {d: [] for d in _date_range(start, end)}
     errors: "list[str]" = []
-    excluded = {name.lower() for name in _normalize_names(exclude_repos)}
+    scanned = 0
+    failed = 0
+    owners_listed = 0
 
-    def _result(complete: bool, scanned: int, listed: int) -> GitHubActivity:
+    def _result(complete: bool, listed: int) -> GitHubActivity:
         activity = GitHubActivity(
             days=days,
             complete=complete,
@@ -1394,24 +1594,28 @@ def collect_github_activity(
             repos_listed=listed,
             requests=client.request_count - requests_before,
             cost=client.cost_total - cost_before,
+            repos_failed=failed,
+            owners_listed=owners_listed,
         )
         log.info(
-            "GitHub 活動収集: %s..%s status=%s repos=%d/%d requests=%d cost=%d",
-            start, end, activity.status, scanned, listed,
+            "GitHub 活動収集: %s..%s status=%s repos scanned=%d failed=%d listed=%d "
+            "requests=%d cost=%d",
+            start, end, activity.status, scanned, failed, listed,
             activity.requests, activity.cost,
         )
         return activity
 
     # ---- 1) owner 決定 ----
-    owner_list = _normalize_names(owners)
+    viewer_login: "str | None" = None
+    owner_list = owner_filter
     if not owner_list:
         try:
             viewer_login, orgs = _list_owners(client, log)
         except GitHubError as exc:
             errors.append(f"viewer / organizations の取得に失敗: {exc}")
             log.warning("GitHub: viewer / organizations の取得に失敗: %s", exc)
-            return _result(False, 0, 0)
-        owner_list = _normalize_names([viewer_login, *orgs])
+            return _result(False, 0)
+        owner_list = _dedupe_names([viewer_login, *orgs])
 
     # ---- 2) repo 列挙 ----
     complete = True
@@ -1425,13 +1629,15 @@ def collect_github_activity(
             errors.append(f"{owner}: repo 一覧の取得に失敗: {exc}")
             log.warning("GitHub: %s の repo 一覧の取得に失敗: %s", owner, exc)
             continue
+        owners_listed += 1
         for repo in owner_repos:
             key = repo.name_with_owner.lower()
             if key in seen_names:
                 continue
             seen_names.add(key)
             all_repos.append(repo)
-    # pushedAt 降順 (owner 跨ぎ)。同時刻・None は列挙順を保つ (sort は安定)。
+    # 走査順だけ pushedAt 降順 (owner 跨ぎ。同時刻・None は列挙順 = sort は安定)。
+    # 出力の並びは日ごとのイベント時刻で決める (step 4) のでここには依存しない。
     epoch = datetime(1970, 1, 1, tzinfo=timezone.utc)
     all_repos.sort(key=lambda r: r.pushed_at or epoch, reverse=True)
     candidates = [
@@ -1444,26 +1650,51 @@ def collect_github_activity(
         start, end, tz, len(candidates), len(all_repos),
     )
 
-    # ---- 3) repo ごとの走査 ----
-    scanned = 0
-    issue_rows: "list[tuple[int, date, int, GitHubItem]]" = []
-    pr_rows: "list[tuple[int, date, int, GitHubItem]]" = []
-    commit_rows: "list[tuple[int, date, GitHubItem]]" = []
-    for index, repo in enumerate(candidates):
+    # ---- 2.5) fork の commit 作者判定に使う viewer login ----
+    fork_login: "str | None" = viewer_login.lower() if viewer_login else None
+    forks = [repo for repo in candidates if repo.is_fork]
+    if forks and not fork_all_authors and fork_login is None:
         try:
-            scan = _scan_repo(client, repo, window, tz, include_bots, max_pages, log)
+            fork_login = _viewer_login(client).lower()
         except GitHubError as exc:
             complete = False
+            names = ", ".join(repo.name_with_owner for repo in forks)
+            errors.append(
+                f"viewer の login を取得できないため fork repo の commit 作者を判定できず "
+                f"{len(forks)} 件を skip ({names}): {exc}"
+            )
+            log.warning(
+                "GitHub: viewer の login を取得できないため fork repo %d 件を skip: %s",
+                len(forks), exc,
+            )
+
+    # ---- 3) repo ごとの走査 (item は並びキー :func:`_row_key` と一緒に集める) ----
+    rows: "list[tuple[tuple[date, int, float, str, str, int], GitHubItem]]" = []
+    for repo in candidates:
+        fork_author: "str | None" = None
+        if repo.is_fork and not fork_all_authors:
+            if fork_login is None:
+                failed += 1  # 理由は 2.5) で errors に 1 件だけ記録済み
+                continue
+            fork_author = fork_login
+        try:
+            scan = _scan_repo(
+                client, repo, window, tz, include_bots, max_pages, log,
+                fork_author=fork_author,
+            )
+        except GitHubError as exc:
+            complete = False
+            failed += 1
             errors.append(f"{repo.name_with_owner}: {exc}")
             log.warning("GitHub: %s の取得に失敗 (skip): %s", repo.name_with_owner, exc)
             continue
         scanned += 1
         for day, number, title, url in scan.issues:
             item = GitHubItem(kind="issue", repo=repo.name, url=url, number=number, title=title)
-            issue_rows.append((index, day, number, item))
+            rows.append((_row_key(scan, repo, day, item), item))
         for day, number, title, url in scan.prs:
             item = GitHubItem(kind="pr", repo=repo.name, url=url, number=number, title=title)
-            pr_rows.append((index, day, number, item))
+            rows.append((_row_key(scan, repo, day, item), item))
         branch = scan.default_branch or repo.default_branch or "main"
         for day, (additions, deletions, count) in scan.commits.items():
             item = GitHubItem(
@@ -1474,20 +1705,17 @@ def collect_github_activity(
                 deletions=deletions,
                 commit_count=count,
             )
-            commit_rows.append((index, day, item))
+            rows.append((_row_key(scan, repo, day, item), item))
         log.debug(
             "GitHub: %s issues=%d prs=%d commit_days=%d",
             repo.name_with_owner, len(scan.issues), len(scan.prs), len(scan.commits),
         )
 
-    # ---- 4) 日別に並べる: issue (repo 順, number 降順) → PR (同) → commit (repo 順) ----
-    for index, day, number, item in sorted(issue_rows, key=lambda r: (r[0], -r[2])):
+    # ---- 4) 日別に並べる: 種別 (issue → PR → commit) → repo (その日の最終イベント
+    #         時刻の降順, 同時刻は owner/name 昇順) → number 降順 ----
+    rows.sort(key=lambda row: row[0])
+    for key, item in rows:
+        day = key[0]
         if day in days:
             days[day].append(item)
-    for index, day, number, item in sorted(pr_rows, key=lambda r: (r[0], -r[2])):
-        if day in days:
-            days[day].append(item)
-    for index, day, item in sorted(commit_rows, key=lambda r: r[0]):
-        if day in days:
-            days[day].append(item)
-    return _result(complete, scanned, len(all_repos))
+    return _result(complete, len(all_repos))

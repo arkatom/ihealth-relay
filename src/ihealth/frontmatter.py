@@ -17,7 +17,16 @@ Unicode 正規化 (NFC/NFD) もしない (実ノートの本文には NFD 文字
 
 ## 対応する frontmatter の形
 
-- 先頭行 (BOM の後) が ``---`` で、次に現れる ``---`` 行 (または ``...`` 行) まで.
+境界は **Obsidian 本体と同じ規則** で決める (Obsidian.app の markdown パーサは
+``\\r\\n|\\r`` を ``\\n`` に正規化し BOM を除いた後、先頭が ``---\\n`` ちょうどのときだけ
+frontmatter とみなし、その後で最初に **行頭が** ``---`` で始まる行で閉じる).
+Obsidian と解釈が食い違う形には書き込まない (:class:`FrontmatterError`).
+
+- 先頭行 (BOM の後) が ``---`` ちょうどで、次に現れる ``---`` ちょうどの行まで.
+- 先頭行が ``---`` + 空白 (Obsidian は frontmatter と認識しない) / frontmatter 内の
+  単独 CR (``\\r``) 改行 (Obsidian は改行とみなすがこのモジュールは行として扱えない) /
+  行頭が ``---`` で始まるが ``---`` ちょうどではない閉じ行 (``--- `` ``----`` など) /
+  ``...`` (Obsidian は閉じとみなさない) は :class:`FrontmatterError`.
 - top-level は block mapping のみ. 行頭 (インデント無し) の ``key:`` 行が entry の開始.
   後続の「空白/タブで始まる行」「``-`` で始まる block sequence 行」は同じ entry の継続.
 - 空行とコメント行 (行頭 ``#`` も、インデント付きの ``  # …`` も) は entry を延長しない.
@@ -36,6 +45,9 @@ Unicode 正規化 (NFC/NFD) もしない (実ノートの本文には NFD 文字
 解釈できない top-level 行 (flow mapping, complex key ``? …``, 閉じ ``---`` 欠落など) を
 含む frontmatter は **変更せず** :class:`FrontmatterError` を raise する
 (壊れた/想定外の frontmatter に追記して被害を広げない).
+置換する entry の値に YAML anchor (``&name``) があり、置換しない場所から alias
+(``*name``) で参照されている場合も同様 (anchor を消すと frontmatter 全体が不正な YAML に
+なり、Obsidian がプロパティを 1 つも表示できなくなるため).
 
 ## 既存値との比較 (``unchanged`` 判定)
 
@@ -127,7 +139,7 @@ def render_scalar(value: object) -> str:
 
     - ``bool`` → ``true`` / ``false`` (``int`` より先に判定)
     - ``int`` → ``str(value)``
-    - ``float`` → 有限値のみ. 整数値なら int 表記 (``66.0`` → ``66``)、それ以外は
+    - ``float`` → 有限値のみ. 整数値なら int 表記 (``61.0`` → ``61``)、それ以外は
       ``repr`` (shortest round-trip). 指数表記になる値は位置表記に直す
       (YAML 1.1 では ``1e-05`` が文字列扱いになるため).
     - ``str`` → ``json.dumps(ensure_ascii=False)`` の double-quoted. 加えて
@@ -490,8 +502,62 @@ def _parse_key_line(content: str) -> "_KeyLine | None":
     return None
 
 
-def _is_delimiter(content: str, marks: "tuple[str, ...]") -> bool:
-    return content.rstrip(" \t") in marks
+_DELIMITER = "---"
+
+
+def _has_opening_delimiter(first: str) -> bool:
+    """1 行目 (改行除く) が frontmatter の開始行か (Obsidian と同じ判定).
+
+    Obsidian は ``\\r\\n|\\r`` を ``\\n`` に正規化した後、先頭が ``---\\n`` ちょうどの
+    ときだけ frontmatter とみなす. そのため 1 行目が ``---`` ちょうどなら開始行.
+    ``---`` の直後に単独 CR が来る (Obsidian からは開始行に見えるが、ここでは
+    行境界を正しく扱えない) / ``---`` + 空白 (Obsidian は frontmatter と認識しない
+    のに、見た目は frontmatter) の場合は書き込み自体を拒否する.
+
+    Raises:
+        FrontmatterError: 上記の曖昧な開始行.
+    """
+    visible = first.split("\r", 1)[0]  # Obsidian から見た 1 行目
+    if visible.rstrip(" \t") != _DELIMITER:
+        return False
+    if visible != first:
+        raise FrontmatterError(
+            "1 行目の '---' の後ろに単独の CR (\\r) 改行があります。"
+            "Obsidian と frontmatter の範囲の解釈が一致しないため書き込みません"
+        )
+    if first != _DELIMITER:
+        raise FrontmatterError(
+            "1 行目が '---' の後ろに空白を含みます。Obsidian はこれを frontmatter と"
+            "認識しないため書き込みません (行末の空白を消してください)"
+        )
+    return True
+
+
+def _find_closing(lines: "list[str]") -> int:
+    """閉じ ``---`` 行の index を返す (Obsidian と同じく、行頭が ``---`` の最初の行).
+
+    Raises:
+        FrontmatterError: 閉じ行が無い / 行頭が ``---`` だが ``---`` ちょうどではない
+            (``--- `` ``----`` ``---x`` など. Obsidian の各 API で解釈が分かれる) /
+            閉じ行より前に単独 CR 改行がある.
+    """
+    for i in range(1, len(lines)):
+        content = _content(lines[i])
+        if content.startswith(_DELIMITER):
+            if content != _DELIMITER:
+                raise FrontmatterError(
+                    f"frontmatter {i + 1} 行目: 閉じ行が '---' ちょうどではありません "
+                    f"({content[:10]!r}). Obsidian と解釈が食い違うため書き込みません"
+                )
+            return i
+        if "\r" in content:
+            raise FrontmatterError(
+                f"frontmatter {i + 1} 行目に単独の CR (\\r) 改行があります。"
+                "Obsidian と行の解釈が一致しないため書き込みません"
+            )
+    raise FrontmatterError(
+        "frontmatter の閉じ '---' が見つかりません (壊れた frontmatter には書き込みません)"
+    )
 
 
 def _leading_spaces(content: str) -> int:
@@ -599,20 +665,12 @@ def _parse(lines: "list[str]") -> "_Parsed | None":
     """frontmatter を解析する. frontmatter が無ければ ``None``.
 
     Raises:
-        FrontmatterError: 閉じ ``---`` 欠落 / 解釈不能な top-level 行 /
-            frontmatter 内で閉じない複数行の値.
+        FrontmatterError: 閉じ ``---`` 欠落 / Obsidian と境界の解釈が食い違う形 /
+            解釈不能な top-level 行 / frontmatter 内で閉じない複数行の値.
     """
-    if not lines or not _is_delimiter(_content(lines[0]), ("---",)):
+    if not lines or not _has_opening_delimiter(_content(lines[0])):
         return None
-    close_idx = None
-    for i in range(1, len(lines)):
-        if _is_delimiter(_content(lines[i]), ("---", "...")):
-            close_idx = i
-            break
-    if close_idx is None:
-        raise FrontmatterError(
-            "frontmatter の閉じ '---' が見つかりません (壊れた frontmatter には書き込みません)"
-        )
+    close_idx = _find_closing(lines)
 
     entries: "list[_Entry]" = []
     current: "_KeyLine | None" = None
@@ -673,7 +731,8 @@ def split_frontmatter(text: str) -> "tuple[str, str] | None":
     frontmatter が無ければ ``None``. 2 つを連結すると元の ``text`` に戻る.
 
     Raises:
-        FrontmatterError: 閉じ ``---`` 欠落 / 解釈不能な top-level 行.
+        FrontmatterError: 閉じ ``---`` 欠落 / Obsidian と境界の解釈が食い違う形 /
+            解釈不能な top-level 行.
     """
     bom = _BOM if text.startswith(_BOM) else ""
     lines = _split_lines(text[len(bom):])
@@ -859,6 +918,51 @@ def _norm_key(key: str) -> str:
     return unicodedata.normalize("NFC", key)
 
 
+#: node の先頭 (行頭 / 空白・flow 区切りの直後) に現れる anchor ``&name`` / alias ``*name``.
+#: quoted / plain scalar の中の ``&x`` まで拾いうるが、拾い過ぎは「書き込みを拒否する」
+#: 安全側にしか倒れない.
+_ANCHOR_RE = re.compile(r"(?:^|(?<=[ \t\[{,]))&([^ \t\[\]{},]+)")
+_ALIAS_RE = re.compile(r"(?:^|(?<=[ \t\[{,]))\*([^ \t\[\]{},]+)")
+
+
+def _check_anchor_references(
+    lines: "list[str]", close_idx: int, replaced: "list[_Entry]",
+) -> None:
+    """置換で消える anchor が、置換しない行の alias から参照されていないか確認する.
+
+    entry を置換すると値に付いていた anchor (``key: &a 1`` や block 内の
+    ``- &a x``) も消える. 他の entry が ``*a`` で参照していると frontmatter 全体が
+    不正な YAML になる (Obsidian はプロパティを 1 つも表示できなくなる) ので、
+    その場合は書き込みを拒否する. anchor を新しい値に付け直すと alias 側の値が
+    変わってしまう (担当外 entry の値を変えない原則に反する) ので付け直しはしない.
+
+    Raises:
+        FrontmatterError: 消える anchor が参照されている.
+    """
+    anchors: "dict[str, str]" = {}
+    covered: "set[int]" = set()
+    for entry in replaced:
+        covered.update(range(entry.start, entry.end))
+        texts = [entry.value_head]
+        texts.extend(_content(lines[k]) for k in range(entry.start + 1, entry.end))
+        for text in texts:
+            for match in _ANCHOR_RE.finditer(text):
+                anchors.setdefault(match.group(1), entry.key)
+    if not anchors:
+        return
+    for k in range(1, close_idx):
+        if k in covered:
+            continue
+        for match in _ALIAS_RE.finditer(_content(lines[k])):
+            name = match.group(1)
+            if name in anchors:
+                raise FrontmatterError(
+                    f"キー {anchors[name]!r} の値の anchor &{name} が frontmatter {k + 1} 行目の"
+                    f" alias *{name} から参照されているため置換できません "
+                    "(anchor を消すと frontmatter が不正な YAML になります)"
+                )
+
+
 # ---------------------------------------------------------------------------
 # upsert 本体
 # ---------------------------------------------------------------------------
@@ -869,6 +973,7 @@ def upsert_frontmatter(
     *,
     fill_only_empty: bool = False,
     create_if_missing: bool = True,
+    replaceable: "Mapping[str, object] | None" = None,
 ) -> "tuple[str, list[FieldChange]]":
     """frontmatter の担当キーだけを書き換えたテキストと、キーごとの結果を返す.
 
@@ -881,6 +986,10 @@ def upsert_frontmatter(
             空でない既存値は ``action="kept"`` で保持 (過去分 backfill 用).
         create_if_missing: frontmatter が無いノートに新規作成するか.
             ``False`` で frontmatter が無ければ :class:`FrontmatterError`.
+        replaceable: ``fill_only_empty`` でも書き換えてよい既存値 (キー → 値).
+            既存値がこの値と **意味的に同じ** ときだけ、そのキーを空とみなして書き換える
+            (本ツールが以前に書いた暫定値を確定値に置き換える用. 利用者が書き換えた
+            値は一致しないので保持される). ``fill_only_empty=False`` では使わない.
 
     Returns:
         ``(新しいテキスト, [FieldChange, ...])``. FieldChange は ``updates`` の順
@@ -889,7 +998,7 @@ def upsert_frontmatter(
         ``(text, [])`` を返す (触らないノートの形は問わない).
 
     ``unchanged`` 判定は **意味的同一** で行う: 既存値が ``55`` で新しい値が
-    ``55.0``、既存が plain ``8.9時間`` で新しい値が ``"8.9時間"``、既存が
+    ``55.0``、既存が plain ``5.5時間`` で新しい値が ``"5.5時間"``、既存が
     ``|-`` の literal block で新しい値が同じ改行入り文字列、のように YAML として
     同じ値なら書き換えない (Obsidian が再シリアライズした表記を尊重し、
     無駄な書き込み・同期・バックアップを避ける).
@@ -898,13 +1007,20 @@ def upsert_frontmatter(
     ``FieldChange.warning`` に記録する (他の entry には触れない).
 
     Raises:
-        FrontmatterError: 閉じ ``---`` 欠落 / 解釈不能な top-level 行 /
-            frontmatter 無しで ``create_if_missing=False``.
+        FrontmatterError: 閉じ ``---`` 欠落 / Obsidian と境界の解釈が食い違う形
+            (先頭行 ``--- `` / 単独 CR 改行 / ``...`` や ``----`` の閉じ行) /
+            解釈不能な top-level 行 / 置換で消える anchor が alias から参照されている /
+            frontmatter 無しで ``create_if_missing=False``. いずれもテキストは返さない
+            (呼び出し側は元のノートに一切触れないこと).
         TypeError / ValueError: 値やキーが書けない型・値 (NaN など). この場合も
             テキストは一切変更されない (全キーの render を先に済ませる).
     """
     pending: "list[tuple[str, object, str]]" = []
     seen_norm: "set[str]" = set()
+    replaceable_norm: "dict[str, object]" = {
+        _norm_key(key): value for key, value in (replaceable or {}).items()
+        if isinstance(key, str)
+    }
     for key, value in updates.items():
         if value is None:
             continue
@@ -937,6 +1053,7 @@ def upsert_frontmatter(
         by_key.setdefault(_norm_key(entry.key), []).append(entry)
 
     replacements: "dict[int, tuple[int, str]]" = {}
+    replaced_entries: "list[_Entry]" = []
     inserts: "list[str]" = []
     changes: "list[FieldChange]" = []
     for key, value, rendered in pending:
@@ -954,9 +1071,17 @@ def upsert_frontmatter(
             )
         existing = _existing_scalar(lines, entry, parsed.close_idx)
         old_raw = _raw_value(lines, entry)
+        norm = _norm_key(key)
         if _semantically_equal(existing, value):
             action = ACTION_UNCHANGED
-        elif fill_only_empty and not _is_empty_value(existing):
+        elif (
+            fill_only_empty
+            and not _is_empty_value(existing)
+            and not (
+                norm in replaceable_norm
+                and _semantically_equal(existing, replaceable_norm[norm])
+            )
+        ):
             action = ACTION_KEPT
         else:
             new_line = f"{entry.key_raw}: {rendered}{nl}"
@@ -965,10 +1090,12 @@ def upsert_frontmatter(
             else:
                 action = ACTION_UPDATE
                 replacements[entry.start] = (entry.end, new_line)
+                replaced_entries.append(entry)
         changes.append(FieldChange(key, action, old_raw, rendered, warning))
 
     if not replacements and not inserts:
         return text, changes
+    _check_anchor_references(lines, parsed.close_idx, replaced_entries)
 
     out: "list[str]" = []
     i = 0

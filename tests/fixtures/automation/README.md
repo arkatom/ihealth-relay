@@ -8,8 +8,8 @@ Health Auto Export の **オートメーション** (iCloud Drive / JSON / Expor
 
 | ディレクトリ | 想定する設定 / 検証したいこと |
 | --- | --- |
-| `aggregated/HealthAutoExport-2030-01-15.json` | `aggregateData=true` / `aggregateSleep=true` (現役設定)。前日 record の除外、kJ → kcal、`Avg`/`Min`/`Max` 心拍、1 日 1 レコードの睡眠集計、瞑想 2 回、体重の最新値、BMI (`body_mass_index`) を体重と取り違えないこと、無関係 metric の無視 |
-| `segments/HealthAutoExport-2030-02-01.json` + `2030-02-02.json` | 非集計の睡眠 segment (`startDate`/`endDate` + `value`)。前日ファイルとの結合、日付をまたぐ同一 segment の重複除去、Awake / In Bed の除外、セッション結合 (0 時前に終わる前半も夜主睡眠に入る)、ソース別最大、昼寝 (14-20 時終了) |
+| `aggregated/HealthAutoExport-2030-01-15.json` | `aggregateData=true` / `aggregateSleep=true` (現役設定)。前日 record の除外、kJ → kcal、`Avg`/`Min`/`Max` 心拍、1 日 1 レコードの睡眠集計、瞑想 2 回、体重の最新値、BMI (`body_mass_index`) を体重と取り違えないこと、無関係 metric の無視。ワークアウトは書き出さない設定 (`data.workouts` なし) なので、アクティビティ詳細は判断できず書かない (テストで `data.workouts: []` を足すと `"瞑想6分"`) |
+| `segments/HealthAutoExport-2030-02-01.json` + `2030-02-02.json` | 非集計の睡眠 segment (`startDate`/`endDate` + `value`)。前日ファイルとの結合、日付をまたぐ同一 segment の重複除去、Awake / In Bed の除外 (セッションの間隔を埋めるだけ)、夜主睡眠 / 昼寝は segment ごとの終了時刻で分類 (0 時前に終わる前半だけセッション経由で翌朝の夜主睡眠へ繰り越す)、ソース別最大、昼寝 (14-20 時終了)。前日ファイルが無い / 夜が明ける前の古い前日ファイルしか無いときの夜主睡眠の保留も、この組で検証する |
 | `workouts/HealthAutoExport-2030-03-10.json` | `data.workouts` からアクティビティ詳細 (`"瞑想3分、ウォーキング31分、…"`) を組む。英 → 日の名前変換、未知名はそのまま、`duration` (秒) / end-start、同名の合算、前日ワークアウトの除外 |
 
 期待値は各テスト (`tests/test_automation_parser.py`, `tests/test_health_loader.py`)

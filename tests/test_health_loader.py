@@ -5,6 +5,8 @@
 * HAE Documents 風のツリーを tempdir に作る (オートメーション JSON は合成 fixture をコピー)
 * AutoSync の ``.hae`` はダミー bytes を置くだけ (存在判定用)。解凍は
   ``metric_fetcher`` を差し替えた fake が「解凍済み JSON」を archive に書いて返す
+* 現在時刻は ``now`` で注入する (既定は全 fixture の日付より後)。置くファイルの
+  mtime は既定で「対象日の翌日 12:00」= 対象日の終了後に書かれた確定版
 """
 
 from __future__ import annotations
@@ -52,13 +54,31 @@ def _mac(d: date, hour: int, minute: int = 0) -> float:
 
 
 _FAIL = object()
+_RAISE = object()
+
+#: テストの既定の「現在時刻」(全 fixture の日付より後 = 対象日は終わっている)。
+NOW = datetime(2030, 12, 31, 12, 0)
+
+
+def _final_mtime(d: date) -> float:
+    """``d`` の終了後 (翌日 12:00 ローカル) に書かれた = 確定版の mtime。"""
+    return datetime.combine(d + timedelta(days=1), time(12, 0)).timestamp()
+
+
+def _local(d: date, hour: int, minute: int = 0) -> float:
+    return datetime.combine(d, time(hour, minute)).timestamp()
+
+
+def _file_date(name: str) -> date:
+    return date.fromisoformat(name[len("HealthAutoExport-"):len("HealthAutoExport-") + 10])
 
 
 class FakeMetricFetcher:
     """``ihealth.source.fetch_metric_for_date`` の fake。
 
     ``payloads[(metric_dir, date)]`` を「解凍済み JSON」として archive に書いて path を返す。
-    値が ``_FAIL`` なら解凍失敗 (None) を返す。
+    値が ``_FAIL`` なら解凍失敗 (None) を返し、``_RAISE`` なら OSError を投げる
+    (archive への書き込み失敗などを模す)。
     """
 
     def __init__(self, payloads: "dict[tuple[str, date], object]") -> None:
@@ -71,6 +91,8 @@ class FakeMetricFetcher:
         payload = self.payloads.get((metric_dir_name, target_date), _FAIL)
         if payload is _FAIL:
             return None
+        if payload is _RAISE:
+            raise OSError(28, "No space left on device")
         dst = archive_root / target_date.isoformat() / f"{metric_dir_name}.json"
         dst.parent.mkdir(parents=True, exist_ok=True)
         dst.write_text(json.dumps(payload), encoding="utf-8")
@@ -116,8 +138,8 @@ class LoaderTestBase(unittest.TestCase):
         dst = self.docs / folder / src.name
         dst.parent.mkdir(parents=True, exist_ok=True)
         shutil.copyfile(src, dst)
-        if mtime is not None:
-            os.utime(dst, (mtime, mtime))
+        stamp = mtime if mtime is not None else _final_mtime(_file_date(src.name))
+        os.utime(dst, (stamp, stamp))
         return dst
 
     def write_automation(self, d: date, payload: object, folder: str = "新しいオートメーション",
@@ -125,21 +147,26 @@ class LoaderTestBase(unittest.TestCase):
         dst = self.docs / folder / f"HealthAutoExport-{d.isoformat()}.json"
         dst.parent.mkdir(parents=True, exist_ok=True)
         dst.write_text(text if text is not None else json.dumps(payload), encoding="utf-8")
-        if mtime is not None:
-            os.utime(dst, (mtime, mtime))
+        stamp = mtime if mtime is not None else _final_mtime(d)
+        os.utime(dst, (stamp, stamp))
         return dst
 
-    def put_hae(self, metric_dir: str, d: date) -> Path:
+    def put_hae(self, metric_dir: str, d: date, *, mtime: "float | None" = None) -> Path:
         name = d.strftime("%Y%m%d") + ".hae"
         path = self.docs / "AutoSync" / "HealthMetrics" / metric_dir / name
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_bytes(b"fake-lzfse")
+        stamp = mtime if mtime is not None else _final_mtime(d)
+        os.utime(path, (stamp, stamp))
         return path
 
-    def loader(self, fetcher: "FakeMetricFetcher | None" = None, **kwargs) -> HealthLoader:
+    def loader(self, fetcher: "FakeMetricFetcher | None" = None, *,
+               now: "datetime | None" = None, **kwargs) -> HealthLoader:
         if fetcher is not None:
             kwargs["metric_fetcher"] = fetcher
-        return HealthLoader(self.config(kwargs.pop("export_dir", None)), _LOGGER, **kwargs)
+        current = now or NOW
+        return HealthLoader(self.config(kwargs.pop("export_dir", None)), _LOGGER,
+                            now=lambda: current, **kwargs)
 
 
 class TestResolveDirectories(LoaderTestBase):
@@ -159,6 +186,29 @@ class TestResolveDirectories(LoaderTestBase):
         self.assertIsNone(resolve_autosync_dir(self.docs))
         self.assertEqual(resolve_automation_root(self.docs), self.docs)
 
+    def test_autosync_folder_without_health_metrics_still_searches_parent(self):
+        # AutoSync を止めて HealthMetrics を消した後も HEALTH_EXPORT_DIR=…/AutoSync のまま
+        # (.env.example の既定値) だと、隣のオートメーションを探さずに全日 nodata を
+        # 黙って返していた。フォルダ名 AutoSync でも親を探索 root にする
+        autosync = self.docs / "AutoSync"
+        (autosync / "Workouts").mkdir(parents=True)
+        self.assertIsNone(resolve_autosync_dir(autosync))
+        self.assertEqual(resolve_automation_root(autosync), self.docs)
+        self.put_automation("aggregated/HealthAutoExport-2030-01-15.json", folder="MyAutomation")
+        loader = self.loader(export_dir=autosync)
+        self.assertEqual(loader.automation_root, self.docs)
+        self.assertIsNone(loader.autosync_dir)
+        result = loader.load(D)
+        self.assertEqual(result.source, SOURCE_AUTOMATION)
+        self.assertEqual(result.status, STATUS_COMPLETE)
+        self.assertEqual(result.health.step_count, 501)
+
+    def test_other_folder_names_are_searched_as_is(self):
+        # AutoSync 以外の名前 (HealthMetrics も無い) は従来どおりそのフォルダを探索 root にする
+        other = self.docs / "Exports"
+        other.mkdir()
+        self.assertEqual(resolve_automation_root(other), other)
+
     def test_loader_finds_automation_in_sibling_folder_when_pointed_at_autosync(self):
         autosync = self.docs / "AutoSync"
         (autosync / "HealthMetrics").mkdir(parents=True)
@@ -169,6 +219,47 @@ class TestResolveDirectories(LoaderTestBase):
         result = loader.load(D)
         self.assertEqual(result.source, SOURCE_AUTOMATION)
         self.assertEqual(result.health.step_count, 501)
+
+
+@unittest.skipIf(hasattr(os, "geteuid") and os.geteuid() == 0, "root は権限を無視する")
+class TestUnreadableDirectories(LoaderTestBase):
+    """読めないディレクトリを「ファイルが無い = nodata」と取り違えない。"""
+
+    def test_unlistable_root_is_failed_not_nodata(self):
+        # stat はできるが一覧できない root (launchd の python が TCC で拒否された状況)
+        self.put_automation("aggregated/HealthAutoExport-2030-01-15.json")
+        self.docs.chmod(0o311)
+        try:
+            with self.assertLogs(_LOGGER, level="WARNING"):
+                result = self.loader().load(D)
+        finally:
+            self.docs.chmod(0o755)
+        self.assertEqual(result.status, STATUS_FAILED)
+        self.assertTrue(any("探索" in error for error in result.errors))
+
+    def test_untraversable_root_does_not_raise_from_constructor(self):
+        self.put_automation("aggregated/HealthAutoExport-2030-01-15.json")
+        self.docs.chmod(0)
+        try:
+            loader = self.loader()           # コンストラクタはファイルシステムに触れない
+            with self.assertLogs(_LOGGER, level="WARNING"):
+                result = loader.load(D)
+        finally:
+            self.docs.chmod(0o755)
+        self.assertEqual(result.status, STATUS_FAILED)
+        self.assertTrue(result.errors)
+
+    def test_unreadable_automation_folder_is_failed(self):
+        self.put_automation("aggregated/HealthAutoExport-2030-01-15.json", folder="auto")
+        locked = self.docs / "auto"
+        locked.chmod(0o300)
+        try:
+            with self.assertLogs(_LOGGER, level="WARNING"):
+                result = self.loader().load(D)
+        finally:
+            locked.chmod(0o755)
+        self.assertEqual(result.status, STATUS_FAILED)
+        self.assertTrue(any("auto" in error for error in result.errors))
 
 
 class TestIndex(LoaderTestBase):
@@ -205,7 +296,9 @@ class TestAutomationPath(LoaderTestBase):
         self.assertEqual(result.source, SOURCE_AUTOMATION)
         self.assertEqual(result.status, STATUS_COMPLETE)
         self.assertEqual(result.errors, ())
-        self.assertEqual(result.activity_detail, "瞑想6分")
+        # fixture (現役設定) はワークアウトを出力しない → アクティビティ詳細は判断できず書かない
+        self.assertIsNone(result.activity_detail)
+        self.assertIn("ワークアウト未出力", result.detail)
         h = result.health
         self.assertEqual(h.step_count, 501)
         self.assertAlmostEqual(h.active_energy_kcal, 300.0)
@@ -217,15 +310,36 @@ class TestAutomationPath(LoaderTestBase):
         self.assertEqual(result.supplemented_fields, ())
         self.assertIn("HealthAutoExport-2030-01-15.json", result.detail)
 
-    def test_provisional_when_file_written_before_day_end(self):
-        early = datetime.combine(D, time(21, 0)).timestamp()      # ローカル 21:00
-        self.put_automation("aggregated/HealthAutoExport-2030-01-15.json", mtime=early)
-        self.assertTrue(self.loader().load(D).provisional)
+    def test_today_is_provisional(self):
+        # 対象日がまだ終わっていない (今日) → その時点までの暫定値を返す (§4.6)
+        self.put_automation("aggregated/HealthAutoExport-2030-01-15.json", mtime=_local(D, 21))
+        result = self.loader(now=datetime.combine(D, time(22, 0))).load(D)
+        self.assertTrue(result.provisional)
+        self.assertEqual(result.status, STATUS_COMPLETE)
+        self.assertEqual(result.health.step_count, 501)
+        self.assertEqual(result.withheld_fields, ())
+
+    def test_ended_day_from_file_written_before_day_end_is_withheld(self):
+        # 対象日は終わったのに、ファイルは 21:00 の途中経過のまま (HAE が未再出力)
+        # → 過少の恐れがある値は書かない (既存値を保持)。想定内の遅延なので通知不要 = nodata
+        self.put_automation("aggregated/HealthAutoExport-2030-01-15.json", mtime=_local(D, 21))
+        result = self.loader(now=datetime.combine(D + timedelta(days=1), time(7, 0))).load(D)
+        self.assertIsNone(result.health)
+        self.assertIsNone(result.activity_detail)
+        self.assertEqual(result.status, STATUS_NODATA)
+        self.assertFalse(result.provisional)
+        self.assertIn("step_count", result.withheld_fields)
+        self.assertIn("sleep_hours", result.withheld_fields)
+        self.assertNotIn("nap_hours", result.withheld_fields)   # 元から値が無い
+        self.assertIn("途中まで", result.detail)
 
     def test_not_provisional_when_written_after_day_end(self):
         late = datetime.combine(D + timedelta(days=1), time(7, 0)).timestamp()
         self.put_automation("aggregated/HealthAutoExport-2030-01-15.json", mtime=late)
-        self.assertFalse(self.loader().load(D).provisional)
+        result = self.loader().load(D)
+        self.assertFalse(result.provisional)
+        self.assertEqual(result.status, STATUS_COMPLETE)
+        self.assertEqual(result.withheld_fields, ())
 
     def test_broken_best_candidate_falls_back_to_next(self):
         good = self.put_automation("aggregated/HealthAutoExport-2030-01-15.json",
@@ -243,6 +357,71 @@ class TestAutomationPath(LoaderTestBase):
         self.assertEqual(len(result.errors), 1)
         self.assertIn("新オートメーション", str(broken))
         self.assertIn(broken.name, result.errors[0])
+
+    def test_stale_older_candidate_after_broken_best_is_not_used(self):
+        # 最良候補 (新しい再出力) が読めず、残る候補は対象日の途中 (08:46) に書かれた古い出力
+        # → 既存の正しい値を古い途中経過で上書きしないよう値を返さない (failed で通知)
+        self.write_automation(D, None, folder="新オートメーション", text="{",
+                              mtime=_final_mtime(D + timedelta(days=1)))
+        self.put_automation("aggregated/HealthAutoExport-2030-01-15.json",
+                            folder="旧オートメーション", mtime=_local(D, 8, 46))
+        with self.assertLogs(_LOGGER, level="WARNING"):
+            result = self.loader().load(D)
+        self.assertEqual(result.status, STATUS_FAILED)
+        self.assertIsNone(result.health)
+        self.assertEqual(len(result.errors), 1)
+        self.assertIn("古い候補のため不採用", result.detail)
+
+    def test_no_fallback_to_older_candidate_for_today(self):
+        # 今日の分は全候補が途中経過 → 読めなかった新しい候補より古い値は使わない
+        self.write_automation(D, None, folder="新オートメーション", text="{",
+                              mtime=_local(D, 20))
+        self.put_automation("aggregated/HealthAutoExport-2030-01-15.json",
+                            folder="旧オートメーション", mtime=_local(D, 9))
+        with self.assertLogs(_LOGGER, level="WARNING"):
+            result = self.loader(now=datetime.combine(D, time(21, 0))).load(D)
+        self.assertEqual(result.status, STATUS_FAILED)
+        self.assertIsNone(result.health)
+
+    def test_candidate_without_target_day_data_does_not_shadow_older_one(self):
+        # 新しい候補に対象日の record が無い (前日付の metric だけ) → 古い候補を使う
+        self.write_automation(D, {"data": {"metrics": [{
+            "name": "apple_sleeping_wrist_temperature", "units": "degC",
+            "data": [{"date": "2030-01-14 22:30:00 +0900", "qty": 36.1}]}]}},
+            folder="new", mtime=_final_mtime(D) + 3600)
+        self.write_automation(D, {"data": {"metrics": [{
+            "name": "step_count", "units": "count",
+            "data": [{"date": "2030-01-15 10:00:00 +0900", "qty": 5000}]}]}},
+            folder="old", mtime=_final_mtime(D))
+        result = self.loader().load(D)
+        self.assertEqual(result.status, STATUS_COMPLETE)
+        self.assertEqual(result.health.step_count, 5000)
+
+    def test_unparseable_dates_are_failed_not_nodata(self):
+        # 日時の書式が変わった (12 時間表記など) → 黙って nodata にせず failed で通知する
+        self.write_automation(D, {"data": {"metrics": [
+            {"name": "step_count", "units": "count",
+             "data": [{"date": "2030-01-15 7:00:00 PM +0900", "qty": 10}]},
+        ]}})
+        with self.assertLogs(_LOGGER, level="WARNING"):
+            result = self.loader().load(D)
+        self.assertEqual(result.status, STATUS_FAILED)
+        self.assertIsNone(result.health)
+        self.assertTrue(any("step_count" in error for error in result.errors))
+
+    def test_uninterpretable_mindful_is_partial_without_activity(self):
+        self.write_automation(D, {"data": {"metrics": [
+            {"name": "step_count", "units": "count",
+             "data": [{"date": "2030-01-15 10:00:00 +0900", "qty": 100}]},
+            {"name": "mindful_minutes", "units": "minutes",
+             "data": [{"date": "2030-01-15 06:00:00 +0900", "qty": 10}]},
+        ]}})
+        with self.assertLogs(_LOGGER, level="WARNING"):
+            result = self.loader().load(D)
+        self.assertEqual(result.status, STATUS_PARTIAL)
+        self.assertEqual(result.health.step_count, 100)
+        self.assertIsNone(result.health.mindful_sessions)
+        self.assertIsNone(result.activity_detail)
 
     def test_all_candidates_broken_without_autosync_is_failed(self):
         self.write_automation(D, None, text="not json")
@@ -326,20 +505,95 @@ class TestAutomationPath(LoaderTestBase):
         with self.assertLogs(_LOGGER, level="WARNING"):
             result = self.loader().load(SEG_DAY)
         # 前日ファイルが読めない → 前夜 22:30-23:30 を取りこぼした過少値 (6.25h) を
-        # 書かないよう睡眠は None (既存値保持)。他のフィールドは確実なので残す
+        # 書かないよう夜主睡眠は None (既存値保持)。昼寝 (当日 14-20 時に終わる) と
+        # 他のフィールドは前日ファイルに依存しないので残す
         self.assertIsNone(result.health.sleep_hours)
-        self.assertIsNone(result.health.nap_hours)
+        self.assertAlmostEqual(result.health.nap_hours, 1.0)
         self.assertEqual(result.health.step_count, 2000)
         self.assertEqual(result.status, STATUS_PARTIAL)
         self.assertTrue(any("前日" in error for error in result.errors))
+        self.assertEqual(result.withheld_fields, ("sleep_hours",))
 
-    def test_missing_prev_day_file_is_not_an_error(self):
-        # 前日ファイルが「無い」のは nodata (失敗ではない) → 当日分だけで集計し complete
+    def test_missing_prev_day_file_withholds_night_that_may_start_before_midnight(self):
+        # 前日ファイルが「無い」のは失敗ではない (エラーなし = complete) が、0 時前後に
+        # 始まる夜は前日ファイルにしか無い segment (22:30-23:30) を取りこぼしている
+        # 恐れがある → 過少値 6.25h を確定値として書かない
         self.put_automation("segments/HealthAutoExport-2030-02-02.json")
         result = self.loader().load(SEG_DAY)
-        self.assertAlmostEqual(result.health.sleep_hours, 6.25)
+        self.assertIsNone(result.health.sleep_hours)
+        self.assertEqual(result.withheld_fields, ("sleep_hours",))
         self.assertEqual(result.status, STATUS_COMPLETE)
+        self.assertEqual(result.errors, ())
         self.assertIn("前日=なし", result.detail)
+        self.assertAlmostEqual(result.health.nap_hours, 1.0)
+
+    def test_missing_prev_day_file_keeps_night_that_starts_late(self):
+        # 夜が 02:00 より後に始まっていれば前日ファイルの segment は繋がりえない → 確定
+        self.write_automation(SEG_DAY, {"data": {"metrics": [{
+            "name": "sleep_analysis", "units": "hr", "data": [
+                {"startDate": "2030-02-02 03:00:00 +0900", "endDate": "2030-02-02 09:00:00 +0900",
+                 "value": "Core", "source": "Sample Watch"},
+            ]}]}})
+        result = self.loader().load(SEG_DAY)
+        self.assertAlmostEqual(result.health.sleep_hours, 6.0)
+        self.assertEqual(result.withheld_fields, ())
+        self.assertEqual(result.status, STATUS_COMPLETE)
+
+    def test_prev_day_file_written_before_the_night_ended_withholds_sleep(self):
+        # 前日ファイルの最終更新が夜主睡眠の終了 (06:10 +0900) より前 = 前夜の segment が
+        # まだ記録されていない時点の出力 → 結合しても過少の恐れ。
+        # 比較相手 (segment の終了) は record 自身の offset を持つ絶対時刻なので、mtime も
+        # 絶対時刻 (05:00 +0900) で置く (実行環境の TZ に依存させない。naive なローカル
+        # 05:00 だと UTC の CI では 14:00 JST になり、夜明け後の確定版と区別できない)
+        self.put_automation("segments/HealthAutoExport-2030-02-01.json",
+                            mtime=datetime(2030, 2, 2, 5, 0, tzinfo=_JST).timestamp())
+        self.put_automation("segments/HealthAutoExport-2030-02-02.json")
+        result = self.loader().load(SEG_DAY)
+        self.assertIsNone(result.health.sleep_hours)
+        self.assertEqual(result.withheld_fields, ("sleep_hours",))
+        self.assertIn("より前に書かれています", result.detail)
+
+    def test_prev_day_in_aggregated_form_cannot_complete_a_segment_night(self):
+        # aggregateSleep を切り替えた日: 前日ファイルは集計形式で segment を結合できない
+        self.write_automation(date(2030, 2, 1), {"data": {"metrics": [{
+            "name": "sleep_analysis", "units": "hr", "data": [
+                {"date": "2030-02-01 00:00:00 +0900", "totalSleep": 7.0,
+                 "sleepEnd": "2030-02-01 06:00:00 +0900", "source": "Sample Watch"},
+            ]}]}})
+        self.put_automation("segments/HealthAutoExport-2030-02-02.json")
+        result = self.loader().load(SEG_DAY)
+        self.assertIsNone(result.health.sleep_hours)
+        self.assertEqual(result.withheld_fields, ("sleep_hours",))
+        self.assertIn("集計形式", result.detail)
+
+    def test_prev_day_is_read_when_day_file_has_no_sleep(self):
+        # 当日ファイルに睡眠 metric が無い (夜全体が前日ファイルの segment) → 前日を読む
+        prev = self.write_automation(date(2030, 2, 1), {"data": {"metrics": [{
+            "name": "sleep_analysis", "units": "hr", "data": [
+                {"startDate": "2030-02-01 22:00:00 +0900", "endDate": "2030-02-02 06:00:00 +0900",
+                 "value": "Asleep", "source": "Sample Watch"},
+            ]}]}})
+        day = self.write_automation(SEG_DAY, {"data": {"metrics": [{
+            "name": "step_count", "units": "count", "data": [
+                {"date": "2030-02-02 12:00:00 +0900", "qty": 2000, "source": "Sample Phone"},
+            ]}]}})
+        recorder = RecordingJsonLoader()
+        result = self.loader(json_loader=recorder).load(SEG_DAY)
+        self.assertEqual(recorder.paths, [day, prev])
+        self.assertAlmostEqual(result.health.sleep_hours, 8.0)
+        self.assertEqual(result.status, STATUS_COMPLETE)
+
+    def test_stale_prev_candidate_after_broken_best_is_not_used(self):
+        # 前日の最良候補が壊れていて、残る候補は前日の途中経過 → 結合に使わない
+        self.write_automation(date(2030, 2, 1), None, folder="新", text="{oops",
+                              mtime=_final_mtime(SEG_DAY))
+        self.put_automation("segments/HealthAutoExport-2030-02-01.json", folder="旧",
+                            mtime=_local(date(2030, 2, 1), 23))
+        self.put_automation("segments/HealthAutoExport-2030-02-02.json")
+        with self.assertLogs(_LOGGER, level="WARNING"):
+            result = self.loader().load(SEG_DAY)
+        self.assertIsNone(result.health.sleep_hours)
+        self.assertEqual(result.status, STATUS_PARTIAL)
 
     def test_unexpected_exception_becomes_failed(self):
         self.put_automation("aggregated/HealthAutoExport-2030-01-15.json")
@@ -394,9 +648,10 @@ class TestSupplementFromAutoSync(LoaderTestBase):
         self.assertIn("補完", result.detail)
 
     def test_mindful_supplement_rebuilds_activity_detail(self):
+        # ワークアウトも書き出す設定 (data.workouts あり) なら、AutoSync で補った瞑想で組み直す
         payload = {"data": {"metrics": [{"name": "step_count", "units": "count", "data": [
             {"date": "2030-01-15 10:00:00 +0900", "qty": 100, "source": "Sample Phone"},
-        ]}]}}
+        ]}], "workouts": []}}
         self.write_automation(D, payload)
         self.put_hae("mindful_minutes", D)
         fetcher = FakeMetricFetcher({("mindful_minutes", D): {"data": [
@@ -407,6 +662,20 @@ class TestSupplementFromAutoSync(LoaderTestBase):
         self.assertAlmostEqual(result.health.mindful_minutes, 10.0)
         self.assertEqual(result.activity_detail, "瞑想10分")
         self.assertEqual(result.supplemented_fields, ("mindful_sessions", "mindful_minutes"))
+
+    def test_mindful_supplement_without_workouts_key_keeps_activity_unknown(self):
+        # ワークアウトを出力しない設定では、瞑想を補っても「瞑想10分」と断定しない
+        payload = {"data": {"metrics": [{"name": "step_count", "units": "count", "data": [
+            {"date": "2030-01-15 10:00:00 +0900", "qty": 100, "source": "Sample Phone"},
+        ]}]}}
+        self.write_automation(D, payload)
+        self.put_hae("mindful_minutes", D)
+        fetcher = FakeMetricFetcher({("mindful_minutes", D): {"data": [
+            {"start": _mac(D, 7), "end": _mac(D, 7, 10), "qty": 10, "unit": "min"},
+        ]}})
+        result = self.loader(fetcher).load(D)
+        self.assertAlmostEqual(result.health.mindful_minutes, 10.0)
+        self.assertIsNone(result.activity_detail)
 
     def test_supplement_failure_is_partial_but_keeps_json_values(self):
         self.put_automation("aggregated/HealthAutoExport-2030-01-15.json")
@@ -420,6 +689,58 @@ class TestSupplementFromAutoSync(LoaderTestBase):
         self.assertEqual(result.health.step_count, 501)
         self.assertTrue(any("sleep_analysis" in error for error in result.errors))
 
+    def test_supplement_skips_nap_dated_to_next_day_by_hae(self):
+        # aggregateSleep は 18 時以降に終わる睡眠を翌日付にして翌日の totalSleep に含める。
+        # 17:30-18:30 の昼寝を当日の nap にも数えると日をまたいで二重計上になる
+        self.put_automation("aggregated/HealthAutoExport-2030-01-15.json")
+        self.put_hae("sleep_analysis", D)
+        source = [{"identifier": "com.example.sleeptracker"}]
+        fetcher = FakeMetricFetcher({("sleep_analysis", D): {"data": [
+            {"asleep": 1.25, "start": _mac(D, 15), "end": _mac(D, 16, 15), "sources": source},
+            {"asleep": 1.0, "start": _mac(D, 17, 30), "end": _mac(D, 18, 30), "sources": source},
+        ]}})
+        result = self.loader(fetcher).load(D)
+        self.assertAlmostEqual(result.health.nap_hours, 1.25)
+
+    def test_truncated_hae_is_not_used_for_supplement(self):
+        # 補完元の .hae も対象日の途中 (17:55) までの出力なら使わない
+        self.put_automation("aggregated/HealthAutoExport-2030-01-15.json")
+        self.put_hae("sleep_analysis", D, mtime=_local(D, 17, 55))
+        fetcher = FakeMetricFetcher({("sleep_analysis", D): self._sleep_hae_payload()})
+        result = self.loader(fetcher).load(D)
+        self.assertEqual(fetcher.calls, [])          # 解凍もしない
+        self.assertIsNone(result.health.nap_hours)
+        self.assertEqual(result.withheld_fields, ("nap_hours",))
+        self.assertEqual(result.status, STATUS_COMPLETE)
+        self.assertEqual(result.supplemented_fields, ())
+
+    def test_supplement_exception_keeps_json_values(self):
+        # 解凍側の OSError (archive 書込失敗など) で JSON の値まで失わない
+        self.put_automation("aggregated/HealthAutoExport-2030-01-15.json")
+        self.put_hae("sleep_analysis", D)
+        fetcher = FakeMetricFetcher({("sleep_analysis", D): _RAISE})
+        with self.assertLogs(_LOGGER, level="WARNING"):
+            result = self.loader(fetcher).load(D)
+        self.assertEqual(result.status, STATUS_PARTIAL)
+        self.assertEqual(result.health.step_count, 501)
+        self.assertIsNone(result.health.nap_hours)
+        self.assertTrue(any("OSError" in error for error in result.errors))
+
+    def test_supplemented_value_dropped_by_validation_is_not_reported(self):
+        payload = {"data": {"metrics": [{"name": "step_count", "units": "count", "data": [
+            {"date": "2030-01-15 10:00:00 +0900", "qty": 100, "source": "Sample Phone"},
+        ]}]}}
+        self.write_automation(D, payload)
+        self.put_hae("body_fat_percentage", D)
+        fetcher = FakeMetricFetcher({("body_fat_percentage", D): {"data": [
+            {"qty": 95.0, "unit": "%", "start": _mac(D, 7), "end": _mac(D, 7)},
+        ]}})
+        with self.assertLogs(_LOGGER, level="WARNING"):
+            result = self.loader(fetcher).load(D)
+        self.assertIsNone(result.health.body_fat_percentage)
+        self.assertEqual(result.supplemented_fields, ())
+        self.assertIn("妥当性違反", result.detail)
+
     def test_no_supplement_when_autosync_has_no_file_for_the_day(self):
         self.put_automation("aggregated/HealthAutoExport-2030-01-15.json")
         self.put_hae("sleep_analysis", D - timedelta(days=3))
@@ -430,7 +751,7 @@ class TestSupplementFromAutoSync(LoaderTestBase):
 
 
 class TestAutoSyncOnlyPath(LoaderTestBase):
-    """オートメーション JSON が無い日 (2026-04 以前など) は AutoSync .hae だけで集計する。"""
+    """オートメーション JSON が無い日 (オートメーション導入前など) は AutoSync .hae だけで集計する。"""
 
     def _payloads(self) -> "dict[tuple[str, date], object]":
         prev = D - timedelta(days=1)
@@ -478,8 +799,9 @@ class TestAutoSyncOnlyPath(LoaderTestBase):
         self.assertAlmostEqual(h.sleep_hours, 7.0)
         self.assertAlmostEqual(h.nap_hours, 0.5)
         self.assertIsNone(h.mindful_minutes)
-        # mindful の .hae を読めた (空) → 瞑想なしと判断できる
-        self.assertEqual(result.activity_detail, "なし")
+        # AutoSync のワークアウト (AutoSync/Workouts/) は読まないので、瞑想が空でも
+        # 「なし」と断定しない (その日にあったワークアウトを含む既存の値を消さない)
+        self.assertIsNone(result.activity_detail)
         self.assertIn(("sleep_analysis", D - timedelta(days=1)), fetcher.calls)
 
     def test_activity_detail_unknown_when_mindful_file_missing(self):
@@ -511,6 +833,89 @@ class TestAutoSyncOnlyPath(LoaderTestBase):
         self.assertEqual(result.source, SOURCE_AUTOSYNC)
         self.assertIsNone(result.health)
 
+    def test_truncated_hae_values_are_withheld(self):
+        # 停止済み AutoSync の .hae が対象日の途中 (10:00) までの出力 → 二度と更新されない
+        # 過少値なので書かない。確定版 (翌日書き出し) の metric はそのまま使う
+        payloads = self._payloads()
+        for metric_dir, d in payloads:
+            self.put_hae(metric_dir, d)
+        self.put_hae("step_count", D, mtime=_local(D, 10))
+        self.put_hae("mindful_minutes", D, mtime=_local(D, 14))
+        fetcher = FakeMetricFetcher(payloads)
+        result = self.loader(fetcher).load(D)
+        self.assertIsNone(result.health.step_count)
+        self.assertIsNone(result.health.mindful_sessions)
+        # 途中までの瞑想ファイルから「なし」とは言えない
+        self.assertIsNone(result.activity_detail)
+        self.assertEqual(
+            result.withheld_fields, ("step_count", "mindful_sessions", "mindful_minutes"),
+        )
+        self.assertAlmostEqual(result.health.heart_rate_avg, 80.0)
+        self.assertEqual(result.status, STATUS_COMPLETE)
+        self.assertFalse(result.provisional)
+        self.assertNotIn(("step_count", D), fetcher.calls)
+
+    def test_all_truncated_hae_is_nodata(self):
+        payloads = self._payloads()
+        for metric_dir, d in payloads:
+            self.put_hae(metric_dir, d, mtime=_local(d, 11))
+        result = self.loader(FakeMetricFetcher(payloads)).load(D)
+        self.assertEqual(result.status, STATUS_NODATA)
+        self.assertIsNone(result.health)
+        self.assertIn("step_count", result.withheld_fields)
+
+    def test_today_autosync_values_are_provisional(self):
+        payloads = self._payloads()
+        for metric_dir, d in payloads:
+            self.put_hae(metric_dir, d)
+        self.put_hae("step_count", D, mtime=_local(D, 10))
+        with self.assertLogs(_LOGGER, level="WARNING"):
+            result = self.loader(FakeMetricFetcher(payloads),
+                                 now=datetime.combine(D, time(11, 0))).load(D)
+        self.assertEqual(result.health.step_count, 2000)
+        self.assertTrue(result.provisional)
+        self.assertEqual(result.withheld_fields, ())
+
+    def test_failed_day_sleep_file_does_not_fall_back_to_previous_day_only(self):
+        # 当日の sleep .hae を読めない → 前日ファイルの日付またぎ分 (3.0h) だけの
+        # 過少値を夜主睡眠にしない
+        payloads = self._payloads()
+        for metric_dir, d in payloads:
+            self.put_hae(metric_dir, d)
+        payloads[("sleep_analysis", D)] = _FAIL
+        fetcher = FakeMetricFetcher(payloads)
+        with self.assertLogs(_LOGGER, level="WARNING"):
+            result = self.loader(fetcher).load(D)
+        self.assertIsNone(result.health.sleep_hours)
+        self.assertIsNone(result.health.nap_hours)
+        self.assertEqual(result.status, STATUS_PARTIAL)
+        self.assertEqual(result.health.step_count, 2000)
+        self.assertNotIn(("sleep_analysis", D - timedelta(days=1)), fetcher.calls)
+
+    def test_failed_previous_day_sleep_file_is_partial_but_keeps_day_values(self):
+        # 当日の .hae はその日に重なる全 record を含むので値は残す。読込失敗は報告する
+        payloads = self._payloads()
+        for metric_dir, d in payloads:
+            self.put_hae(metric_dir, d)
+        payloads[("sleep_analysis", D - timedelta(days=1))] = _FAIL
+        with self.assertLogs(_LOGGER, level="WARNING"):
+            result = self.loader(FakeMetricFetcher(payloads)).load(D)
+        self.assertEqual(result.status, STATUS_PARTIAL)
+        self.assertAlmostEqual(result.health.sleep_hours, 7.0)
+        self.assertTrue(any(error.startswith("前日 ") for error in result.errors))
+
+    def test_previous_day_sleep_file_written_before_its_day_ended_is_ignored(self):
+        payloads = self._payloads()
+        for metric_dir, d in payloads:
+            self.put_hae(metric_dir, d)
+        self.put_hae("sleep_analysis", D - timedelta(days=1), mtime=_local(D - timedelta(days=1), 20))
+        fetcher = FakeMetricFetcher(payloads)
+        with self.assertLogs(_LOGGER, level="WARNING"):
+            result = self.loader(fetcher).load(D)
+        self.assertEqual(result.status, STATUS_COMPLETE)
+        self.assertAlmostEqual(result.health.sleep_hours, 7.0)
+        self.assertNotIn(("sleep_analysis", D - timedelta(days=1)), fetcher.calls)
+
     def test_broken_automation_with_autosync_fallback_is_partial(self):
         self._put_all()
         self.write_automation(D, None, text="{")
@@ -529,6 +934,7 @@ class TestHealthLoadResult(unittest.TestCase):
         self.assertEqual(result.errors, ())
         self.assertEqual(result.supplemented_fields, ())
         self.assertFalse(result.provisional)
+        self.assertEqual(result.withheld_fields, ())
 
 
 if __name__ == "__main__":

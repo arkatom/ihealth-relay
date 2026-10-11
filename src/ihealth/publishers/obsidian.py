@@ -12,13 +12,24 @@
   掃除する (本 publisher が作った名前形式のファイルだけを消す).
 - **並行編集の検知**: 読込時の ``(st_mtime_ns, st_size, st_ino)`` と内容を記録し、
   隠し tmp に書いた後 ``os.replace`` の直前に stat と内容を再確認する. 不一致
-  (= Obsidian / Obsidian Sync / screen-diary 等が同時に書いた) なら tmp を捨てて
+  (= Obsidian / Obsidian Sync / 同じノートに書く他のツール等が同時に書いた) なら tmp を捨てて
   読み直しから再試行し (既定 3 回)、それでも不一致なら **書かずに**
   :class:`ObsidianPublishError` を raise する.
 
-  注意: 再確認から ``os.replace`` までの μs 単位の窓で起きた競合は原理的に排除
-  できない (Obsidian / screen-diary とロックを協調する仕組みが無いため).
-  その代わり書込前バックアップから復元できる.
+  注意: 再確認から ``os.replace`` までの μs 単位の窓で他のプログラムが書いた内容は
+  原理的に失われうる (Obsidian や同じノートに書く他のツールとロックを協調する仕組みが無いため).
+  書込前バックアップに入っているのは「本ツールが編集の基にした内容」であり、
+  この窓で他のプログラムが書いた内容は含まれない. その場合は Obsidian の
+  「ファイル復元」コアプラグインや Obsidian Sync のバージョン履歴から戻す.
+  置換直後に読み直して本ツールが書いた内容と違えば warning を出す
+  (= 置換の直後に誰かが保存した. こちらの値は次回実行で再適用される).
+- **空ノート / Templater 未処理ノート**: 0 byte (空白のみ) のノートは「作成直後で
+  テンプレート適用待ち」か「他のプログラムの書込途中 (truncate 直後)」なので、
+  待って読み直す. 最後まで空なら、ノート不在時と同じ規則 (下記) で作成を許される
+  場合だけテンプレートで初期化する (直近に変更された空ノートには書かない).
+  frontmatter が無く Templater の ``<%`` が残るノート (テンプレート処理待ち /
+  処理失敗) は frontmatter を前置すると Templater 処理後に二重 frontmatter になる
+  ので書かない (status ``"skipped"``).
 - **アトミック置換**: 同じディレクトリの隠し tmp (``.{name}.ihealth-{pid}-*.tmp``,
   Obsidian はドットファイルを無視する) に書いて fsync → ``os.replace`` →
   親ディレクトリ fsync. 元ファイルの permission を継承し、macOS では作成日時
@@ -29,13 +40,26 @@
   - ``"never"``: 作らない (status ``"missing"``).
   - ``"template"`` (既定): ``template_path`` の Templater テンプレートを限定展開
     (先頭の ``<%* … %>`` ブロック除去, ``<% dateStr %>``, ``<% weekday %>`` のみ)
-    して ``日記/YYYY-MM-DD.md`` を作る. 未対応の ``<%`` が残る / 読めない /
+    して ``YYYY-MM-DD.md`` を作る. 未対応の ``<%`` が残る / 読めない /
     frontmatter が壊れている場合は **作成を見送る** (status ``"missing"``, warning).
   - ``"minimal"``: テンプレートが使えなければ ``---\\n日付: YYYY-MM-DD\\n---\\n`` の
     最小ノートを作る (明示設定時のみ).
 
+  ただし対象日が「今日 - ``create_min_age_days``」より新しい (既定: 今日・昨日) ノートは
+  作らない. Obsidian Sync は Obsidian アプリが起動している間しか同期しないので、
+  Mac 側で Obsidian が閉じている間に本ツールが作ったノートと、iPhone 等で
+  ユーザーが同じ日に作ったデイリーノートが「共通の祖先の無い同名ファイル」として
+  衝突するのを避けるため (数日前のノートを他の端末で新規作成することは稀).
+
+  作成先フォルダは、対象日の前後 ``±7`` 日で最も近い既存の日記ノート
+  (``YYYY-MM-DD.md`` 完全一致, 隠しフォルダは除く. 同距離なら過去側) と同じフォルダ.
+  見つからなければ日記ルート直下 (過去の月を ``日記/2026-Q1Q2Q3/`` のような
+  サブフォルダに移す運用で、抜けていた日のノートを隣の日と同じ場所に作るため).
+
   新規作成は ``os.link`` による排他作成なので、同時に誰かが作ったノートを上書き
   しない (その場合は既存ノートの更新として再試行する).
+- **ノート探索**: ``日記/`` 配下を再帰探索する. Obsidian と同じくシンボリックリンクの
+  フォルダもたどる (循環は実パスで検出). シンボリックリンクのノート自体は更新しない.
 - **dry-run**: ファイルを一切作らない/書かない. 変更予定を
   ``[dry-run] {path}: {key}: {old!r} -> {new!r}`` で info ログに出す.
 """
@@ -50,7 +74,7 @@ import stat
 import tempfile
 import time
 from dataclasses import dataclass, fields as dataclass_fields
-from datetime import date, datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone, tzinfo
 from pathlib import Path
 from types import MappingProxyType
 from typing import Callable, Mapping
@@ -194,13 +218,29 @@ STATUS_UPDATED = "updated"
 STATUS_UNCHANGED = "unchanged"
 STATUS_CREATED = "created"
 STATUS_MISSING = "missing"
+STATUS_SKIPPED = "skipped"
 STATUS_WOULD_UPDATE = "would_update"
 STATUS_WOULD_CREATE = "would_create"
+
+#: NotePublishOutcome.reason: 何も書かなかった理由 (status が missing / skipped のとき).
+REASON_NOTHING_TO_WRITE = "nothing_to_write"          # 書く値が無い
+REASON_CREATE_DISABLED = "create_disabled"            # create_missing="never"
+REASON_TOO_RECENT = "too_recent"                      # 今日/昨日 (create_min_age_days 未満) は作らない
+REASON_TEMPLATE_UNAVAILABLE = "template_unavailable"  # テンプレート未設定 / 読めない / 未対応構文
+REASON_RECENTLY_MODIFIED = "recently_modified"        # 空ノートが直前に変更された (書込途中の可能性)
+REASON_UNPROCESSED_TEMPLATE = "unprocessed_template"  # frontmatter 無し + Templater の '<%' が残る
 
 CREATE_NEVER = "never"
 CREATE_TEMPLATE = "template"
 CREATE_MINIMAL = "minimal"
 _CREATE_MODES = frozenset({CREATE_NEVER, CREATE_TEMPLATE, CREATE_MINIMAL})
+
+#: 不在ノートの作成先を決めるときに探す近傍の日数 (対象日の前後).
+_NEIGHBOR_WINDOW_DAYS = 7
+
+#: 空ノートを初期化してよい最終更新からの経過秒数. これより新しい空ノートは
+#: 他のプログラムの書込途中 (truncate 直後) / テンプレート適用待ちとみなして書かない.
+_EMPTY_NOTE_SETTLE_SEC = 10.0
 
 
 class ObsidianPublishError(RuntimeError):
@@ -231,10 +271,13 @@ class NotePublishOutcome:
         date: 対象日.
         path: 対象ノート. ``"missing"`` のときは ``None``.
             ``"would_create"`` のときは作成予定の path.
-        status: ``"updated"`` / ``"unchanged"`` / ``"created"`` / ``"missing"`` /
+        status: ``"updated"`` / ``"unchanged"`` / ``"created"`` (新規作成. 既存の空ノートを
+            テンプレートで初期化した場合も含む) / ``"missing"`` (ノートが無く作らなかった) /
+            ``"skipped"`` (ノートはあるが安全に書けないので触らなかった) /
             ``"would_update"`` / ``"would_create"``.
         changes: キーごとの結果 (:class:`ihealth.frontmatter.FieldChange`).
         backup_path: 書込前バックアップの保存先 (取っていなければ ``None``).
+        reason: ``"missing"`` / ``"skipped"`` の理由 (``REASON_*`` 定数). それ以外は ``None``.
     """
 
     date: date
@@ -242,6 +285,7 @@ class NotePublishOutcome:
     status: str
     changes: "tuple[FieldChange, ...]"
     backup_path: "Path | None" = None
+    reason: "str | None" = None
 
     @property
     def written_keys(self) -> "tuple[str, ...]":
@@ -364,6 +408,12 @@ class ObsidianPublisher:
         retry_interval_sec: 再試行の待ち時間 (既定 0.2 秒).
         clock: 現在時刻 (aware datetime) を返す関数. テスト用.
         sleep: 待機関数. テスト用.
+        create_min_age_days: ノートを新規作成 (空ノートの初期化を含む) してよい最小の
+            経過日数. ``今日 - 対象日`` がこれ未満なら作らない (status ``"missing"`` /
+            ``"skipped"``, reason ``"too_recent"``). 既定 2 = 今日・昨日・未来日のノートは
+            作らない (別端末での同日ノート作成と Obsidian Sync で衝突させないため).
+            0 で今日も作る.
+        tz: 「今日」を決めるタイムゾーン. ``None`` ならシステムのローカルタイムゾーン.
 
     Raises:
         ObsidianConfigError: 設定不正 (vault / 日記 dir 不在, 未知の内部名,
@@ -389,6 +439,8 @@ class ObsidianPublisher:
         retry_interval_sec: float = 0.2,
         clock: "Callable[[], datetime] | None" = None,
         sleep: "Callable[[float], None] | None" = None,
+        create_min_age_days: int = 2,
+        tz: "tzinfo | None" = None,
     ) -> None:
         self._logger = logger
         self._vault_dir = Path(vault_dir).expanduser()
@@ -410,6 +462,14 @@ class ObsidianPublisher:
             raise ObsidianConfigError(f"max_attempts は 1 以上: {max_attempts}")
         if backup_retention_days < 1:
             raise ObsidianConfigError(f"backup_retention_days は 1 以上: {backup_retention_days}")
+        if (
+            isinstance(create_min_age_days, bool)
+            or not isinstance(create_min_age_days, int)
+            or create_min_age_days < 0
+        ):
+            raise ObsidianConfigError(
+                f"create_min_age_days は 0 以上の整数: {create_min_age_days!r}"
+            )
 
         self._property_map = self._merge_property_map(property_overrides)
         if date_property in self._property_map.values():
@@ -443,8 +503,14 @@ class ObsidianPublisher:
         self._retry_interval = retry_interval_sec
         self._clock = clock or _default_clock
         self._sleep = sleep or time.sleep
+        self._create_min_age_days = create_min_age_days
+        self._tz = tz
         self._index: "dict[str, list[Path]] | None" = None
         self._pruned = False
+        #: 現在の publish_record で fill_only_empty でも置き換えてよい既存値
+        self._replaceable: "dict[str, object]" = {}
+        #: 現在の publish_record で使う fill_only_empty
+        self._active_fill_only_empty = fill_only_empty
 
     # ------------------------------------------------------------------
     # 設定
@@ -488,10 +554,21 @@ class ObsidianPublisher:
     # ------------------------------------------------------------------
 
     def _build_index(self) -> "dict[str, list[Path]]":
+        """``diary_root`` 以下の ``YYYY-MM-DD.md`` を名前 → path 一覧にする.
+
+        隠しディレクトリ (``.trash`` 等) は除外. Obsidian と同じくシンボリックリンクの
+        フォルダもたどる (循環・同じ実体への重複は実パスで 1 回に絞る).
+        """
         index: "dict[str, list[Path]]" = {}
-        for dirpath, dirnames, filenames in os.walk(self._diary_root):
+        visited: "set[str]" = set()
+        for dirpath, dirnames, filenames in os.walk(self._diary_root, followlinks=True):
+            real = os.path.realpath(dirpath)
+            if real in visited:
+                dirnames[:] = []  # 循環 / 既に見た実体: たどらない
+                continue
+            visited.add(real)
             dirnames[:] = sorted(d for d in dirnames if not d.startswith("."))
-            for name in filenames:
+            for name in sorted(filenames):
                 if _NOTE_NAME_RE.match(name):
                     index.setdefault(name, []).append(Path(dirpath) / name)
         return index
@@ -499,14 +576,23 @@ class ObsidianPublisher:
     def _invalidate_index(self) -> None:
         self._index = None
 
+    def _ordered_candidates(self, name: str, paths: "list[Path] | set[Path]") -> "list[Path]":
+        """同名ノートの優先順: 日記ルート直下 → 浅い path → path 文字列順."""
+        direct = self._diary_root / name
+        return sorted(
+            paths,
+            key=lambda p: (p != direct, len(p.relative_to(self._diary_root).parts), str(p)),
+        )
+
     def find_note(self, d: date) -> "Path | None":
         """``d`` の日記ノートを探す. 無ければ ``None``.
 
         ``diary_root/YYYY-MM-DD.md`` を最優先し、無ければ ``diary_root`` 以下を再帰探索して
         ファイル名が ``YYYY-MM-DD.md`` に **完全一致** するものを探す (隠しディレクトリ
-        と ``.trash`` は除外. ``2025-09-07 週次振り返り ….md`` のような別ノートは掴まない).
-        複数ヒット時は浅い path を優先し warning を出す. 再帰探索の結果は publisher
-        インスタンス内でキャッシュする (直下 path は毎回実ファイルを確認).
+        と ``.trash`` は除外. ``2025-09-07 週次振り返り ….md`` のような別ノートは掴まない.
+        シンボリックリンクのフォルダはたどる). 複数ヒット時は浅い path を優先し warning を
+        出す. 再帰探索の結果は publisher インスタンス内でキャッシュする (直下 path は毎回
+        実ファイルを確認).
         """
         name = f"{d.isoformat()}.md"
         direct = self._diary_root / name
@@ -517,16 +603,38 @@ class ObsidianPublisher:
             candidates.add(direct)
         if not candidates:
             return None
-        ordered = sorted(
-            candidates,
-            key=lambda p: (p != direct, len(p.relative_to(self._diary_root).parts), str(p)),
-        )
+        ordered = self._ordered_candidates(name, candidates)
         if len(ordered) > 1:
             self._logger.warning(
                 "日記ノートが複数見つかりました。%s を採用します (他: %s)",
                 ordered[0], ", ".join(str(p) for p in ordered[1:]),
             )
         return ordered[0]
+
+    def _creation_dir(self, d: date) -> Path:
+        """不在ノート ``d`` を作るフォルダ.
+
+        対象日の前後 ``_NEIGHBOR_WINDOW_DAYS`` 日で最も近い既存の日記ノート
+        (``YYYY-MM-DD.md`` 完全一致, 隠しフォルダ除外) と同じフォルダ. 同距離なら過去側.
+        見つからなければ日記ルート直下.
+        """
+        if self._index is None:
+            self._index = self._build_index()
+        for distance in range(1, _NEIGHBOR_WINDOW_DAYS + 1):
+            for delta in (-distance, distance):  # 同距離なら過去側を優先
+                try:
+                    neighbor = d + timedelta(days=delta)
+                except OverflowError:
+                    continue
+                name = f"{neighbor.isoformat()}.md"
+                paths = self._index.get(name)
+                if paths:
+                    chosen = self._ordered_candidates(name, paths)[0]
+                    self._logger.debug(
+                        "新規ノートの作成先: %s と同じフォルダ (%s)", chosen, chosen.parent,
+                    )
+                    return chosen.parent
+        return self._diary_root
 
     # ------------------------------------------------------------------
     # 値の組み立て
@@ -588,13 +696,28 @@ class ObsidianPublisher:
     def publish(self, health_data: DailyHealthData) -> None:
         """:class:`ihealth.publishers.base.Publisher` 互換 (健康データだけを書く)."""
         outcome = self.publish_record(DiaryRecord(date=health_data.date, health=health_data))
-        if outcome.status == STATUS_MISSING:
+        if outcome.status in (STATUS_MISSING, STATUS_SKIPPED):
             self._logger.warning(
-                "日記ノートが無いため健康データを書き込めませんでした: date=%s", health_data.date,
+                "日記ノートに健康データを書き込めませんでした: date=%s status=%s reason=%s",
+                health_data.date, outcome.status, outcome.reason,
             )
 
-    def publish_record(self, record: DiaryRecord) -> NotePublishOutcome:
+    def publish_record(
+        self,
+        record: DiaryRecord,
+        *,
+        replaceable: "Mapping[str, object] | None" = None,
+        fill_only_empty: "bool | None" = None,
+    ) -> NotePublishOutcome:
         """1 日分の値を日記ノートに書き込む.
+
+        Args:
+            record: 書き込む値.
+            replaceable: ``fill_only_empty`` でも置き換えてよい既存値 (frontmatter キー →
+                以前に本ツールが書いた暫定値). 既存値がこれと同じキーだけ書き換える
+                (:func:`ihealth.frontmatter.upsert_frontmatter` の ``replaceable``).
+            fill_only_empty: この 1 回だけ ``fill_only_empty`` を上書きする (None なら
+                コンストラクタの設定).
 
         Raises:
             ObsidianPublishError: 書き込み失敗 / frontmatter が壊れている /
@@ -605,6 +728,10 @@ class ObsidianPublisher:
             raise ObsidianPublishError(
                 f"target_date 不整合: publisher={self._target_date} record={d}"
             )
+        self._replaceable = dict(replaceable or {})
+        self._active_fill_only_empty = (
+            self._fill_only_empty if fill_only_empty is None else bool(fill_only_empty)
+        )
         updates = self.build_updates(record)
         for attempt in range(1, self._max_attempts + 1):
             if attempt > 1:
@@ -612,14 +739,16 @@ class ObsidianPublisher:
                 self._invalidate_index()
             path = self.find_note(d)
             if path is None:
-                # 作成前に再帰探索をやり直す (実行中にサブフォルダへ移動されたノートの
-                # 取りこぼしで重複ノートを作らないため)
+                # 作成前に再帰探索をやり直す (実行中にサブフォルダへ移動・作成されたノートを
+                # キャッシュ済みの索引が取りこぼして重複ノートを作らないため)
                 self._invalidate_index()
                 path = self.find_note(d)
             if path is None:
                 outcome = self._publish_new(d, updates)
             else:
-                outcome = self._publish_existing(d, path, updates, attempt)
+                outcome = self._publish_existing(
+                    d, path, updates, attempt, last=attempt == self._max_attempts,
+                )
             if outcome is not None:
                 return outcome
         raise ObsidianPublishError(
@@ -630,8 +759,12 @@ class ObsidianPublisher:
     # ---- 既存ノートの更新 ----
 
     def _publish_existing(
-        self, d: date, path: Path, updates: "dict[str, object]", attempt: int,
+        self, d: date, path: Path, updates: "dict[str, object]", attempt: int, *, last: bool,
     ) -> "NotePublishOutcome | None":
+        """既存ノートを更新する. ``None`` は「読み直して再試行」."""
+        if not updates:
+            # 書く値が無いならノートの形は問わない (読みもしない)
+            return NotePublishOutcome(d, path, STATUS_UNCHANGED, ())
         if path.is_symlink():
             raise ObsidianPublishError(f"シンボリックリンクの日記ノートは更新しません: {path}")
         try:
@@ -648,9 +781,14 @@ class ObsidianPublisher:
             text = snap.data.decode("utf-8")
         except UnicodeDecodeError as exc:
             raise ObsidianPublishError(f"日記ノートが UTF-8 ではありません: {path}") from exc
+        if text.strip() == "":
+            return self._publish_uninitialized(d, path, snap, updates, attempt, last=last)
         try:
+            if split_frontmatter(text) is None and "<%" in text:
+                return self._skip_unprocessed_template(d, path, attempt, last=last)
             new_text, changes = upsert_frontmatter(
-                text, updates, fill_only_empty=self._fill_only_empty, create_if_missing=True,
+                text, updates, fill_only_empty=self._active_fill_only_empty, create_if_missing=True,
+                replaceable=self._replaceable,
             )
         except FrontmatterError as exc:
             raise ObsidianPublishError(
@@ -665,7 +803,88 @@ class ObsidianPublisher:
         if self._dry_run:
             self._log_dry_run(path, changes)
             return NotePublishOutcome(d, path, STATUS_WOULD_UPDATE, tuple(changes))
+        return self._commit_replace(
+            d, path, snap, new_text, changes, attempt, STATUS_UPDATED, "日記ノート更新",
+        )
 
+    def _publish_uninitialized(
+        self, d: date, path: Path, snap: _Snapshot, updates: "dict[str, object]",
+        attempt: int, *, last: bool,
+    ) -> "NotePublishOutcome | None":
+        """空 (0 byte / 空白のみ) の既存ノート. ``None`` は「読み直して再試行」.
+
+        作成直後でテンプレート適用待ち (Daily notes コアプラグインはテンプレート未設定だと
+        空ノートを作り、テンプレートは後から挿入される) か、他のプログラムの書込途中
+        (truncate 直後) なので、まず待って読み直す. 最後の試行でも空なら、ノート不在時と
+        同じ規則 (``create_missing`` / ``create_min_age_days``) で作成を許される場合だけ
+        テンプレート (または最小ノート) で初期化する. 直近に変更された空ノートには書かない.
+        frontmatter だけを書き込むと、後でテンプレートを挿入したときに二重 frontmatter に
+        なるため.
+        """
+        if not last:
+            self._logger.info(
+                "日記ノートが空です。書込途中の可能性があるため読み直します (attempt %d/%d): %s",
+                attempt, self._max_attempts, path,
+            )
+            return None
+        reason = self._creation_block_reason(d)
+        if reason is None and self._recently_modified(snap):
+            reason = REASON_RECENTLY_MODIFIED
+        initial = self._initial_note_text(d) if reason is None else None
+        if initial is None:
+            if reason is None:
+                reason = REASON_TEMPLATE_UNAVAILABLE
+            log = self._logger.info if reason == REASON_TOO_RECENT else self._logger.warning
+            log("空の日記ノートには書き込みません (reason=%s): %s", reason, path)
+            return NotePublishOutcome(d, path, STATUS_SKIPPED, (), reason=reason)
+        try:
+            new_text, changes = upsert_frontmatter(
+                initial, updates, fill_only_empty=self._active_fill_only_empty, create_if_missing=True,
+                replaceable=self._replaceable,
+            )
+        except (FrontmatterError, TypeError, ValueError) as exc:
+            raise ObsidianPublishError(
+                f"空ノートの初期内容を組み立てられません: {path} ({exc})"
+            ) from exc
+        if self._dry_run:
+            self._log_dry_run(path, changes)
+            return NotePublishOutcome(d, path, STATUS_WOULD_CREATE, tuple(changes))
+        return self._commit_replace(
+            d, path, snap, new_text, changes, attempt, STATUS_CREATED, "空の日記ノートを初期化",
+        )
+
+    def _skip_unprocessed_template(
+        self, d: date, path: Path, attempt: int, *, last: bool,
+    ) -> "NotePublishOutcome | None":
+        """frontmatter が無く Templater の ``<%`` が残るノート (テンプレート処理待ち / 処理失敗).
+
+        ここへ frontmatter を前置すると、Templater が後で処理したときにテンプレート側の
+        frontmatter が 2 つ目のブロック (本文扱い) になり、Obsidian はこちらのキーしか
+        プロパティとして表示しなくなる. 処理を待って読み直し、最後まで残っていれば触らない.
+        """
+        if not last:
+            self._logger.info(
+                "日記ノートに Templater の未処理構文があります。処理待ちの可能性があるため"
+                "読み直します (attempt %d/%d): %s", attempt, self._max_attempts, path,
+            )
+            return None
+        self._logger.warning(
+            "frontmatter が無く Templater の未処理構文 '<%%' が残る日記ノートには書き込みません "
+            "(テンプレートを適用してください): %s", path,
+        )
+        return NotePublishOutcome(
+            d, path, STATUS_SKIPPED, (), reason=REASON_UNPROCESSED_TEMPLATE,
+        )
+
+    def _commit_replace(
+        self, d: date, path: Path, snap: _Snapshot, new_text: str,
+        changes: "list[FieldChange]", attempt: int, status: str, label: str,
+    ) -> "NotePublishOutcome | None":
+        """書込前バックアップ → 隠し tmp に書込 → 置換直前の再確認 → ``os.replace``.
+
+        再確認で読込時 (``snap``) から stat か内容が変わっていれば tmp を捨てて ``None``
+        (= 読み直して再試行).
+        """
         new_data = new_text.encode("utf-8")
         backup_path = self._write_backup(path, snap.data)
         tmp = self._write_tmp(path, new_data, snap.mode)
@@ -691,25 +910,39 @@ class ObsidianPublisher:
                 self._unlink_quietly(tmp)
         self._fsync_dir(path.parent)
         self._verify_written(path, new_data)
-        self._log_summary("日記ノート更新", path, changes, backup_path)
-        return NotePublishOutcome(d, path, STATUS_UPDATED, tuple(changes), backup_path)
+        self._log_summary(label, path, changes, backup_path)
+        return NotePublishOutcome(d, path, status, tuple(changes), backup_path)
 
     # ---- ノート新規作成 ----
 
     def _publish_new(self, d: date, updates: "dict[str, object]") -> "NotePublishOutcome | None":
         if not updates:
             self._logger.info("書き込む値が無いため日記ノートは作成しません: date=%s", d)
-            return NotePublishOutcome(d, None, STATUS_MISSING, ())
+            return NotePublishOutcome(d, None, STATUS_MISSING, (), reason=REASON_NOTHING_TO_WRITE)
+        reason = self._creation_block_reason(d)
+        if reason == REASON_TOO_RECENT:
+            self._logger.info(
+                "日記ノートがありません。直近 (今日から %d 日未満) のノートは別端末での作成と"
+                "Obsidian Sync で衝突しうるため作成しません: date=%s",
+                self._create_min_age_days, d,
+            )
+            return NotePublishOutcome(d, None, STATUS_MISSING, (), reason=reason)
+        if reason is not None:
+            self._logger.warning("日記ノートがありません (作成しない設定): date=%s", d)
+            return NotePublishOutcome(d, None, STATUS_MISSING, (), reason=reason)
         initial = self._initial_note_text(d)
         if initial is None:
-            return NotePublishOutcome(d, None, STATUS_MISSING, ())
+            return NotePublishOutcome(
+                d, None, STATUS_MISSING, (), reason=REASON_TEMPLATE_UNAVAILABLE,
+            )
         try:
             new_text, changes = upsert_frontmatter(
-                initial, updates, fill_only_empty=self._fill_only_empty, create_if_missing=True,
+                initial, updates, fill_only_empty=self._active_fill_only_empty, create_if_missing=True,
+                replaceable=self._replaceable,
             )
         except (FrontmatterError, TypeError, ValueError) as exc:
             raise ObsidianPublishError(f"新規ノートの frontmatter を組み立てられません: {d} ({exc})") from exc
-        path = self._diary_root / f"{d.isoformat()}.md"
+        path = self._creation_dir(d) / f"{d.isoformat()}.md"
         if self._dry_run:
             self._log_dry_run(path, changes)
             return NotePublishOutcome(d, path, STATUS_WOULD_CREATE, tuple(changes))
@@ -719,10 +952,33 @@ class ObsidianPublisher:
         self._log_summary("日記ノート作成", path, changes, None)
         return NotePublishOutcome(d, path, STATUS_CREATED, tuple(changes))
 
-    def _initial_note_text(self, d: date) -> "str | None":
-        """不在ノートの初期内容. 作らない場合は ``None`` (理由は warning ログ)."""
+    def _today(self) -> date:
+        """``tz`` (未指定ならシステムのローカルタイムゾーン) での今日."""
+        now = self._clock()
+        if now.tzinfo is None:
+            now = now.replace(tzinfo=timezone.utc)
+        if self._tz is not None:
+            return now.astimezone(self._tz).date()
+        return now.astimezone().date()
+
+    def _creation_block_reason(self, d: date) -> "str | None":
+        """ノートを作成 (空ノートの初期化を含む) してはいけない理由. 作ってよければ ``None``."""
         if self._create_missing == CREATE_NEVER:
-            self._logger.warning("日記ノートがありません (作成しない設定): date=%s", d)
+            return REASON_CREATE_DISABLED
+        if (self._today() - d).days < self._create_min_age_days:
+            return REASON_TOO_RECENT
+        return None
+
+    def _recently_modified(self, snap: _Snapshot) -> bool:
+        """読込時点の mtime が現在から ``_EMPTY_NOTE_SETTLE_SEC`` 以内か (未来の mtime も含む)."""
+        now = self._clock()
+        if now.tzinfo is None:
+            now = now.replace(tzinfo=timezone.utc)
+        return now.timestamp() - snap.mtime_ns / 1_000_000_000 < _EMPTY_NOTE_SETTLE_SEC
+
+    def _initial_note_text(self, d: date) -> "str | None":
+        """新規ノート (空ノートの初期化を含む) の初期内容. 作れない場合は ``None`` (理由は warning ログ)."""
+        if self._create_missing == CREATE_NEVER:
             return None
         if self._template_path is not None:
             try:
@@ -738,10 +994,10 @@ class ObsidianPublisher:
                     "テンプレートから日記ノートを作れません: %s (%s)", self._template_path, exc,
                 )
         if self._create_missing == CREATE_MINIMAL:
-            self._logger.info("最小ノートを作成します: date=%s", d)
+            self._logger.info("最小ノートの内容を使います: date=%s", d)
             return f"---\n{render_key(self._date_property)}: {d.isoformat()}\n---\n"
         self._logger.warning(
-            "日記ノートが無く、テンプレートからも作成できないため書き込みを見送ります: date=%s", d,
+            "テンプレートが使えないため日記ノートを作成 (初期化) しません: date=%s", d,
         )
         return None
 
@@ -860,7 +1116,12 @@ class ObsidianPublisher:
                 pass
 
     def _verify_written(self, path: Path, expected: bytes) -> None:
-        """置換直後の内容確認. 一致しなければ μs 窓の競合として warning (バックアップで復元可)."""
+        """置換直後の内容確認. 一致しなければ「置換の直後に誰かが保存した」として warning.
+
+        その場合ノートにあるのは他のプログラムが保存した内容で、こちらの値が上書きされた
+        可能性がある (次回実行で再適用される). 逆に「再確認から置換までの窓で他のプログラムが
+        書いた内容」はここでは検出できない (置換後のファイルはこちらが書いた内容と一致する).
+        """
         try:
             actual = path.read_bytes()
         except OSError as exc:
@@ -868,8 +1129,8 @@ class ObsidianPublisher:
             return
         if actual != expected:
             self._logger.warning(
-                "書き込み直後に日記ノートが別の内容になっています (並行編集の可能性。"
-                "必要ならバックアップから復元してください): %s", path,
+                "書き込み直後に日記ノートが別の内容に変わっています (直後に他のプログラムが"
+                "保存した可能性。こちらの値は次回実行で再適用されます): %s", path,
             )
 
     @staticmethod

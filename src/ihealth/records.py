@@ -57,7 +57,7 @@ class DiaryRecord:
     Attributes:
         date: 対象日 (日記ノート ``YYYY-MM-DD.md`` の日付).
         health: 健康データ. ``None`` なら健康系キーには触れない.
-        activity_detail: ``アクティビティ詳細`` に書く文字列 (例 ``"瞑想3分、その他31分"``).
+        activity_detail: ``アクティビティ詳細`` に書く文字列 (例 ``"瞑想5分、ウォーキング20分"``).
         weather: 天気サマリ. ``None`` なら天気系キーには触れない.
         github: ``Github`` に書く整形済み文字列 (活動なしが確定した日は ``"該当なし"``).
 

@@ -13,7 +13,19 @@
     ボリュームに自由にアクセスできる (python3 へのフルディスクアクセス付与は別途必要)。
   - ProgramArguments は bin/ihealth-run ラッパー経由。ラッパー側で cd / PYTHONPATH /
     LANG をセットアップするので、plist の EnvironmentVariables は不要。
-  - StartCalendarInterval で毎朝 07:00 起動 (cron の直接的代替)
+  - StartCalendarInterval で起動 (cron の直接的代替)。テンプレートは 07:00 / 12:00 /
+    21:00 の 3 回で、bin/install-launchd.sh が .env の IHEALTH_PUBLISHER を見て決める:
+    obsidian なら 3 回とも残し、それ以外 (notion / markdown / sqlite / slack / stdout /
+    未設定) は下の IHEALTH_OBSIDIAN_EXTRA_RUNS の範囲 (12:00 / 21:00) を消して従来どおり
+    07:00 の 1 回にする (Slack の重複投稿や、データ未到着の通知・再試行待ちが 1 日 3 回に
+    増えるのを防ぐ)。Obsidian 日記は毎回「昨日から lookback 日分の確定値 + 今日の暫定値」を
+    書くので、日中も今日の値が更新され、HAE の再出力や気象庁の公開が遅れた前日分も次の回で
+    埋まる。日記は冪等 (同じ値なら書かない) なのでノートは変わった時だけ書き換わる。
+    IHEALTH_PUBLISHER を変えたら install-launchd.sh を再実行すること
+  - スリープ中に過ぎた時刻の起動は復帰後にまとめて 1 回実行される (launchd の仕様)。
+    復帰直後は Wi-Fi が未接続のことがあるので、アプリ側が最大 60 秒ネットワークを待つ
+  - launchd.log はローテーションされないので、アプリは launchd 経由 (標準エラーが端末で
+    ない) のとき標準エラーへ WARNING 以上だけを出す (全ログは logs/run.log)
   - RunAtLoad=false: install 直後に即発火させない (運用開始は翌朝から)
   - stdout / stderr は $HOME/Library/Logs/ihealth-relay/launchd.log に集約。
     アプリ側 TimedRotatingFileHandler が出す logs/run.log (プロジェクトルート配下) と
@@ -34,12 +46,28 @@
     <string>__HOME__</string>
 
     <key>StartCalendarInterval</key>
-    <dict>
-        <key>Hour</key>
-        <integer>7</integer>
-        <key>Minute</key>
-        <integer>0</integer>
-    </dict>
+    <array>
+        <dict>
+            <key>Hour</key>
+            <integer>7</integer>
+            <key>Minute</key>
+            <integer>0</integer>
+        </dict>
+        <!-- IHEALTH_OBSIDIAN_EXTRA_RUNS_BEGIN (obsidian 以外では install-launchd.sh がここから END までを消す) -->
+        <dict>
+            <key>Hour</key>
+            <integer>12</integer>
+            <key>Minute</key>
+            <integer>0</integer>
+        </dict>
+        <dict>
+            <key>Hour</key>
+            <integer>21</integer>
+            <key>Minute</key>
+            <integer>0</integer>
+        </dict>
+        <!-- IHEALTH_OBSIDIAN_EXTRA_RUNS_END -->
+    </array>
 
     <key>StandardOutPath</key>
     <string>__HOME__/Library/Logs/ihealth-relay/launchd.log</string>
@@ -50,7 +78,7 @@
     <false/>
 
     <!--
-      ProcessType: CPU / I/O の resource limits 分類。1 日 1 回の短時間バッチで
+      ProcessType: CPU / I/O の resource limits 分類。1 日数回の短時間バッチで
       ユーザーと直接やり取りしないので Background を選択し、システム負荷の高い
       時間帯では throttling 対象として CPU 優先度を下げて他アプリを優先させる.
       (StartCalendarInterval の「sleep 中に missed した起動は wake 後に coalesce

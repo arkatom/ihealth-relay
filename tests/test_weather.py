@@ -3,11 +3,14 @@
 - fixture は **合成 HTML** (``tests/fixtures/jma/``, および本ファイルの ``_page``)。
   実ページの構造 (見出し 2 段 + rowspan/colspan, 後続の「記事」表, ナビゲーション画像)
   を模した架空値で、実観測値は含まない。
-- 前身 GoogleFitNotionIntegration ``src/weather/weather_notion.py`` の集計部を逐語転写した
-  参照実装 :func:`_legacy_summary` と「同じ入力で同じ出力」になることを固定ケース +
-  乱数ケースで検証する (見出しスキップの off-by-one だけは意図的に修正済みなので、
-  参照実装も全データ行を読む形にしてある)。
+- 前身 GoogleFitNotionIntegration ``src/weather/weather_notion.py`` の ``get_weather_data``
+  を **逐語転写** した参照実装 :func:`_legacy_get_weather_data` (BeautifulSoup だけ最小限の
+  代役 :class:`_Bs4Soup` に置換, 見出しスキップ ``if i > 2`` の off-by-one もそのまま) と
+  「同じ入力で同じ出力」になることを固定ケース + 乱数ケースで検証する:
+  ``_FIRST_HOUR = 2`` (前身と同じく 1 時の行を集計しない) なら完全一致、既定
+  (``_FIRST_HOUR = 1``) は前身の式で 1〜24 時を全て読ませた結果と一致 (違いは 1 時の行だけ)。
 - ネットワークには出ない (opener 注入 / ``urllib.request.urlopen`` をモック)。
+  公開待ち判定の「今日」も注入し、実行時の時計に依存しない。
 """
 
 from __future__ import annotations
@@ -16,14 +19,16 @@ import dataclasses
 import http.client
 import logging
 import random
+import re
 import socket
 import statistics
 import unittest
 import urllib.error
 import urllib.request
-from datetime import date
+from datetime import date, datetime, timedelta, timezone
+from html.parser import HTMLParser
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 from unittest import mock
 
 from ihealth import __version__
@@ -157,11 +162,86 @@ def _summarize_spec(rows: DaySpec, d: date = FIXTURE_DATE) -> WeatherSummary:
 
 
 # ---------------------------------------------------------------------------
-# 前身 weather_notion.get_weather_data の集計部 (67〜199 行目) の逐語転写
+# 前身 weather_notion.get_weather_data の逐語転写 (参照実装)
 # ---------------------------------------------------------------------------
 
+_VOID_TAGS = frozenset({
+    "area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta", "source", "track", "wbr",
+})
 
-def _legacy_emoji(condition: str) -> str:
+
+class _Bs4Tag:
+    """BeautifulSoup の ``Tag`` の代役 (前身が使う ``find`` / ``find_all`` / ``text`` /
+    ``has_attr`` / ``get`` だけ). weather.py のパーサとは独立に実装し、bs4 と同じく
+    ``find_all`` は子孫を再帰的に探し ``text`` は子孫のテキストを連結する. 空要素でも真."""
+
+    def __init__(self, name: str, attrs: "Sequence[Tuple[str, Optional[str]]]") -> None:
+        self.name = name
+        self.attrs: "Dict[str, Optional[str]]" = dict(attrs)
+        self.children: "List[object]" = []
+
+    def _descendants(self) -> "Iterable[_Bs4Tag]":
+        for child in self.children:
+            if isinstance(child, _Bs4Tag):
+                yield child
+                yield from child._descendants()
+
+    def find_all(self, name: str, class_: "Optional[str]" = None) -> "List[_Bs4Tag]":
+        return [
+            tag
+            for tag in self._descendants()
+            if tag.name == name and (class_ is None or class_ in (tag.attrs.get("class") or "").split())
+        ]
+
+    def find(self, name: str, class_: "Optional[str]" = None) -> "Optional[_Bs4Tag]":
+        found = self.find_all(name, class_)
+        return found[0] if found else None
+
+    @property
+    def text(self) -> str:
+        return "".join(child if isinstance(child, str) else child.text for child in self.children)  # type: ignore[attr-defined]
+
+    def has_attr(self, key: str) -> bool:
+        return key in self.attrs
+
+    def get(self, key: str) -> "Optional[str]":
+        return self.attrs.get(key)
+
+
+class _Bs4Soup(HTMLParser):
+    """``BeautifulSoup(html, 'html.parser')`` の代役 (要素の木を組み立てるだけ)."""
+
+    def __init__(self, html: str) -> None:
+        super().__init__(convert_charrefs=True)
+        self.root = _Bs4Tag("[document]", [])
+        self._open: "List[_Bs4Tag]" = [self.root]
+        self.feed(html)
+        self.close()
+
+    def handle_starttag(self, tag: str, attrs: "List[Tuple[str, Optional[str]]]") -> None:
+        node = _Bs4Tag(tag, attrs)
+        self._open[-1].children.append(node)
+        if tag not in _VOID_TAGS:
+            self._open.append(node)
+
+    def handle_startendtag(self, tag: str, attrs: "List[Tuple[str, Optional[str]]]") -> None:
+        self._open[-1].children.append(_Bs4Tag(tag, attrs))
+
+    def handle_endtag(self, tag: str) -> None:
+        for index in range(len(self._open) - 1, 0, -1):
+            if self._open[index].name == tag:
+                del self._open[index:]
+                return
+
+    def handle_data(self, data: str) -> None:
+        self._open[-1].children.append(data)
+
+    def find(self, name: str, class_: "Optional[str]" = None) -> "Optional[_Bs4Tag]":
+        return self.root.find(name, class_)
+
+
+def _legacy_get_weather_emoji(condition):  # type: ignore[no-untyped-def]
+    """前身 ``get_weather_emoji`` (weather_notion.py 27〜42 行目) の逐語転写."""
     condition = condition.lower()
     if "快晴" in condition:
         return "☀️☀️"
@@ -178,12 +258,23 @@ def _legacy_emoji(condition: str) -> str:
     return ""
 
 
-def _legacy_summary(rows: DaySpec) -> "Dict[str, str]":
-    """前身の集計 (bs4 の ``cells[i].text.strip()`` を行仕様の文字列に置換).
+def _legacy_get_weather_data(html: str) -> "Dict[str, object]":
+    """前身 ``get_weather_data`` (weather_notion.py 44〜205 行目) の逐語転写.
 
-    前身の ``if i > 2`` は見出し 2 行 + 1 時の行を読み捨てる off-by-one だったが、本実装は
-    意図的に修正しているので、ここでは全データ行を読む (それ以外の式・書式は逐語).
+    置き換えたのは ``requests.get`` (→ 引数 ``html``) と ``BeautifulSoup`` (→ :class:`_Bs4Soup`),
+    使わない ``"日付"`` キーだけ. 見出しスキップ ``if i > 2`` (見出し 2 行に加えて 1 時の
+    行も読み捨てる off-by-one) を含め、それ以外は一字一句そのまま.
     """
+    soup = _Bs4Soup(html)
+    table = soup.find('table', class_='data2_s')
+    if table is None:
+        return {
+            "天気": "", "気温": "", "湿度": "", "降水量": "", "気圧": "", "日照時間": "",
+            "_is_complete": False,
+        }
+    rows = table.find_all('tr')
+
+    # 結果格納用の変数を初期化
     weather_info = []
     total_sunshine = 0
     humidity_data = []
@@ -191,92 +282,177 @@ def _legacy_summary(rows: DaySpec) -> "Dict[str, str]":
     temperature_data = []
     precipitation_data = []
 
-    for hour_number, spec in rows:
-        cells = [str(hour_number) if name == "hour" else spec[name] for name in _COLUMN_ORDER]
-        hour = int(str(cells[0]).strip())
-        sea_pressure = str(cells[2]).strip()
-        if sea_pressure != "--" and sea_pressure != "":
-            sea_level_pressures.append((hour, float(sea_pressure)))
-        precipitation = str(cells[3]).strip()
-        if precipitation != "--" and precipitation != "":
-            try:
-                precipitation_data.append((hour, float(precipitation)))
-            except ValueError:
-                precipitation_data.append((hour, 0.0))
-        temperature = str(cells[4]).strip()
-        if temperature != "--" and temperature != "":
-            temperature_data.append((hour, float(temperature)))
-        humidity = str(cells[7]).strip()
-        if humidity != "--" and humidity != "":
-            humidity_data.append((hour, int(humidity)))
-        sunshine = str(cells[10]).strip()
-        if sunshine != "--" and sunshine != "":
-            try:
-                total_sunshine += float(sunshine)
-            except ValueError:
-                pass
-        if cells[14] is not None:
-            weather_condition = cells[14]
-            emoji = _legacy_emoji(weather_condition)
-            weather_info.append(f"{hour}時: {weather_condition}{emoji}")
+    for i, row in enumerate(rows):
+        if i > 2:  # ヘッダー行をスキップ
+            cells = row.find_all('td')
+            if len(cells) >= 15:
+                hour = int(cells[0].text.strip())
 
+                # 海面気圧（インデックス2）
+                sea_pressure = cells[2].text.strip()
+                if sea_pressure != "--" and sea_pressure != "":
+                    sea_level_pressures.append((hour, float(sea_pressure)))
+
+                # 降水量（インデックス3）
+                precipitation = cells[3].text.strip()
+                if precipitation != "--" and precipitation != "":
+                    try:
+                        precipitation_data.append((hour, float(precipitation)))
+                    except ValueError:
+                        precipitation_data.append((hour, 0.0))
+
+                # 気温（インデックス4）
+                temperature = cells[4].text.strip()
+                if temperature != "--" and temperature != "":
+                    temperature_data.append((hour, float(temperature)))
+
+                # 湿度（インデックス7）
+                humidity = cells[7].text.strip()
+                if humidity != "--" and humidity != "":
+                    humidity_data.append((hour, int(humidity)))
+
+                # 日照時間（インデックス10）
+                sunshine = cells[10].text.strip()
+                if sunshine != "--" and sunshine != "":
+                    try:
+                        total_sunshine += float(sunshine)
+                    except ValueError:
+                        # 数値に変換できない場合はスキップ
+                        pass
+
+                # 天気（インデックス14の画像のalt属性）
+                weather_img = cells[14].find('img')
+                if weather_img and weather_img.has_attr('alt'):
+                    weather_condition = weather_img.get('alt')
+                    emoji = _legacy_get_weather_emoji(weather_condition)
+                    weather_info.append(f"{hour}時: {weather_condition}{emoji}")
+
+    # 気圧データを6時間スパンで処理（大気潮に合わせる）
     pressure_spans = []
+
+    # 6時間ごとのスパンの気圧データを収集
     for i in range(1, 25, 6):
-        span_pressures = [p[1] for p in sea_level_pressures if i <= p[0] < i + 6]
+        span_pressures = [p[1] for p in sea_level_pressures if i <= p[0] < i+6]
         if span_pressures:
             avg_pressure = statistics.mean(span_pressures)
             min_pressure = min(span_pressures)
             max_pressure = max(span_pressures)
-            pressure_spans.append((i, i + 5, avg_pressure, min_pressure, max_pressure, span_pressures))
-    for i in range(len(pressure_spans) - 1):
+            pressure_spans.append((i, i+5, avg_pressure, min_pressure, max_pressure, span_pressures))
+
+    # 気圧変化のマークを追加
+    for i in range(len(pressure_spans)-1):
         current_span = pressure_spans[i]
-        next_span = pressure_spans[i + 1]
+        next_span = pressure_spans[i+1]
+
         change_mark = ""
+
+        # 下降判定: 現在のスパンの最大値と次のスパンのすべての値を比較
         if any(current_span[4] - next_value >= 5 for next_value in next_span[5]):
             change_mark = "⤵️💣️"
+        # 上昇判定: 現在のスパンの最小値と次のスパンのすべての値を比較
         elif any(next_value - current_span[3] >= 5 for next_value in next_span[5]):
             change_mark = "⤴️⚠️"
+
+        # マークを追加（元のタプルの要素を保持し、マークを最後に追加）
         pressure_spans[i] = (*current_span[:5], change_mark)
+
+    # 最後のスパンの変化マークは空
     if pressure_spans:
         pressure_spans[-1] = (*pressure_spans[-1][:5], "")
 
+    # 気温データを処理
     morning_temps = [t[1] for t in temperature_data if 5 <= t[0] <= 11]
     daytime_temps = [t[1] for t in temperature_data if 12 <= t[0] <= 18]
     evening_temps = [t[1] for t in temperature_data if t[0] >= 19 or t[0] <= 4]
+
     all_temps = [t[1] for t in temperature_data]
     max_temp = max(all_temps) if all_temps else 0
     min_temp = min(all_temps) if all_temps else 0
+
     morning_avg = statistics.mean(morning_temps) if morning_temps else 0
     daytime_avg = statistics.mean(daytime_temps) if daytime_temps else 0
     evening_avg = statistics.mean(evening_temps) if evening_temps else 0
 
+    # 湿度データを処理
     morning_humidity = [h[1] for h in humidity_data if 5 <= h[0] <= 11]
     daytime_humidity = [h[1] for h in humidity_data if 12 <= h[0] <= 18]
     evening_humidity = [h[1] for h in humidity_data if h[0] >= 19 or h[0] <= 4]
+
     all_humidity = [h[1] for h in humidity_data]
     max_humidity = max(all_humidity) if all_humidity else 0
     min_humidity = min(all_humidity) if all_humidity else 0
+
     morning_hum_avg = statistics.mean(morning_humidity) if morning_humidity else 0
     daytime_hum_avg = statistics.mean(daytime_humidity) if daytime_humidity else 0
     evening_hum_avg = statistics.mean(evening_humidity) if evening_humidity else 0
 
+    # 降水量データを処理
     morning_precip = sum([p[1] for p in precipitation_data if 5 <= p[0] <= 11])
     daytime_precip = sum([p[1] for p in precipitation_data if 12 <= p[0] <= 18])
     evening_precip = sum([p[1] for p in precipitation_data if p[0] >= 19 or p[0] <= 4])
 
+    # 気圧情報を文字列化（6時間スパン版）
     pressure_str = ", ".join([f"{s[0]}-{s[1]}時:平均{s[2]:.1f}hPa{s[5]}" for s in pressure_spans])
+
+    # 気温情報を文字列化
     temp_str = f"朝:平均{morning_avg:.1f}℃, 昼:平均{daytime_avg:.1f}℃, 夜:平均{evening_avg:.1f}℃（最高:{max_temp:.1f}℃, 最低:{min_temp:.1f}℃）"
+
+    # 湿度情報を文字列化
     humidity_str = f"朝:平均{morning_hum_avg:.1f}%, 昼:平均{daytime_hum_avg:.1f}%, 夜:平均{evening_hum_avg:.1f}%（最高:{max_humidity}%, 最低:{min_humidity}%）"
+
+    # 降水量情報を文字列化
     precip_str = f"朝:{morning_precip:.1f}mm, 昼:{daytime_precip:.1f}mm, 夜:{evening_precip:.1f}mm"
+
+    # 天気情報を文字列化
     weather_str = ", ".join(weather_info)
-    return {
-        "weather": weather_str,
-        "temperature": temp_str,
-        "humidity": humidity_str,
-        "precipitation": precip_str,
-        "pressure": pressure_str,
-        "sunshine": f"{total_sunshine:.1f}時間",
+
+    result = {
+        "天気": weather_str,
+        "気温": temp_str,
+        "湿度": humidity_str,
+        "降水量": precip_str,
+        "気圧": pressure_str,
+        "日照時間": f"{total_sunshine:.1f}時間"
     }
+
+    # データの完全性を示すフラグを追加
+    # 天気情報（imgのalt属性）が空の場合はデータ未公開と判断
+    result["_is_complete"] = len(weather_info) > 0
+
+    return result
+
+
+#: 前身の出力キー → :class:`WeatherSummary` のフィールド名.
+_LEGACY_KEYS: "Dict[str, str]" = {
+    "weather": "天気",
+    "temperature": "気温",
+    "humidity": "湿度",
+    "precipitation": "降水量",
+    "pressure": "気圧",
+    "sunshine": "日照時間",
+}
+
+#: 前身の ``if i > 2`` は見出し 2 行に加えて 3 行目 (= 1 時) も読み捨てる. 見出しの直後に
+#: 空の行を 1 つ挟んだページを読ませると、前身の式のまま 1〜24 時を全て集計させられる.
+_SACRIFICIAL_ROW = '<tr class="mtx"><th scope="col"></th></tr>\n'
+
+
+def _legacy_fields(html: str) -> "Dict[str, object]":
+    """前身の出力を :class:`WeatherSummary` のフィールド名で (``_is_complete`` も含む)."""
+    result = _legacy_get_weather_data(html)
+    fields: "Dict[str, object]" = {name: result[key] for name, key in _LEGACY_KEYS.items()}
+    fields["_is_complete"] = result["_is_complete"]
+    return fields
+
+
+def _legacy_verbatim(rows: DaySpec) -> "Dict[str, object]":
+    """前身そのもの (1 時の行を読み捨てる)."""
+    return _legacy_fields(_page(rows))
+
+
+def _legacy_all_hours(rows: DaySpec) -> "Dict[str, object]":
+    """前身の式で 1〜24 時を全て読ませた結果 (入力側で off-by-one を打ち消す)."""
+    return _legacy_fields(_page(rows, header=_HEADER_ROWS + _SACRIFICIAL_ROW))
 
 
 _CONDITIONS = ("快晴", "晴れ", "薄曇", "曇", "雨", "雪", "みぞれ", "霧雨", "雷電", "霧", "あられ", "しゅう雨または止み間のある雨")
@@ -406,9 +582,11 @@ class ParseSyntheticFixtureTest(unittest.TestCase):
         page = weather._parse_page(html)
         self.assertFalse(page.table_found)
         self.assertEqual(parse_jma_hourly(html), [])
-        summary = summarize_weather([], date(2031, 2, 15))
+        summary = summarize_weather([], date(2031, 2, 15), pending=True)
         self.assertFalse(summary.is_complete)
         self.assertEqual(summary.status, "nodata")
+        # 公開待ちの期間を過ぎた日の 0 行は「データなし」ではなく未完成 (partial)
+        self.assertEqual(summarize_weather([], date(2031, 2, 15)).status, "partial")
 
 
 # ---------------------------------------------------------------------------
@@ -417,10 +595,27 @@ class ParseSyntheticFixtureTest(unittest.TestCase):
 
 
 class LegacyParityTest(unittest.TestCase):
+    """前身の逐語転写 :func:`_legacy_get_weather_data` と同じ入力で同じ出力.
+
+    - ``_FIRST_HOUR = 2`` (前身と同じく 1 時の行を集計しない) では前身と **完全一致**.
+      = ``_FIRST_HOUR`` 1 つを変えるだけで前身互換に戻せることの証明.
+    - 既定 (``_FIRST_HOUR = 1``) は、前身の式で 1〜24 時を全て読ませた結果と一致
+      (= 前身との違いは 1 時の行だけ. 具体値は :class:`HourOneRowTest` で固定).
+    """
+
     def assert_same_as_legacy(self, rows: DaySpec) -> WeatherSummary:
+        verbatim = _legacy_verbatim(rows)
+        self.assertIs(verbatim.pop("_is_complete"), True)
+        with mock.patch.object(weather, "_FIRST_HOUR", 2):
+            strict = _summarize_spec(rows)
+        self.assertTrue(strict.is_complete)
+        self.assertEqual(_summary_dict(strict), verbatim)
+
+        all_hours = _legacy_all_hours(rows)
+        self.assertIs(all_hours.pop("_is_complete"), True)
         summary = _summarize_spec(rows)
         self.assertTrue(summary.is_complete)
-        self.assertEqual(_summary_dict(summary), _legacy_summary(rows))
+        self.assertEqual(_summary_dict(summary), all_hours)
         return summary
 
     def test_default_day(self) -> None:
@@ -517,6 +712,16 @@ class LegacyParityTest(unittest.TestCase):
                 expected_mark = (float(high) - float(low)) >= 5
                 self.assertEqual(DROP in (summary.pressure or ""), expected_mark)
 
+    def test_mean_is_correctly_rounded_like_legacy(self) -> None:
+        # 7 時間そろった朝 / 昼の平均は 10 進で x.x5 ちょうどにならないが、1 時間欠けて 6 個に
+        # なると起こりうる. 前身と同じ statistics.mean (正しく丸めた平均) でないと 1 桁目がずれる.
+        # 空欄は前身も読み飛ばすので、逐語転写とそのまま突き合わせられる
+        rows = _day({5: {"temp": ""}, 11: {"temp": "10.3"}, 12: {"temp": ""}, 18: {"temp": "10.3"}})
+        summary = self.assert_same_as_legacy(rows)
+        self.assertTrue((summary.temperature or "").startswith("朝:平均10.1℃, 昼:平均10.1℃, "))
+        naive = [10.0] * 5 + [10.3]
+        self.assertEqual(f"{sum(naive) / len(naive):.1f}", "10.0")  # 素朴な sum / len だと 10.0
+
     def test_humidity_extremes_are_integers(self) -> None:
         rows = _day({4: {"hum": "100"}, 14: {"hum": "9"}})
         summary = self.assert_same_as_legacy(rows)
@@ -550,7 +755,7 @@ class LegacyParityTest(unittest.TestCase):
         for condition, emoji in expected.items():
             with self.subTest(condition=condition):
                 self.assertEqual(weather._weather_emoji(condition), emoji)
-                self.assertEqual(weather._weather_emoji(condition), _legacy_emoji(condition))
+                self.assertEqual(weather._weather_emoji(condition), _legacy_get_weather_emoji(condition))
 
 
 # ---------------------------------------------------------------------------
@@ -559,10 +764,45 @@ class LegacyParityTest(unittest.TestCase):
 
 
 class HourOneRowTest(unittest.TestCase):
-    """前身は ``if i > 2`` で 1 時の行を読み捨てていた. 本実装は 1〜24 時を全て使う."""
+    """前身は ``if i > 2`` で 1 時の行を読み捨てていた. 本実装は 1〜24 時を全て使う.
+
+    SPEC §2-B「前身と完全一致」からの意図的な逸脱 (理由は weather.py の docstring).
+    前身互換に戻すなら ``_FIRST_HOUR = 2`` にしてこのクラスの期待値を前身側に揃える.
+    """
+
+    ROWS = _day({1: {"temp": "30.0", "slp": "1040.0", "hum": "99", "precip": "2.0"}})
+
+    def test_default_uses_hour_one(self) -> None:
+        self.assertEqual(weather._FIRST_HOUR, 1)
+
+    def test_predecessor_drops_hour_one(self) -> None:
+        """前身の逐語転写は 1 時の行 (30℃ / 1040hPa / 99% / 2.0mm) を集計に入れない."""
+        legacy = _legacy_verbatim(self.ROWS)
+        self.assertEqual(
+            legacy["temperature"],
+            "朝:平均10.0℃, 昼:平均10.0℃, 夜:平均10.0℃（最高:10.0℃, 最低:10.0℃）",
+        )
+        self.assertEqual(
+            legacy["humidity"],
+            "朝:平均60.0%, 昼:平均60.0%, 夜:平均60.0%（最高:60%, 最低:60%）",
+        )
+        self.assertEqual(
+            legacy["pressure"],
+            "1-6時:平均1010.0hPa, 7-12時:平均1010.0hPa, 13-18時:平均1010.0hPa, 19-24時:平均1010.0hPa",
+        )
+        self.assertEqual(legacy["precipitation"], "朝:0.0mm, 昼:0.0mm, 夜:0.0mm")
+
+    def test_first_hour_two_reproduces_predecessor(self) -> None:
+        with mock.patch.object(weather, "_FIRST_HOUR", 2):
+            summary = _summarize_spec(self.ROWS)
+        expected = _legacy_verbatim(self.ROWS)
+        self.assertIs(expected.pop("_is_complete"), True)
+        self.assertEqual(_summary_dict(summary), expected)
+        self.assertEqual(summary.observed_hours, 24)  # 1 時の行は読むが集計に使わないだけ
+        self.assertEqual(summary.status, "complete")
 
     def test_hour_one_counts_for_night_first_span_and_extremes(self) -> None:
-        rows = _day({1: {"temp": "30.0", "slp": "1040.0", "hum": "99", "precip": "2.0"}})
+        rows = self.ROWS
         summary = _summarize_spec(rows)
         # 夜 = 1〜4 時 + 19〜24 時 の 10 時間: (30.0 + 9 × 10.0) / 10 = 12.0
         self.assertEqual(
@@ -611,6 +851,23 @@ class QualityMarkTest(unittest.TestCase):
         self.assertEqual(obs.precipitation, 0.0)
         self.assertEqual(obs.sunshine, 0.0)
         self.assertFalse(obs.sunshine_missing)
+
+    def test_quasi_normal_no_phenomenon_is_zero(self) -> None:
+        # ``--)`` = 「該当現象なし」の準正常値. 記号を外して ``--`` と同じ扱い (0. 欠測ではない)
+        for text in ("--)", "-- )", " --) "):
+            with self.subTest(text=text):
+                self.assertEqual(weather._amount(text), (0.0, False))
+                self.assertIsNone(weather._measured(text))
+        # 資料不足値 / 疑問値の ``--``, 記号だけ, 記号の重複は欠測
+        for text in ("--]", "--#", ")", "]", "--))", "12.3))"):
+            with self.subTest(text=text):
+                self.assertEqual(weather._amount(text), (None, True))
+
+    def test_quasi_normal_no_phenomenon_keeps_amount_keys(self) -> None:
+        summary = _summarize_spec(_day({13: {"precip": "--)"}, 12: {"sun": "-- )"}}))
+        self.assertEqual(summary.precipitation, "朝:0.0mm, 昼:0.0mm, 夜:0.0mm")
+        self.assertEqual(summary.sunshine, "5.0時間")  # 12 時 = 0, 残り 7〜17 時の 10 時間 × 0.5
+        self.assertEqual(summary.status, "complete")
 
     def test_blank_cells(self) -> None:
         obs = self._single(temp="", precip="", sun="&nbsp;")
@@ -676,6 +933,24 @@ class KeyLevelCompletenessTest(unittest.TestCase):
         rows = _day({h: {"sun": ""} for h in (7, 8, 9)})
         self.assertIsNone(_summarize_spec(rows).sunshine)
 
+    def test_sunshine_missing_mark_outside_core_hours_drops_key(self) -> None:
+        # 17 時 (8〜16 時の外, 数値のある時間帯の端) の欠測記号だけでも合計は過小になる
+        self.assertIsNone(_summarize_spec(_day({17: {"sun": "×"}})).sunshine)
+
+    def test_sunshine_blank_inside_numeric_range_outside_core_drops_key(self) -> None:
+        # 6 時に数値があり 7 時が空欄 → 日中の内側の欠落 (8〜16 時の判定には掛からない位置)
+        self.assertIsNone(_summarize_spec(_day({6: {"sun": "0.3"}, 7: {"sun": ""}})).sunshine)
+
+    def test_sunshine_core_hours_are_8_to_16(self) -> None:
+        # 端の 2 時間が欠けると数値の範囲は狭まるが、8 時 / 16 時は全国どこでも日中なので欠測
+        for hours in ((7, 8), (16, 17)):
+            with self.subTest(blank=hours):
+                self.assertIsNone(_summarize_spec(_day({h: {"sun": ""} for h in hours})).sunshine)
+        # 7 時 / 17 時だけの空欄は夜明け前 / 日没後と区別できないので 0 として合計する
+        for hour in (7, 17):
+            with self.subTest(blank=hour):
+                self.assertEqual(_summarize_spec(_day({hour: {"sun": ""}})).sunshine, "5.0時間")
+
     def test_sunshine_night_blanks_are_zero(self) -> None:
         # 既定: 7〜17 時が 0.5h, 他は空欄 → 11 × 0.5 = 5.5
         self.assertEqual(_summarize_spec(_day()).sunshine, "5.5時間")
@@ -724,11 +999,23 @@ class DayCompletenessTest(unittest.TestCase):
     def test_no_weather_observation(self) -> None:
         self.assert_incomplete(_day({h: {"alt": None} for h in _ALT_HOURS}), observed=24)
 
-    def test_header_only_table_is_nodata(self) -> None:
+    def test_header_only_table_is_nodata_only_while_pending(self) -> None:
         page = weather._parse_page(_page([]))
         self.assertTrue(page.table_found)
         self.assertEqual(page.observations, [])
-        self.assertEqual(summarize_weather(page.observations, FIXTURE_DATE).status, "nodata")
+        waiting = summarize_weather(page.observations, FIXTURE_DATE, pending=True)
+        self.assertEqual((waiting.status, waiting.observed_hours), ("nodata", 0))
+        # 確定済みのはずの日に 0 行 (休止した観測所 / 番号の誤り) は黙って nodata にしない
+        stale = summarize_weather(page.observations, FIXTURE_DATE)
+        self.assertEqual((stale.status, stale.observed_hours, stale.is_complete), ("partial", 0, False))
+        self.assertEqual(stale.missing_keys, WEATHER_FIELDS)
+
+    def test_single_observed_row(self) -> None:
+        # 行が 1 つでもあれば「未公開 (0 行)」ではない. 確定済みのはずの日なら partial
+        summary = self.assert_incomplete(_day(hours=[1]), observed=1)
+        self.assertEqual(summary.status, "partial")
+        waiting = summarize_weather(parse_jma_hourly(_page(_day(hours=[1]))), FIXTURE_DATE, pending=True)
+        self.assertEqual(waiting.status, "nodata")
 
     def test_summarize_ignores_out_of_range_and_duplicate_hours(self) -> None:
         base = parse_jma_hourly(_page(_day()))
@@ -746,6 +1033,54 @@ class DayCompletenessTest(unittest.TestCase):
         summary = _summarize_spec(_day())
         with self.assertRaises(dataclasses.FrozenInstanceError):
             summary.weather = "x"  # type: ignore[misc]
+
+
+class PendingStatusTest(unittest.TestCase):
+    """SPEC v2 §4.1: 公開待ち (想定内の遅延) は nodata, 確定済みのはずの日の未完成は partial.
+
+    前日分は 24 時間分の数値が先に公開され、天気欄 (img) が後から埋まる. この状態を
+    毎朝 partial (= 部分失敗) と報告しないよう、:func:`fetch_weather` が日付から
+    ``pending`` を決める (fetch 側の境界は :class:`FetchWeatherTest`).
+    """
+
+    def _prepublication_obs(self) -> "List[HourlyObservation]":
+        return parse_jma_hourly(_page(_day({h: {"alt": None} for h in _ALT_HOURS})))
+
+    def test_incomplete_day_status_follows_pending(self) -> None:
+        obs = self._prepublication_obs()
+        stale = summarize_weather(obs, FIXTURE_DATE)
+        self.assertEqual(
+            (stale.is_complete, stale.pending, stale.status, stale.observed_hours),
+            (False, False, "partial", 24),
+        )
+        waiting = summarize_weather(obs, FIXTURE_DATE, pending=True)
+        self.assertEqual((waiting.is_complete, waiting.pending, waiting.status), (False, True, "nodata"))
+        self.assertEqual(waiting.missing_keys, WEATHER_FIELDS)
+
+    def test_complete_day_is_never_pending(self) -> None:
+        summary = summarize_weather(parse_jma_hourly(_page(_day())), FIXTURE_DATE, pending=True)
+        self.assertEqual((summary.status, summary.pending), ("complete", False))
+
+    def test_incomplete_reasons(self) -> None:
+        """ログに出す未完成の理由 (完成した日は空)."""
+
+        def reasons(rows: DaySpec) -> "List[str]":
+            return weather._incomplete_reasons(weather._index_by_hour(parse_jma_hourly(_page(rows))))
+
+        self.assertEqual(reasons(_day()), [])
+        self.assertEqual(weather._incomplete_reasons({}), ["観測行なし"])
+        self.assertEqual(reasons(_day({h: {"alt": None} for h in _ALT_HOURS})), ["天気 (画像の alt) が 0 件"])
+        self.assertEqual(reasons(_day(hours=range(1, 24))), ["24時の行なし"])
+        self.assertEqual(
+            reasons(_day({24: {"temp": "×", "slp": ""}})),
+            ["24時の気温が欠測", "24時の海面気圧が欠測"],
+        )
+
+    def test_missing_key_on_complete_day_is_partial_even_when_pending(self) -> None:
+        # 日は完成している (= 公開済み) ので、欠測キーは公開待ちではなく欠測
+        rows = _day({13: {"precip": "×"}})
+        summary = summarize_weather(parse_jma_hourly(_page(rows)), FIXTURE_DATE, pending=True)
+        self.assertEqual((summary.status, summary.missing_keys), ("partial", ("precipitation",)))
 
 
 # ---------------------------------------------------------------------------
@@ -816,8 +1151,73 @@ class HtmlRobustnessTest(unittest.TestCase):
         )
         self.assertEqual(len(parse_jma_hourly(html)), 24)
 
+    _ONE_ROW_HEADER = (
+        "<tr>"
+        + "".join(
+            f"<th>{label}</th>"
+            for label in (
+                "時", "現地気圧", "海面気圧", "降水量", "気温", "露点温度", "蒸気圧", "湿度", "風速",
+                "風向", "日照時間", "全天日射量", "降雪", "積雪", "天気", "雲量", "視程",
+            )
+        )
+        + "</tr>\n"
+    )
+    # 「海面」は 3 段目にしか無い (見出しを 2 段と決め打ちすると列を特定できない)
+    _THREE_ROW_HEADER = (
+        '<tr><th rowspan="3">時</th><th colspan="2">気圧(hPa)</th><th rowspan="3">降水量</th>'
+        '<th rowspan="3">気温</th><th rowspan="3">露点温度</th><th rowspan="3">蒸気圧</th>'
+        '<th rowspan="3">湿度</th><th colspan="2" rowspan="2">風向・風速</th><th rowspan="3">日照時間</th>'
+        '<th rowspan="3">全天日射量</th><th colspan="2" rowspan="2">雪(cm)</th><th rowspan="3">天気</th>'
+        '<th rowspan="3">雲量</th><th rowspan="3">視程</th></tr>\n'
+        '<tr><th colspan="2">観測値</th></tr>\n'
+        "<tr><th>現地</th><th>海面</th><th>風速</th><th>風向</th><th>降雪</th><th>積雪</th></tr>\n"
+    )
+
+    def test_header_row_count_is_detected(self) -> None:
+        expected = _summary_dict(_summarize_spec(_day()))
+        for label, header in (("1 段", self._ONE_ROW_HEADER), ("3 段", self._THREE_ROW_HEADER)):
+            with self.subTest(header=label):
+                obs = parse_jma_hourly(_page(_day(), header=header))
+                self.assertEqual([o.hour for o in obs], list(range(1, 25)))
+                self.assertEqual(_summary_dict(summarize_weather(obs, FIXTURE_DATE)), expected)
+
+
+_HOUR_CELL_RE = re.compile(r'(<td style="white-space:nowrap">)(\d+)(</td>)')
+
+
+def _with_hour_cells(html: str, render: "Callable[[int], str]") -> str:
+    """時刻列のセル (``1``〜``24``) を ``render(時刻)`` に書き換える (時刻列の仕様変更の模擬)."""
+    rewritten = _HOUR_CELL_RE.sub(lambda m: m.group(1) + render(int(m.group(2))) + m.group(3), html)
+    assert rewritten != html
+    return rewritten
+
 
 class LayoutChangeTest(unittest.TestCase):
+    def test_hour_cells_in_another_format_raise(self) -> None:
+        # 書式が変わった時刻を 0 行 (= 未公開, nodata) と取り違えず失敗にする.
+        # "00:00" 形式は区間の始まりを表す可能性もあるので読み替えない
+        formats: "Dict[str, Callable[[int], str]]" = {
+            "1時": lambda h: f"{h}時",
+            "00:00": lambda h: f"{h - 1:02d}:00",
+            "1.0": lambda h: f"{h}.0",
+        }
+        for label, render in formats.items():
+            with self.subTest(format=label):
+                with self.assertRaisesRegex(WeatherError, "時刻列"):
+                    parse_jma_hourly(_with_hour_cells(_page(_day()), render))
+
+    def test_single_unreadable_hour_cell_raises(self) -> None:
+        html = _page(_day()).replace(
+            '<td style="white-space:nowrap">13</td>', '<td style="white-space:nowrap">13時</td>', 1,
+        )
+        with self.assertRaisesRegex(WeatherError, "13時"):
+            parse_jma_hourly(html)
+
+    def test_data_rows_without_any_hour_raise(self) -> None:
+        html = _with_hour_cells(_page(_day()), lambda h: "-")
+        with self.assertRaisesRegex(WeatherError, "24 行"):
+            parse_jma_hourly(html)
+
     def test_missing_sunshine_column(self) -> None:
         html = _page(_day()).replace("日照<br />時間<br />(h)", "日射<br />時間<br />(h)")
         with self.assertRaisesRegex(WeatherError, "日照"):
@@ -865,6 +1265,17 @@ class _FakeOpener:
         return response
 
 
+class _WarningCollector(logging.Handler):
+    """logger に付けて WARNING 以上の記録を集める (「警告が出ないこと」の確認用)."""
+
+    def __init__(self) -> None:
+        super().__init__(level=logging.WARNING)
+        self.records: "List[logging.LogRecord]" = []
+
+    def emit(self, record: logging.LogRecord) -> None:
+        self.records.append(record)
+
+
 def _http_error(code: int) -> urllib.error.HTTPError:
     return urllib.error.HTTPError(jma_hourly_url(FIXTURE_DATE), code, "error", None, None)  # type: ignore[arg-type]
 
@@ -882,6 +1293,8 @@ class FetchWeatherTest(unittest.TestCase):
         self.logger = logging.getLogger("test.ihealth.weather")
 
     def fetch(self, opener: _FakeOpener, d: date = FIXTURE_DATE, **kwargs: object) -> WeatherSummary:
+        # 公開待ち判定を実行時の時計に依存させない. 既定は「確定済みの過去日」として取得する
+        kwargs.setdefault("today", d + timedelta(days=30))
         return fetch_weather(d, opener=opener, logger=self.logger, sleep=self.sleeps.append, **kwargs)  # type: ignore[arg-type]
 
     def test_success_sends_user_agent_url_and_timeout(self) -> None:
@@ -909,10 +1322,105 @@ class FetchWeatherTest(unittest.TestCase):
 
     def test_unavailable_page_is_nodata_not_error(self) -> None:
         body = (FIXTURES / "hourly_unavailable.html").read_bytes()
-        summary = self.fetch(_FakeOpener([body]), d=date(2031, 2, 15))
+        summary = self.fetch(_FakeOpener([body]), d=date(2031, 2, 15), today=date(2031, 2, 15))
         self.assertFalse(summary.is_complete)
         self.assertEqual(summary.status, "nodata")
         self.assertEqual(summary.missing_keys, WEATHER_FIELDS)
+
+    def test_zero_row_pages_of_old_days_are_partial_with_warning(self) -> None:
+        # 公開待ちの期間 (2 日) を過ぎた日の「0 行」は想定外: 観測所の休止 / JMA_PREC_NO・
+        # JMA_BLOCK_NO の誤り / 過去日に未公開の案内が返る障害。nodata (= 黙って何も
+        # 書かない) にすると利用者が気付けないので partial + warning にする
+        # (統合側は 2 日以上続けば通知する)
+        cases = {
+            # 見出しの日付 (2031-02-14) と要求日を合わせる
+            "見出しだけの表": (_page([]).encode("utf-8"), FIXTURE_DATE),
+            "未公開の案内": ((FIXTURES / "hourly_unavailable.html").read_bytes(), date(2031, 2, 15)),
+        }
+        for label, (body, d) in cases.items():
+            with self.subTest(case=label):
+                with self.assertLogs(self.logger, level="WARNING"):
+                    summary = self.fetch(_FakeOpener([body]), d=d, today=d + timedelta(days=5))
+                self.assertEqual(
+                    (summary.status, summary.pending, summary.is_complete, summary.observed_hours),
+                    ("partial", False, False, 0),
+                )
+                self.assertEqual(summary.missing_keys, WEATHER_FIELDS)
+                # 公開待ちの期間内なら同じページでも nodata (想定内)
+                waiting = self.fetch(_FakeOpener([body]), d=d, today=d + timedelta(days=2))
+                self.assertEqual((waiting.status, waiting.pending), ("nodata", True))
+
+    def _prepublication_body(self) -> bytes:
+        """前日分の公開途中: 24 時間分の数値は出ているが天気欄 (img) がまだ空."""
+        return _page(_day({h: {"alt": None} for h in _ALT_HOURS})).encode("utf-8")
+
+    def test_prepublication_page_is_nodata_within_grace_days(self) -> None:
+        # 想定内の遅延なので warning も出さない (tests/__init__.py が INFO 以下を止めているので
+        # WARNING 以上だけを集めて「無いこと」を確かめる. 3.9 には assertNoLogs が無い)
+        collector = _WarningCollector()
+        self.logger.addHandler(collector)
+        self.addCleanup(self.logger.removeHandler, collector)
+        for days in (0, 1, 2):
+            with self.subTest(days_since=days):
+                summary = self.fetch(
+                    _FakeOpener([self._prepublication_body()]), today=FIXTURE_DATE + timedelta(days=days),
+                )
+                self.assertEqual(
+                    (summary.status, summary.pending, summary.is_complete, summary.observed_hours),
+                    ("nodata", True, False, 24),
+                )
+                self.assertEqual(_summary_dict(summary), {name: None for name in WEATHER_FIELDS})
+        self.assertEqual(collector.records, [])
+
+    def test_incomplete_page_older_than_grace_days_is_partial_with_warning(self) -> None:
+        # 確定済みのはずの日が埋まらない = 気象庁の欠測 / 天気欄の仕様変更. 黙って nodata にしない
+        cases = {
+            "天気欄が空": (self._prepublication_body(), "天気 (画像の alt) が 0 件"),
+            "天気が img でなく文字": (
+                re.sub(r'<img src="[^"]*tenki[^"]*" alt="([^"]*)">', r"\1", _page(_day())).encode("utf-8"),
+                "天気 (画像の alt) が 0 件",
+            ),
+            "24時の気温が欠測": (_page(_day({24: {"temp": "×"}})).encode("utf-8"), "24時の気温が欠測"),
+        }
+        for label, (body, reason) in cases.items():
+            with self.subTest(case=label):
+                with self.assertLogs(self.logger, level="WARNING") as captured:
+                    summary = self.fetch(_FakeOpener([body]), today=FIXTURE_DATE + timedelta(days=3))
+                self.assertEqual((summary.status, summary.pending, summary.is_complete), ("partial", False, False))
+                self.assertEqual(summary.missing_keys, WEATHER_FIELDS)
+                self.assertIn(reason, captured.output[0])
+
+    def test_complete_page_is_complete_whatever_the_date(self) -> None:
+        for days in (0, 1, 3, 400):
+            with self.subTest(days_since=days):
+                summary = self.fetch(_FakeOpener([self.page]), today=FIXTURE_DATE + timedelta(days=days))
+                self.assertEqual((summary.status, summary.pending), ("complete", False))
+
+    def test_today_defaults_to_jst_clock(self) -> None:
+        def fetch_without_today() -> WeatherSummary:
+            return fetch_weather(
+                FIXTURE_DATE, opener=_FakeOpener([self._prepublication_body()]),
+                logger=self.logger, sleep=self.sleeps.append,
+            )
+
+        with mock.patch.object(weather, "_jst_today", return_value=FIXTURE_DATE + timedelta(days=2)) as clock:
+            self.assertEqual(fetch_without_today().status, "nodata")
+        clock.assert_called_once_with()
+        with mock.patch.object(weather, "_jst_today", return_value=FIXTURE_DATE + timedelta(days=3)) as clock:
+            with self.assertLogs(self.logger, level="WARNING"):
+                self.assertEqual(fetch_without_today().status, "partial")
+        clock.assert_called_once_with()
+
+    def test_jst_today_is_the_japan_date(self) -> None:
+        # 2031-02-14 15:00 UTC = 2031-02-15 00:00 JST (実行環境の TZ には依存しない)
+        midnight_jst = datetime(2031, 2, 14, 15, 0, tzinfo=timezone.utc).timestamp()
+        self.assertEqual(weather._jst_today(lambda: midnight_jst), date(2031, 2, 15))
+        self.assertEqual(weather._jst_today(lambda: midnight_jst - 1), date(2031, 2, 14))
+
+    def test_hour_format_change_is_an_error_not_nodata(self) -> None:
+        body = _with_hour_cells(_page(_day()), lambda h: f"{h}時").encode("utf-8")
+        with self.assertRaisesRegex(WeatherError, "時刻列"):
+            self.fetch(_FakeOpener([body]), today=FIXTURE_DATE + timedelta(days=1))
 
     def test_unexpected_page_without_table_or_notice_raises(self) -> None:
         body = "<html><body><p>ただいまメンテナンス中です</p></body></html>".encode("utf-8")
@@ -1004,7 +1512,10 @@ class FetchWeatherTest(unittest.TestCase):
         response = mock.MagicMock()
         response.__enter__.return_value.read.return_value = self.page
         with mock.patch.object(urllib.request, "urlopen", return_value=response) as urlopen:
-            summary = fetch_weather(FIXTURE_DATE, timeout=7.5, logger=self.logger, sleep=self.sleeps.append)
+            summary = fetch_weather(
+                FIXTURE_DATE, timeout=7.5, logger=self.logger, sleep=self.sleeps.append,
+                today=FIXTURE_DATE + timedelta(days=30),
+            )
         self.assertTrue(summary.is_complete)
         (request,), kwargs = urlopen.call_args
         self.assertEqual(request.full_url, jma_hourly_url(FIXTURE_DATE))
@@ -1016,7 +1527,10 @@ class FetchWeatherTest(unittest.TestCase):
         with mock.patch.object(urllib.request, "urlopen", return_value=response), \
                 mock.patch.object(weather, "_MAX_BODY_BYTES", 10):
             with self.assertRaisesRegex(WeatherError, "大きすぎ"):
-                fetch_weather(FIXTURE_DATE, logger=self.logger, sleep=self.sleeps.append)
+                fetch_weather(
+                    FIXTURE_DATE, logger=self.logger, sleep=self.sleeps.append,
+                    today=FIXTURE_DATE + timedelta(days=30),
+                )
 
 
 if __name__ == "__main__":

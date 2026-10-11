@@ -82,7 +82,7 @@ OBSIDIAN_SHAPE = (
     "歩数 (歩): 本文中の偽 frontmatter\n"
 )
 
-#: 別ツール (screen-diary) が作る最小ノート + 本文末尾の日報節.
+#: 別ツール (本文末尾に日報を追記するツール等) が作る最小ノート + 本文末尾の日報節.
 MINIMAL_SHAPE = (
     "---\n"
     "日付: 2030-01-04\n"
@@ -188,7 +188,7 @@ def _mini_yaml_load(text: str) -> "dict[str, object]":
 
 class TestRenderScalar(unittest.TestCase):
     def test_int(self):
-        self.assertEqual(render_scalar(4009), "4009")
+        self.assertEqual(render_scalar(5555), "5555")
         self.assertEqual(render_scalar(0), "0")
         self.assertEqual(render_scalar(-3), "-3")
 
@@ -199,12 +199,12 @@ class TestRenderScalar(unittest.TestCase):
         self.assertEqual(render_scalar(Level.HIGH), "3")
 
     def test_float_integer_value_uses_int_notation(self):
-        self.assertEqual(render_scalar(66.0), "66")
-        self.assertEqual(render_scalar(36.0), "36")
+        self.assertEqual(render_scalar(61.0), "61")
+        self.assertEqual(render_scalar(24.0), "24")
         self.assertEqual(render_scalar(-0.0), "0")
 
     def test_float_shortest_repr(self):
-        self.assertEqual(render_scalar(1899.4), "1899.4")
+        self.assertEqual(render_scalar(1234.6), "1234.6")
         self.assertEqual(render_scalar(0.1 + 0.2), "0.30000000000000004")
 
     def test_float_exponent_becomes_positional(self):
@@ -222,7 +222,7 @@ class TestRenderScalar(unittest.TestCase):
         self.assertEqual(render_scalar(False), "false")
 
     def test_str_is_json_double_quoted(self):
-        self.assertEqual(render_scalar("8.9時間"), '"8.9時間"')
+        self.assertEqual(render_scalar("5.5時間"), '"5.5時間"')
         self.assertEqual(render_scalar('a"b\\c'), '"a\\"b\\\\c"')
         self.assertEqual(render_scalar(""), '""')
 
@@ -484,9 +484,12 @@ class TestUpsertEdgeCases(unittest.TestCase):
         out, _ = upsert_frontmatter("---\n---\nbody\n", {"a": 1})
         self.assertEqual(out, "---\na: 1\n---\nbody\n")
 
-    def test_dots_closing_delimiter(self):
-        out, _ = upsert_frontmatter("---\na:\n...\nbody\n", {"a": 1, "b": 2})
-        self.assertEqual(out, "---\na: 1\nb: 2\n...\nbody\n")
+    def test_dots_line_is_not_a_closing_delimiter(self):
+        # Obsidian は '...' を frontmatter の閉じとみなさない (行頭が '---' の行だけ).
+        # '...' で閉じたつもりのノートは Obsidian 上 frontmatter が無い/別範囲なので書かない.
+        for text in ("---\na:\n...\nbody\n", "---\na:\n...\nbody\n---\nmore\n"):
+            with self.assertRaises(FrontmatterError, msg=repr(text)):
+                upsert_frontmatter(text, {"a": 1, "b": 2})
 
     def test_empty_file(self):
         out, changes = upsert_frontmatter("", {"a": 1})
@@ -594,12 +597,12 @@ class TestUpsertEdgeCases(unittest.TestCase):
         self.assertEqual(changes[0].action, "update")
 
     def test_semantic_equality_keeps_existing_representation(self):
-        text = "---\n体重 (kg): 66.0\n日照時間: 8.9時間\n歩数 (歩): '100'\n---\n"
+        text = "---\n体重 (kg): 61.0\n日照時間: 5.5時間\n歩数 (歩): '100'\n---\n"
         out, changes = upsert_frontmatter(
-            text, {"体重 (kg)": 66, "日照時間": "8.9時間", "歩数 (歩)": 100},
+            text, {"体重 (kg)": 61, "日照時間": "5.5時間", "歩数 (歩)": 100},
         )
-        # 66.0 == 66 / plain 8.9時間 == "8.9時間" は同値. '100' (文字列) と 100 (数値) は別物.
-        self.assertEqual(out, "---\n体重 (kg): 66.0\n日照時間: 8.9時間\n歩数 (歩): 100\n---\n")
+        # 61.0 == 61 / plain 5.5時間 == "5.5時間" は同値. '100' (文字列) と 100 (数値) は別物.
+        self.assertEqual(out, "---\n体重 (kg): 61.0\n日照時間: 5.5時間\n歩数 (歩): 100\n---\n")
         self.assertEqual([c.action for c in changes], ["unchanged", "unchanged", "update"])
 
     def test_plain_value_that_is_not_valid_yaml_gets_rewritten(self):
@@ -642,6 +645,34 @@ class TestFillOnlyEmpty(unittest.TestCase):
         out, changes = upsert_frontmatter(text, {"a": 2, "b": 3}, fill_only_empty=True)
         self.assertEqual(out, "---\na: 1\nb: 3\n---\n")
         self.assertEqual([c.action for c in changes], ["kept", "insert"])
+
+    def test_replaceable_value_is_overwritten_even_when_filling_only_empty(self):
+        # 本ツールが以前に書いた暫定値 (replaceable) のままなら、確定値に置き換える
+        text = '---\n"歩数 (歩)": 468\nGithub: 該当なし\nb: 1\n---\nbody\n'
+        out, changes = upsert_frontmatter(
+            text, {"歩数 (歩)": 9000, "Github": "[x](u)", "b": 2}, fill_only_empty=True,
+            replaceable={"歩数 (歩)": 468, "Github": "該当なし", "b": 7},
+        )
+        # Github は plain 表記でも意味的に同じなので置き換え、b は値が違う (利用者の値) ので保持
+        self.assertEqual(out, '---\n"歩数 (歩)": 9000\nGithub: "[x](u)"\nb: 1\n---\nbody\n')
+        self.assertEqual([c.action for c in changes], ["update", "update", "kept"])
+
+    def test_replaceable_does_not_touch_values_the_user_changed(self):
+        text = "---\na: 5555\n---\n"
+        out, changes = upsert_frontmatter(
+            text, {"a": 9000}, fill_only_empty=True, replaceable={"a": 468},
+        )
+        self.assertEqual(out, text)
+        self.assertEqual(changes[0].action, "kept")
+
+    def test_replaceable_keys_are_unicode_normalized(self):
+        decomposed = "プ"   # "プ" (NFD)
+        text = f"---\n{decomposed}: 1\n---\n"
+        out, changes = upsert_frontmatter(
+            text, {"プ": 2}, fill_only_empty=True, replaceable={"プ": 1},
+        )
+        self.assertEqual(changes[0].action, "update")
+        self.assertIn(": 2\n", out)
 
     def test_migrated_note_backfill_keeps_existing(self):
         updates = {"歩数 (歩)": 9999, "睡眠時間 (分)": 1, "昼寝時間": 20}
@@ -705,6 +736,148 @@ class TestSplitFrontmatter(unittest.TestCase):
     def test_unclosed(self):
         with self.assertRaises(FrontmatterError):
             split_frontmatter("---\na: 1\n")
+
+
+# ---------------------------------------------------------------------------
+# Obsidian と同じ境界判定 (Obsidian.app の markdown パーサの規則)
+# ---------------------------------------------------------------------------
+
+class TestObsidianBoundaries(unittest.TestCase):
+    """Obsidian は \\r\\n|\\r を \\n に正規化し BOM を除いた後、先頭が '---\\n' ちょうどのときだけ
+    frontmatter とみなし、行頭が '---' の最初の行で閉じる. 解釈が食い違う形には書かない."""
+
+    def test_cr_only_note_is_refused_not_prepended(self):
+        # Obsidian からは a: 1 の frontmatter に見える. 前置すると既存プロパティが本文になる.
+        text = "---\ra: 1\r---\rbody\r"
+        with self.assertRaisesRegex(FrontmatterError, "CR"):  # 直し方が分かるメッセージ
+            upsert_frontmatter(text, {"a": 2})
+        with self.assertRaisesRegex(FrontmatterError, "CR"):
+            split_frontmatter(text)
+
+    def test_lone_cr_inside_frontmatter_is_refused(self):
+        # Obsidian からは a / b の 2 entry. 行として扱うと b を消す・重複追記してしまう.
+        for updates in ({"b": 3}, {"a": 3}):
+            with self.assertRaises(FrontmatterError, msg=repr(updates)):
+                upsert_frontmatter("---\na: 1\rb: 2\n---\n", updates)
+
+    def test_lone_cr_in_body_is_fine(self):
+        out, _ = upsert_frontmatter("---\na: 1\n---\nbody\rmore\n", {"a": 2})
+        self.assertEqual(out, "---\na: 2\n---\nbody\rmore\n")
+        out2, _ = upsert_frontmatter("# t\rbody", {"a": 2})
+        self.assertEqual(out2, "---\na: 2\n---\n# t\rbody")
+
+    def test_opening_with_trailing_whitespace_is_refused(self):
+        # Obsidian は '--- ' を frontmatter と認識しない (書いても表示されない) → 書かない
+        for text in ("--- \na: 1\n---\n", "---\t\na: 1\n---\n", "--- \r\na: 1\r\n---\r\n"):
+            with self.assertRaises(FrontmatterError, msg=repr(text)):
+                upsert_frontmatter(text, {"a": 2})
+
+    def test_closing_must_be_exactly_three_dashes(self):
+        # Obsidian は行頭が '---' の最初の行で閉じる. '---' ちょうどでない閉じ行は解釈が分かれる.
+        for closing in ("--- ", "----", "---x", "--- # c"):
+            text = f"---\na: 1\n{closing}\nbody\n"
+            with self.assertRaises(FrontmatterError, msg=repr(closing)):
+                upsert_frontmatter(text, {"b": 2})
+
+    def test_crlf_and_bom_are_fine(self):
+        out, _ = upsert_frontmatter("﻿---\r\na: 1\r\n---\r\nbody\r\n", {"a": 2})
+        self.assertEqual(out, "﻿---\r\na: 2\r\n---\r\nbody\r\n")
+
+    def test_dashes_line_inside_block_value_does_not_close(self):
+        text = "---\nmemo: |\n  ---\n  x\nb: 1\n---\nbody\n"
+        out, _ = upsert_frontmatter(text, {"b": 2})
+        self.assertEqual(out, "---\nmemo: |\n  ---\n  x\nb: 2\n---\nbody\n")
+
+
+# ---------------------------------------------------------------------------
+# YAML anchor / alias
+# ---------------------------------------------------------------------------
+
+class TestAnchorGuard(unittest.TestCase):
+    def test_replacing_referenced_anchor_is_refused(self):
+        # anchor を消すと alias が未定義になり frontmatter 全体が不正 YAML になる
+        cases = (
+            ("---\nsteps: &s 100\nalias: *s\n---\nbody\n", {"steps": 1234}),
+            ("---\ntags:\n  - &t a\nother: *t\n---\n", {"tags": "x"}),
+            ("---\nbase: &b {k: 1}\nm:\n  <<: *b\n---\n", {"base": "z"}),
+            ("---\na: &x 1\nlist: [*x, 2]\n---\n", {"a": 2}),
+        )
+        for text, updates in cases:
+            with self.assertRaises(FrontmatterError, msg=text):
+                upsert_frontmatter(text, updates)
+
+    def test_unreferenced_anchor_is_replaced(self):
+        out, _ = upsert_frontmatter("---\nsteps: &s 100\nother: 1\n---\n", {"steps": 5})
+        self.assertEqual(out, "---\nsteps: 5\nother: 1\n---\n")
+
+    def test_alias_removed_together_with_its_anchor_is_fine(self):
+        # alias も置換される entry の中にある → 参照ごと消えるので不正にならない
+        out, _ = upsert_frontmatter("---\ntags:\n  - &t a\n  - *t\nn: 1\n---\n", {"tags": "x"})
+        self.assertEqual(out, '---\ntags: "x"\nn: 1\n---\n')
+        out2, _ = upsert_frontmatter("---\na: &x 1\nb: *x\n---\n", {"a": 2, "b": 3})
+        self.assertEqual(out2, "---\na: 2\nb: 3\n---\n")
+
+    def test_replacing_the_alias_side_is_fine(self):
+        out, _ = upsert_frontmatter("---\na: &x 1\nsteps: *x\n---\n", {"steps": 9})
+        self.assertEqual(out, "---\na: &x 1\nsteps: 9\n---\n")
+
+    def test_kept_entry_with_anchor_is_not_touched(self):
+        text = "---\nsteps: &s 100\nalias: *s\n---\n"
+        out, changes = upsert_frontmatter(text, {"steps": 1}, fill_only_empty=True)
+        self.assertEqual(out, text)
+        self.assertEqual(changes[0].action, "kept")
+
+
+# ---------------------------------------------------------------------------
+# 既存の literal block scalar との比較 (unchanged 判定 = 書き込まない判定)
+# ---------------------------------------------------------------------------
+
+class TestBlockScalarComparison(unittest.TestCase):
+    """期待値は YAML (PyYAML / Obsidian の yaml) が返す値との一致で決めている.
+
+    ``unchanged`` を誤判定すると古い値が黙って残るので、chomping・明示インデント・
+    ブロック内の '#' 行などを個別に固定する.
+    """
+
+    CASES = (
+        # (frontmatter 本体, 新しい値, 期待 action)
+        ("G: |-\n  a\n  b\nx: 1\n", "a\nb", "unchanged"),          # strip
+        ("G: |-\n  a\n  b\nx: 1\n", "a\nc", "update"),
+        ("G: |2-\n    a\n  b\nx: 1\n", "  a\nb", "unchanged"),     # 明示インデント
+        ("G: |2-\n    a\n  b\nx: 1\n", "a\nb", "update"),
+        ("G: |\n  a\n  b\nx: 1\n", "a\nb\n", "unchanged"),         # clip = 末尾改行 1 つ
+        ("G: |\n  a\n  b\nx: 1\n", "a\nb", "update"),
+        ("G: |+\n  a\n\n\n", "a\n\n\n", "unchanged"),              # keep = 末尾の空行も値
+        ("G: |+\n  a\n\n\n", "a\n", "update"),
+        ("G: |+\n  a\n\nx: 1\n", "a\n\n", "unchanged"),
+        ("G: >\n  a\n  b\nx: 1\n", "a\nb", "update"),              # folded は 'a b\n'
+        ("G: >-\n  a\n  b\nx: 1\n", "a\nb", "update"),             # folded は 'a b' (literal と誤読しない)
+        ("G: |-\n  # h\n  t\nx: 1\n", "# h\nt", "unchanged"),       # ブロック内の '#' は値
+        ("G: |-\n  a\n    # h\nx: 1\n", "a\n  # h", "unchanged"),
+        ("G: |-\n  a\n\n  b\nx: 1\n", "a\n\nb", "unchanged"),       # 内部の空行
+        ("G: |- # memo\n  a\nx: 1\n", "a", "unchanged"),            # header のコメント
+        ("G: !!str |-\n  a\nx: 1\n", "a", "update"),               # tag 付きは比較しない (安全側)
+        ("G: |-\r\n  a\r\n  b\r\nx: 1\r\n", "a\nb", "unchanged"),  # CRLF
+    )
+
+    def test_cases(self):
+        for body, new, expected in self.CASES:
+            nl = "\r\n" if "\r\n" in body else "\n"
+            text = f"---{nl}{body}---{nl}"
+            out, changes = upsert_frontmatter(text, {"G": new})
+            self.assertEqual(changes[0].action, expected, (body, new))
+            if expected == "unchanged":
+                self.assertEqual(out, text, (body, new))
+            else:
+                self.assertNotEqual(out, text, (body, new))
+                self.assertIn(f"G: {render_scalar(new)}{nl}", out)
+
+    def test_escaped_surrogate_pair_key_matches_real_emoji_key(self):
+        # JSON / JavaScript と同じくサロゲートペアの escape は 1 文字に結合する (重複追記しない)
+        text = '---\n"\\ud83d\\ude00": 1\n---\n'
+        out, changes = upsert_frontmatter(text, {"😀": 2})
+        self.assertEqual(out, '---\n"\\ud83d\\ude00": 2\n---\n')
+        self.assertEqual(changes[0].action, "update")
 
 
 if __name__ == "__main__":

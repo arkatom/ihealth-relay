@@ -854,5 +854,214 @@ class TestPublisherReexports(unittest.TestCase):
         self.assertIs(workflow.NotionAppError, NotionAppError)
 
 
+class TestObsidianWorkflow(unittest.TestCase):
+    """obsidian publisher の組み立て / エラー変換 (SPEC §2-E / v2 §4.1 / §4.5)."""
+
+    def setUp(self):
+        from unittest.mock import patch
+        self._tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self._tmp.name)
+        self.health_dir = self.root / "AutoSync"
+        self.health_dir.mkdir()
+        self.archive_root = self.root / "data" / "health"
+        self.archive_root.mkdir(parents=True)
+        self.vault = self.root / "vault"
+        (self.vault / "日記").mkdir(parents=True)
+        self.target_date = date(2030, 1, 2)
+        self.log = logging.getLogger("test-obsidian-workflow")
+        self._patcher = patch(
+            "ihealth.config_file.find_config_path",
+            side_effect=lambda root: (
+                self.root / "config.toml" if (self.root / "config.toml").is_file() else None
+            ),
+        )
+        self._patcher.start()
+
+    def tearDown(self):
+        self._patcher.stop()
+        self._tmp.cleanup()
+
+    def _config(self, **kwargs) -> Config:
+        values = dict(
+            notion_secret=None,
+            database_id=None,
+            health_export_dir=self.health_dir,
+            archive_root=self.archive_root,
+            birth_date=date(1990, 1, 1),
+            obsidian_vault_dir=self.vault,
+        )
+        values.update(kwargs)
+        return Config(**values)
+
+    def test_error_exit_codes(self):
+        from ihealth.errors import DiaryPartialFailureError, ObsidianAppError
+        self.assertEqual(ObsidianAppError("x").exit_code, 11)
+        self.assertEqual(DiaryPartialFailureError("x").exit_code, 12)
+
+    def test_build_obsidian_publisher(self):
+        from ihealth.publishers.obsidian import ObsidianPublisher
+        from ihealth.workflow import build_obsidian_publisher
+        tpl = Path("テンプレート/毎日の習慣.md")
+        publisher = build_obsidian_publisher(
+            self._config(obsidian_template=tpl), logger=self.log,
+        )
+        self.assertIsInstance(publisher, ObsidianPublisher)
+        self.assertEqual(publisher.diary_root, self.vault / "日記")
+        self.assertEqual(publisher._template_path, self.vault / tpl)
+        self.assertEqual(publisher._create_missing, "template")
+        self.assertEqual(publisher._backup_dir, self.root / "data" / "obsidian-backup")
+        self.assertEqual(publisher._tz, self._config().diary_tz)
+
+    def test_build_obsidian_publisher_passes_non_default_settings(self):
+        # 既定値と違う値で配線を確かめる (既定値どうしの比較だとハードコードでも通る)
+        from datetime import timedelta, timezone
+        from ihealth.workflow import build_obsidian_publisher
+        tz = timezone(timedelta(hours=-5))
+        publisher = build_obsidian_publisher(
+            self._config(
+                obsidian_create_min_age_days=0, obsidian_create_missing="minimal", diary_tz=tz,
+            ),
+            logger=self.log,
+        )
+        self.assertEqual(publisher._create_min_age_days, 0)
+        self.assertEqual(publisher._create_missing, "minimal")
+        self.assertEqual(publisher._tz, tz)
+
+    def test_non_utf8_config_toml_is_config_error_exit_3(self):
+        # Shift_JIS で保存した config.toml は「想定外エラー (exit 1)」ではなく設定不備 (exit 3)
+        from ihealth.errors import ConfigAppError
+        from ihealth.workflow import build_default_deps, build_obsidian_publisher
+        (self.root / "config.toml").write_bytes(
+            '[publishers.obsidian.fields.github]\nproperty = "活動"\n'.encode("shift_jis"),
+        )
+        with self.assertRaises(ConfigAppError) as ctx:
+            build_obsidian_publisher(self._config(), logger=self.log)
+        self.assertEqual(ctx.exception.exit_code, 3)
+        self.assertIn("config.toml が不正です", ctx.exception.title)
+        for kind in ("markdown", "stdout", "dryrun"):
+            with self.subTest(publisher_kind=kind):
+                with self.assertRaises(ConfigAppError) as ctx:
+                    build_default_deps(
+                        self._config(markdown_output_dir=self.root / "md"),
+                        dry_run=False, target_date=self.target_date, logger=self.log,
+                        publisher_kind=kind,
+                    )
+                self.assertEqual(ctx.exception.exit_code, 3)
+
+    def test_broken_obsidian_section_stops_every_publisher(self):
+        # config.example.toml の約束: 壊れた config.toml は「どの publisher でも」exit 3。
+        # [publishers.obsidian] 節だけが壊れていても notion 以外の単日 sink で止まる
+        from ihealth.errors import ConfigAppError
+        from ihealth.workflow import build_default_deps
+        cases = {
+            "unknown field": '[publishers.obsidian.fields.stepcount]\nproperty = "x"\n',
+            "collision": '[publishers.obsidian.fields.step_count]\nproperty = "天気"\n',
+            "empty key": '[publishers.obsidian.fields.github]\nproperty = ""\n',
+            "date_property collision": '[publishers.obsidian]\ndate_property = "Github"\n',
+        }
+        for label, text in cases.items():
+            (self.root / "config.toml").write_text(text, encoding="utf-8")
+            for kind in ("markdown", "stdout", "dryrun"):
+                with self.subTest(case=label, publisher_kind=kind):
+                    with self.assertRaises(ConfigAppError) as ctx:
+                        build_default_deps(
+                            self._config(markdown_output_dir=self.root / "md"),
+                            dry_run=False, target_date=self.target_date, logger=self.log,
+                            publisher_kind=kind,
+                        )
+                    self.assertEqual(ctx.exception.exit_code, 3)
+
+    def test_valid_obsidian_section_does_not_disturb_other_publishers(self):
+        from ihealth.publishers.stdout import StdoutPublisher
+        from ihealth.workflow import build_default_deps
+        (self.root / "config.toml").write_text(
+            '[publishers.obsidian]\ndate_property = "日付"\n'
+            '[publishers.obsidian.fields.github]\nproperty = "GitHub"\n',
+            encoding="utf-8",
+        )
+        deps = build_default_deps(
+            self._config(), dry_run=False, target_date=self.target_date, logger=self.log,
+            publisher_kind="stdout",
+        )
+        self.assertIsInstance(deps.publisher, StdoutPublisher)
+
+    def test_build_default_deps_obsidian_keeps_own_dry_run(self):
+        from ihealth.publishers.obsidian import ObsidianPublisher
+        from ihealth.workflow import build_default_deps
+        deps = build_default_deps(
+            self._config(), dry_run=True, target_date=self.target_date, logger=self.log,
+            publisher_kind="obsidian",
+        )
+        self.assertIsInstance(deps.publisher, ObsidianPublisher)
+        self.assertTrue(deps.publisher._dry_run)
+
+    def test_missing_vault_setting_is_config_error(self):
+        from ihealth.errors import ConfigAppError
+        from ihealth.workflow import build_obsidian_publisher
+        with self.assertRaises(ConfigAppError) as ctx:
+            build_obsidian_publisher(self._config(obsidian_vault_dir=None), logger=self.log)
+        self.assertEqual(ctx.exception.exit_code, 3)
+        self.assertIn("OBSIDIAN_VAULT_DIR", ctx.exception.user_message)
+
+    def test_missing_diary_dir_is_config_error(self):
+        from ihealth.errors import ConfigAppError
+        from ihealth.workflow import build_obsidian_publisher
+        with self.assertRaises(ConfigAppError):
+            build_obsidian_publisher(
+                self._config(obsidian_diary_dir="Journal"), logger=self.log,
+            )
+
+    def test_overrides_from_config_toml(self):
+        from ihealth.workflow import build_obsidian_publisher
+        (self.root / "config.toml").write_text(
+            '[publishers.obsidian]\ndate_property = "Date"\n'
+            '[publishers.obsidian.fields.github]\nproperty = "GitHub"\n',
+            encoding="utf-8",
+        )
+        publisher = build_obsidian_publisher(self._config(), logger=self.log)
+        self.assertEqual(publisher.property_map["github"], "GitHub")
+        self.assertEqual(publisher._date_property, "Date")
+
+    def test_override_collisions_are_config_errors(self):
+        from ihealth.errors import ConfigAppError
+        from ihealth.workflow import build_obsidian_publisher
+        cases = [
+            '[publishers.obsidian.fields.step_count]\nproperty = "天気"\n',
+            '[publishers.obsidian]\ndate_property = "Github"\n',
+            '[publishers.obsidian.fields.stepcount]\nproperty = "x"\n',
+            '[publishers.notion.fields.bogus]\nproperty = "x"\n',
+            "broken === toml\n",
+        ]
+        for text in cases:
+            with self.subTest(text=text):
+                (self.root / "config.toml").write_text(text, encoding="utf-8")
+                with self.assertRaises(ConfigAppError):
+                    build_obsidian_publisher(self._config(), logger=self.log)
+
+    def test_run_pipeline_wraps_obsidian_publish_error(self):
+        from ihealth.errors import ObsidianAppError
+        from ihealth.publishers.obsidian import ObsidianPublishError
+
+        class _RaisingObsidianPublisher:
+            def publish(self, health_data):
+                raise ObsidianPublishError("frontmatter を安全に解釈できない")
+
+        fetch_result = FetchResult(
+            target_date=self.target_date,
+            archive_dir=self.archive_root / self.target_date.isoformat(),
+            archived={}, missing=[],
+        )
+        deps = PipelineDeps(
+            fetcher=MagicMock(return_value=fetch_result),
+            parser=MagicMock(return_value=DailyHealthData(date=self.target_date, step_count=1)),
+            publisher=_RaisingObsidianPublisher(),
+            sleep_payload_builder=MagicMock(return_value={}),
+        )
+        with self.assertRaises(ObsidianAppError) as ctx:
+            run_pipeline(self._config(), self.target_date, deps, self.log)
+        self.assertEqual(ctx.exception.exit_code, 11)
+        self.assertIn("2030-01-02", ctx.exception.title)
+
+
 if __name__ == "__main__":
     unittest.main()
