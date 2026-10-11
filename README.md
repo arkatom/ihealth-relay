@@ -140,6 +140,10 @@ See [`docs/architecture.md`](docs/architecture.md) for module-level details.
    ```bash
    ./bin/install-launchd.sh   # installs LaunchAgent/com.ihealthrelay.daemon.plist
    ```
+   Then grant **Full Disk Access to `/bin/bash`** (otherwise scheduled runs
+   cannot read the Health Auto Export iCloud folder) and allow the dialog
+   that lets bash control **Reminders** — see
+   [Schedule (launchd)](#schedule-launchd).
 
 See [`docs/setup.md`](docs/setup.md) for detailed instructions, including
 the Obsidian vault, Notion DB schema setup and per-sink configuration.
@@ -267,7 +271,8 @@ Github: "[🔀 my-app:PR #12: Add login form](https://github.com/your-name/my-ap
    ./bin/ihealth-run --publisher obsidian --dry-run   # logs "[dry-run] <note>: <key>: old -> new"
    ./bin/ihealth-run --publisher obsidian
    ```
-5. **Schedule**: `./bin/install-launchd.sh` (see [Schedule](#schedule-launchd)).
+5. **Schedule**: `./bin/install-launchd.sh`, then grant Full Disk Access to
+   `/bin/bash` and allow the Reminders dialog (see [Schedule](#schedule-launchd)).
 
 #### `.env` keys for Obsidian
 
@@ -343,6 +348,28 @@ the installer after changing `IHEALTH_PUBLISHER`;
 without changing anything.
 Runs missed while the Mac was asleep are run once after wake; the tool then
 waits up to `IHEALTH_NETWORK_GRACE_SEC` seconds for Wi-Fi.
+
+After installing, give the scheduled run its macOS permissions (once):
+
+- **Full Disk Access for `/bin/bash`**: launchd starts `bin/ihealth-run`, a
+  bash script, so macOS privacy protection (TCC) attributes the run's file
+  access to `/bin/bash`. Without the grant, reading the Health Auto Export
+  iCloud folder
+  (`~/Library/Mobile Documents/iCloud~com~ifunography~HealthExport/Documents`)
+  fails with `[Errno 1] Operation not permitted`: the health source fails
+  (exit 12) while weather and GitHub still work. macOS shows no dialog for
+  `/bin/bash`, so add it yourself: System Settings › Privacy & Security ›
+  Full Disk Access › "+", press Cmd+Shift+G, enter `/bin/bash`, add it and
+  turn it on. This also covers a vault in `~/Documents` or `~/Desktop`. The
+  grant applies to every bash script launchd starts for your user.
+- **Reminders**: the first time a scheduled run creates a reminder, macOS
+  asks whether bash may control Reminders. Allow it (or later under System
+  Settings › Privacy & Security › Automation › bash › Reminders); until
+  then the reminder times out, is kept as undelivered and is retried on the
+  next run.
+
+Then test the job with `launchctl kickstart -k gui/$(id -u)/com.ihealthrelay.daemon`
+and check `logs/run.log`.
 
 - Application log: `logs/run.log` (daily rotation, 30 days).
 - launchd stdout/stderr: `~/Library/Logs/ihealth-relay/launchd.log` — start-up
