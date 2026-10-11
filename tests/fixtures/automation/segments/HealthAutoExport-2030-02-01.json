@@ -1,0 +1,23 @@
+{
+  "data": {
+    "metrics": [
+      {
+        "name": "step_count",
+        "units": "count",
+        "data": [
+          {"date": "2030-02-01 12:00:00 +0900", "qty": 1000, "source": "Sample Phone"}
+        ]
+      },
+      {
+        "name": "sleep_analysis",
+        "units": "hr",
+        "data": [
+          {"startDate": "2030-02-01 13:00:00 +0900", "endDate": "2030-02-01 13:40:00 +0900", "value": "Core", "qty": 0.6666666666666666, "source": "Sample Watch"},
+          {"startDate": "2030-02-01 22:30:00 +0900", "endDate": "2030-02-01 23:30:00 +0900", "value": "Core", "qty": 1.0, "source": "Sample Watch"},
+          {"startDate": "2030-02-01 23:30:00 +0900", "endDate": "2030-02-01 23:45:00 +0900", "value": "Awake", "qty": 0.25, "source": "Sample Watch"},
+          {"startDate": "2030-02-01 23:45:00 +0900", "endDate": "2030-02-02 00:30:00 +0900", "value": "Deep", "qty": 0.75, "source": "Sample Watch"}
+        ]
+      }
+    ]
+  }
+}

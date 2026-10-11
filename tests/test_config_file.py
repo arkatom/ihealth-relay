@@ -56,6 +56,19 @@ class TestLoadConfigToml(unittest.TestCase):
             "歩数 (歩)",
         )
 
+    def test_non_utf8_file_is_config_file_error(self):
+        # Shift_JIS で保存した config.toml (UnicodeDecodeError = ValueError 系) も
+        # 設定ファイルの不備として ConfigFileError にする (上位で exit 3 になる)
+        with tempfile.TemporaryDirectory() as tmp:
+            p = Path(tmp) / "config.toml"
+            p.write_bytes(
+                '[publishers.notion.fields.step_count]\nproperty = "歩数 (歩)"\n'.encode("shift_jis"),
+            )
+            with self.assertRaises(ConfigFileError) as ctx:
+                load_config_toml(p)
+        self.assertIn("UTF-8", str(ctx.exception))
+        self.assertIsInstance(ctx.exception.__cause__, UnicodeDecodeError)
+
 
 class TestExtractNotionPropertyOverrides(unittest.TestCase):
     def test_extracts_simple_map(self):
@@ -222,6 +235,76 @@ class TestExtractNotionDateProperty(unittest.TestCase):
         config = {"publishers": {"notion": "oops"}}
         with self.assertRaises(ConfigFileError):
             extract_notion_date_property(config)
+
+
+class TestObsidianOverrides(unittest.TestCase):
+    """``[publishers.obsidian]`` の frontmatter キー override (SPEC §2-E / v2 §4.5)."""
+
+    def test_extracts_obsidian_fields_only(self):
+        from ihealth.config_file import extract_obsidian_property_overrides
+        config = {
+            "publishers": {
+                "notion": {"fields": {"step_count": {"property": "Steps (notion)"}}},
+                "obsidian": {"fields": {
+                    "step_count": {"property": "Steps"},
+                    "github": {"property": "GitHub"},
+                }},
+            }
+        }
+        self.assertEqual(
+            extract_obsidian_property_overrides(config),
+            {"step_count": "Steps", "github": "GitHub"},
+        )
+        self.assertEqual(
+            extract_notion_property_overrides(config), {"step_count": "Steps (notion)"},
+        )
+
+    def test_strict_unknown_field_mentions_obsidian_section(self):
+        from ihealth.config_file import extract_obsidian_property_overrides
+        config = {"publishers": {"obsidian": {"fields": {"weathr": {"property": "x"}}}}}
+        with self.assertRaises(ConfigFileError) as ctx:
+            extract_obsidian_property_overrides(
+                config, valid_field_names=frozenset({"weather"}),
+            )
+        self.assertIn("weathr", str(ctx.exception))
+
+    def test_entry_errors_name_the_obsidian_section(self):
+        from ihealth.config_file import extract_obsidian_property_overrides
+        for entry, fragment in (
+            ("oops", "publishers.obsidian.fields.github"),
+            ({"property": 1}, "文字列"),
+            ({"property": ""}, "空文字列"),
+        ):
+            with self.subTest(entry=entry):
+                config = {"publishers": {"obsidian": {"fields": {"github": entry}}}}
+                with self.assertRaises(ConfigFileError) as ctx:
+                    extract_obsidian_property_overrides(config)
+                self.assertIn(fragment, str(ctx.exception))
+
+    def test_obsidian_date_property(self):
+        from ihealth.config_file import extract_obsidian_date_property
+        self.assertIsNone(extract_obsidian_date_property({}))
+        self.assertEqual(
+            extract_obsidian_date_property({"publishers": {"obsidian": {"date_property": "Date"}}}),
+            "Date",
+        )
+        with self.assertRaises(ConfigFileError):
+            extract_obsidian_date_property({"publishers": {"obsidian": {"date_property": " "}}})
+
+    def test_collision_check(self):
+        from ihealth.config_file import check_property_collisions
+        defaults = {"a": "A", "b": "B", "c": "C"}
+        check_property_collisions(defaults, {"a": "X"}, publisher="obsidian")
+        check_property_collisions(defaults, {"a": "B", "b": "A"}, publisher="obsidian")  # 入れ替えは可
+        with self.assertRaises(ConfigFileError) as ctx:
+            check_property_collisions(defaults, {"c": "A"}, publisher="obsidian")
+        self.assertIn("'A'", str(ctx.exception))
+        self.assertIn("a と c", str(ctx.exception))
+        with self.assertRaises(ConfigFileError) as ctx:
+            check_property_collisions(
+                defaults, {}, publisher="obsidian", reserved={"B": "date_property"},
+            )
+        self.assertIn("date_property", str(ctx.exception))
 
 
 if __name__ == "__main__":

@@ -21,6 +21,11 @@ config.toml
 data/health/*
 data/health/*/
 !data/health/.gitkeep
+# Obsidian publisher の書込前バックアップ (日記本文 = 個人データ)
+data/obsidian-backup/
+# Obsidian 日記の暫定値の台帳 (日付と健康値 = 個人データ) と書込中の一時ファイル
+data/diary-state.json
+data/.diary-state.json.*
 
 # 内部実装計画 (個人開発フェーズの歴史記録、OSS 利用者には価値なし)
 docs/plans/

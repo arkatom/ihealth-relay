@@ -3,9 +3,12 @@
 # 手動検証 / cron 運用時のエントリポイントを 1 つに統一する。
 #
 # 使い方:
-#   ./bin/ihealth-run                        # 昨日分を処理
+#   ./bin/ihealth-run                        # 昨日分を処理 (IHEALTH_PUBLISHER=obsidian なら
+#                                            #   昨日から lookback 日分 + 今日の暫定値)
 #   ./bin/ihealth-run --date 2026-04-22      # 指定日
-#   ./bin/ihealth-run --dry-run --verbose    # 実送信せず properties ログ出力
+#   ./bin/ihealth-run --dry-run --verbose    # 実送信せず properties ログ出力 (obsidian は差分表示)
+#   ./bin/ihealth-run --publisher obsidian --from 2026-07-22 --to 2026-10-10 --fill-empty-only
+#                                            # 日記の過去分 backfill (既存の値は上書きしない)
 #
 # 終了コードは `python3 -m ihealth` と同一 (__main__.py のドキュメント参照)。
 set -euo pipefail

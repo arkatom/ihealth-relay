@@ -111,3 +111,28 @@ class SlackAppError(AppError):
     """
 
     exit_code = 10
+
+
+class ObsidianAppError(AppError):
+    """Obsidian 日記への書き込み失敗 / 全 source の取得失敗 (致命)。``exit_code=11``。
+
+    - 日記ノートの書き込み I/O 失敗・frontmatter が壊れていて安全に書けない・
+      並行編集が続いて書き込みを見送った (``ObsidianPublishError``)
+    - 対象の全日付で選択した全 source が失敗した (書けるものが何も無い)
+
+    vault / 日記ディレクトリ不在・property 衝突などの設定不備は本エラーではなく
+    :class:`ConfigAppError` (``exit_code=3``) として扱う。
+    """
+
+    exit_code = 11
+
+
+class DiaryPartialFailureError(AppError):
+    """日記パイプラインの部分失敗。``exit_code=12``。
+
+    一部の source / 日付で取得に失敗した (取れた分は書き込み済み)。
+    失敗した source のキーは書かず既存値を保持している。``nodata``
+    (HAE 未出力・気象庁の公開待ちなど想定内の遅延) は失敗に含めない。
+    """
+
+    exit_code = 12

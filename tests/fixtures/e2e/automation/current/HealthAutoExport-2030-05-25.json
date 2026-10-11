@@ -1,0 +1,57 @@
+{
+  "data": {
+    "metrics": [
+      {
+        "name": "step_count",
+        "units": "count",
+        "data": [
+          {"date": "2030-05-25 08:00:00 +0900", "qty": 4000, "source": "Sample Phone"},
+          {"date": "2030-05-25 17:00:00 +0900", "qty": 2321, "source": "Sample Phone"}
+        ]
+      },
+      {
+        "name": "walking_running_distance",
+        "units": "km",
+        "data": [
+          {"date": "2030-05-25 08:00:00 +0900", "qty": 2.9, "source": "Sample Phone"},
+          {"date": "2030-05-25 17:00:00 +0900", "qty": 1.6, "source": "Sample Phone"}
+        ]
+      },
+      {
+        "name": "active_energy",
+        "units": "kcal",
+        "data": [
+          {"date": "2030-05-25 08:00:00 +0900", "qty": 200.0, "source": "Sample Watch"},
+          {"date": "2030-05-25 17:00:00 +0900", "qty": 123.4, "source": "Sample Watch"}
+        ]
+      },
+      {
+        "name": "heart_rate",
+        "units": "count/min",
+        "data": [
+          {"date": "2030-05-25 08:00:00 +0900", "Avg": 95, "Min": 90, "Max": 101, "source": "Sample Watch"},
+          {"date": "2030-05-25 17:00:00 +0900", "Avg": 70, "Min": 65, "Max": 78, "source": "Sample Watch"}
+        ]
+      },
+      {
+        "name": "resting_heart_rate",
+        "units": "count/min",
+        "data": [
+          {"date": "2030-05-25 06:30:00 +0900", "qty": 62, "source": "Sample Watch"}
+        ]
+      },
+      {
+        "name": "weight_body_mass",
+        "units": "kg",
+        "data": []
+      },
+      {
+        "name": "body_fat_percentage",
+        "units": "%",
+        "data": [
+          {"date": "2030-05-25 07:00:00 +0900", "qty": 20.4, "source": "Sample Scale"}
+        ]
+      }
+    ]
+  }
+}

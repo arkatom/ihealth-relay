@@ -13,7 +13,9 @@ launchd で毎朝自動実行される前提なので、失敗に **永続的** 
 - **通知失敗で本体処理の終了コードが変わらない**: 通知はあくまで「副作用」で、
   本体の success/fail 判定を通知手段の有無に依存させない。
   例外 (osascript 不在 / AppleScript エラー / タイムアウト) はすべて握り潰して
-  error ログだけ残す。
+  error ログだけ残し、戻り値 ``False`` で「リマインダーを作れなかった」ことだけを
+  返す (同じ通知を 1 日 1 回に抑える呼び出し側が、作れなかった通知を「通知済み」と
+  記録しないため。戻り値を見ない既存の呼び出しはそのまま動く)。
 - **AppleScript インジェクション対策**: リマインダー本文はユーザー由来の値
   (Notion エラー本文、ファイルパス等) を含むので、バックスラッシュ /
   ダブルクオート / 改行を正しくエスケープする。
@@ -64,15 +66,17 @@ def _build_applescript(title: str, body: str) -> str:
     )
 
 
-def notify_failure(title: str, body: str) -> None:
-    """Reminders.app にリマインダーを追加する。
+def notify_failure(title: str, body: str) -> bool:
+    """Reminders.app にリマインダーを追加する。作れたら ``True``。
 
     失敗しても例外を投げない (通知手段の失敗で本体処理の終了コードが変わらない設計)。
-    Linux / SSH セッション / osascript 非存在環境では warning ログを残してスキップ。
+    Linux / SSH セッション / osascript 非存在環境では warning ログを残してスキップ
+    (``False``)。タイムアウト / AppleScript エラー (Reminders を操作する権限が無い等) /
+    OS エラーも ``False``。
     """
     if not os.path.exists(_OSASCRIPT):
         _logger.warning("osascript が見つからないため通知スキップ: %s", title)
-        return
+        return False
 
     script = _build_applescript(title, body)
     try:
@@ -84,6 +88,7 @@ def notify_failure(title: str, body: str) -> None:
         )
     except subprocess.TimeoutExpired:
         _logger.error("Reminders 通知がタイムアウト: %s", title)
+        return False
     except subprocess.CalledProcessError as exc:
         # stderr にエラー詳細が入る (通常は小さい)。個人情報のリスクは低いが DEBUG に留める
         _logger.error("Reminders 通知失敗 (rc=%d): %s", exc.returncode, title)
@@ -93,6 +98,9 @@ def notify_failure(title: str, body: str) -> None:
             except (AttributeError, UnicodeDecodeError):
                 stderr_text = repr(exc.stderr)
             _logger.debug("osascript stderr: %s", stderr_text)
+        return False
     except OSError as exc:
         # osascript のファイル自体はあるが実行不可などのケース
         _logger.error("Reminders 通知で OS エラー: %s", exc)
+        return False
+    return True

@@ -1,0 +1,105 @@
+{
+  "data": {
+    "metrics": [
+      {
+        "name": "step_count",
+        "units": "count",
+        "data": [
+          {"date": "2030-05-20 08:00:00 +0900", "qty": 2100, "source": "Sample Watch"},
+          {"date": "2030-05-20 13:00:00 +0900", "qty": 3400, "source": "Sample Watch|Sample Phone"},
+          {"date": "2030-05-20 20:30:00 +0900", "qty": 500, "source": "Sample Phone"}
+        ]
+      },
+      {
+        "name": "walking_running_distance",
+        "units": "km",
+        "data": [
+          {"date": "2030-05-20 08:00:00 +0900", "qty": 1.5, "source": "Sample Watch"},
+          {"date": "2030-05-20 13:00:00 +0900", "qty": 2.5, "source": "Sample Watch|Sample Phone"},
+          {"date": "2030-05-20 20:30:00 +0900", "qty": 0.4, "source": "Sample Phone"}
+        ]
+      },
+      {
+        "name": "active_energy",
+        "units": "kcal",
+        "data": [
+          {"date": "2030-05-20 08:00:00 +0900", "qty": 150.0, "source": "Sample Watch"},
+          {"date": "2030-05-20 13:00:00 +0900", "qty": 210.5, "source": "Sample Watch"},
+          {"date": "2030-05-20 20:30:00 +0900", "qty": 40.0, "source": "Sample Watch"}
+        ]
+      },
+      {
+        "name": "apple_exercise_time",
+        "units": "min",
+        "data": [
+          {"date": "2030-05-20 08:00:00 +0900", "qty": 15, "source": "Sample Watch"}
+        ]
+      },
+      {
+        "name": "heart_rate",
+        "units": "count/min",
+        "data": [
+          {"date": "2030-05-20 08:00:00 +0900", "Avg": 110, "Min": 100, "Max": 125, "source": "Sample Watch"},
+          {"date": "2030-05-20 13:00:00 +0900", "Avg": 75, "Min": 70, "Max": 80, "source": "Sample Watch"}
+        ]
+      },
+      {
+        "name": "resting_heart_rate",
+        "units": "count/min",
+        "data": [
+          {"date": "2030-05-20 06:00:00 +0900", "qty": 61, "source": "Sample Watch"}
+        ]
+      },
+      {
+        "name": "blood_oxygen_saturation",
+        "units": "%",
+        "data": [
+          {"date": "2030-05-20 03:00:00 +0900", "qty": 95, "source": "Sample Watch"},
+          {"date": "2030-05-20 05:00:00 +0900", "qty": 97, "source": "Sample Watch"}
+        ]
+      },
+      {
+        "name": "sleep_analysis",
+        "units": "hr",
+        "data": [
+          {
+            "date": "2030-05-20 00:00:00 +0900",
+            "totalSleep": 6.5,
+            "asleep": 0,
+            "core": 4.0,
+            "deep": 1.0,
+            "rem": 1.5,
+            "awake": 0.3,
+            "inBed": 0,
+            "sleepStart": "2030-05-19 23:50:00 +0900",
+            "sleepEnd": "2030-05-20 06:20:00 +0900",
+            "inBedStart": "2030-05-19 23:50:00 +0900",
+            "inBedEnd": "2030-05-20 06:20:00 +0900",
+            "source": "Sample Watch"
+          }
+        ]
+      },
+      {
+        "name": "mindful_minutes",
+        "units": "min",
+        "data": [
+          {"date": "2030-05-20 07:00:00 +0900", "qty": 5.0, "source": "Sample Mindfulness"}
+        ]
+      },
+      {
+        "name": "weight_body_mass",
+        "units": "kg",
+        "data": [
+          {"date": "2030-05-20 07:15:00 +0900", "qty": 64.8, "source": "Sample Scale"}
+        ]
+      },
+      {
+        "name": "body_fat_percentage",
+        "units": "%",
+        "data": [
+          {"date": "2030-05-20 07:15:00 +0900", "qty": 19.2, "source": "Sample Scale"}
+        ]
+      }
+    ]
+  }
+}

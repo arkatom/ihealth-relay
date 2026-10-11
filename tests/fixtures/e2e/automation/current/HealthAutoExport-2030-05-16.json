@@ -1,0 +1,42 @@
+{
+  "data": {
+    "metrics": [
+      {
+        "name": "step_count",
+        "units": "count",
+        "data": [
+          {"date": "2030-05-15 23:59:00 +0900", "qty": 33, "source": "Sample Watch"},
+          {"date": "2030-05-16 00:05:00 +0900", "qty": 41, "source": "Sample Watch"}
+        ]
+      },
+      {
+        "name": "heart_rate",
+        "units": "count/min",
+        "data": [
+          {"date": "2030-05-16 00:05:00 +0900", "Avg": 66, "Min": 64, "Max": 69, "source": "Sample Watch"}
+        ]
+      },
+      {
+        "name": "sleep_analysis",
+        "units": "hr",
+        "data": [
+          {
+            "date": "2030-05-16 00:00:00 +0900",
+            "totalSleep": 0.1,
+            "asleep": 0,
+            "core": 0.1,
+            "deep": 0,
+            "rem": 0,
+            "awake": 0,
+            "inBed": 0,
+            "sleepStart": "2030-05-15 23:58:00 +0900",
+            "sleepEnd": "2030-05-16 00:04:00 +0900",
+            "inBedStart": "2030-05-15 23:58:00 +0900",
+            "inBedEnd": "2030-05-16 00:04:00 +0900",
+            "source": "Sample Watch"
+          }
+        ]
+      }
+    ]
+  }
+}

@@ -6,6 +6,8 @@
 * AppleScript リテラル内で ダブルクオート / バックスラッシュ / 改行を正しくエスケープ
 * osascript 不在 (非 macOS) でも例外を投げない
 * subprocess の失敗 (TimeoutExpired / CalledProcessError / OSError) を握り潰す
+* リマインダーを作れたら ``True``、作れなかったら ``False`` を返す (呼び出し側が
+  作れなかった通知を「通知済み」と記録しないため)
 
 を検証する。個別ヘルパー (_escape_applescript_string / _build_applescript) も単体で
 エッジケースをカバーする。
@@ -83,7 +85,8 @@ class TestNotifyFailureSuccess(unittest.TestCase):
             mock_run.return_value = subprocess.CompletedProcess(
                 args=[], returncode=0, stdout=b"", stderr=b"",
             )
-            notify_failure("タイトル", "本文")
+            delivered = notify_failure("タイトル", "本文")
+        self.assertIs(delivered, True)
         cmd = mock_run.call_args[0][0]
         self.assertEqual(cmd[0], "/usr/bin/osascript")
         self.assertEqual(cmd[1], "-e")
@@ -128,7 +131,7 @@ class TestNotifyFailureGracefulErrors(unittest.TestCase):
         # subprocess.run が呼ばれていれば検知できる)。
         with patch("ihealth.notifier.os.path.exists", return_value=False), \
              patch("ihealth.notifier.subprocess.run") as mock_run:
-            notify_failure("t", "b")
+            self.assertIs(notify_failure("t", "b"), False)
             self.assertEqual(
                 mock_run.call_count, 0,
                 "osascript 不在時は subprocess.run を呼ばない契約",
@@ -142,8 +145,8 @@ class TestNotifyFailureGracefulErrors(unittest.TestCase):
                 cmd=["/usr/bin/osascript", "-e", "x"],
                 stderr=b"permission denied",
             )
-            # 例外が漏れない
-            notify_failure("t", "b")
+            # 例外が漏れず、作れなかったことを返す
+            self.assertIs(notify_failure("t", "b"), False)
 
     def test_timeout_suppressed(self):
         with patch("ihealth.notifier.os.path.exists", return_value=True), \
@@ -151,13 +154,13 @@ class TestNotifyFailureGracefulErrors(unittest.TestCase):
             mock_run.side_effect = subprocess.TimeoutExpired(
                 cmd=["/usr/bin/osascript"], timeout=10,
             )
-            notify_failure("t", "b")
+            self.assertIs(notify_failure("t", "b"), False)
 
     def test_oserror_suppressed(self):
         with patch("ihealth.notifier.os.path.exists", return_value=True), \
              patch("ihealth.notifier.subprocess.run") as mock_run:
             mock_run.side_effect = OSError(13, "Permission denied")
-            notify_failure("t", "b")
+            self.assertIs(notify_failure("t", "b"), False)
 
 
 if __name__ == "__main__":

@@ -23,12 +23,14 @@ from datetime import date, timedelta
 from pathlib import Path
 from typing import Any, Callable
 
+from ihealth.config import PUBLISHER_KINDS as _PUBLISHER_KINDS
 from ihealth.config import Config
 from ihealth.errors import (
     ConfigAppError,
     HealthExportDirError,
     MarkdownAppError,
     NotionAppError,  # noqa: F401 — 互換 re-export 用 (テスト側で workflow から取る)
+    ObsidianAppError,
     SlackAppError,
     SourceAppError,
     SQLiteAppError,
@@ -51,6 +53,12 @@ from ihealth.publishers.notion import (
     NotionPublisher,
     build_properties,  # noqa: F401 — 互換 re-export
 )
+from ihealth.publishers.obsidian import (
+    DEFAULT_PROPERTY_MAP as OBSIDIAN_DEFAULT_PROPERTY_MAP,
+    ObsidianConfigError,
+    ObsidianPublishError,
+    ObsidianPublisher,
+)
 from ihealth.publishers.slack import (
     SlackPublishError,
     SlackPublisher,
@@ -72,7 +80,9 @@ from ihealth.source import (
 )
 
 
-#: ``--publisher`` で受け付ける publisher 種別 (Phase 1 A3-md / stdout / sqlite / slack で拡張).
+#: ``--publisher`` で受け付ける publisher 種別 (Phase 1 A3-md / stdout / sqlite / slack で拡張,
+#: Obsidian 日記対応で ``obsidian`` を追加). 定義元は :data:`ihealth.config.PUBLISHER_KINDS`
+#: (``IHEALTH_PUBLISHER`` の検証と共有するため).
 #:
 #: - ``notion``: Notion API へ書き込み (既定 / 既存運用)
 #: - ``markdown``: Obsidian 互換 Markdown を ``MARKDOWN_OUTPUT_DIR`` に出力
@@ -80,9 +90,15 @@ from ihealth.source import (
 #: - ``sqlite``: ローカル SQLite DB に 1 日 1 行 UPSERT
 #: - ``slack``: Incoming Webhook で日次サマリを Slack に投稿
 #: - ``dryrun``: Notion publisher の組み立て結果をログ出力するだけ (HTTP 不発射)
+#: - ``obsidian``: Obsidian 日記ノートの frontmatter を部分更新 (CLI では
+#:   :mod:`ihealth.diary` の複数日・複数 source パイプラインで使う)
 #:
 #: ``--dry-run`` フラグが指定されたら publisher 選択にかかわらず ``dryrun`` で上書き.
-PUBLISHER_KINDS = ("notion", "markdown", "stdout", "sqlite", "slack", "dryrun")
+#: ただし ``obsidian`` は自前の dry-run (差分ログのみ・無書込) を持つのでそちらを使う.
+PUBLISHER_KINDS = _PUBLISHER_KINDS
+
+#: Obsidian の最小ノート生成時の日付キー (``[publishers.obsidian] date_property`` 未指定時)。
+_OBSIDIAN_DEFAULT_DATE_PROPERTY = "日付"
 
 
 #: sleep_analysis の前日併読で参照する HealthMetrics サブディレクトリ名 (Issue #14)
@@ -182,11 +198,13 @@ def run_pipeline(
         payload_overrides=sleep_overrides,
     )
 
-    populated = sum(
-        1 for key, value in health_data.as_dict().items()
-        if key != "date" and value is not None
+    # 健康フィールド (date を除く 15 個) のうち値があるもの。分母はフィールド定義から数える
+    values = health_data.as_dict()
+    health_fields = [key for key in values if key != "date"]
+    populated = sum(1 for key in health_fields if values[key] is not None)
+    logger.info(
+        "集計完了: target=%s populated=%d/%d", target_date, populated, len(health_fields),
     )
-    logger.info("集計完了: target=%s populated=%d/14", target_date, populated)
     logger.debug("集計値:")
     for key, value in health_data.as_dict().items():
         logger.debug("  %s = %s", key, value)
@@ -242,6 +260,17 @@ def run_pipeline(
                 f"詳細: {exc}"
             ),
         ) from exc
+    except ObsidianPublishError as exc:
+        logger.error("Obsidian 日記への書き込みに失敗しました: %s", exc)
+        raise ObsidianAppError(
+            str(exc),
+            title=f"ihealth-relay: 日記の書き込み失敗 ({target_date})",
+            body=(
+                f"対象日 {target_date} の日記ノートへの書き込みに失敗しました。\n"
+                f"ノートの frontmatter と vault の権限/容量を確認してください。\n"
+                f"詳細: {exc}"
+            ),
+        ) from exc
     return health_data
 
 
@@ -292,13 +321,18 @@ def build_default_deps(
         )
 
     # dry_run フラグは publisher 選択より強い (安全側で no-op にする).
-    effective_kind = "dryrun" if dry_run else publisher_kind
+    # obsidian だけは publisher 自身の dry-run (差分ログのみ・無書込) を使う.
+    effective_kind = "dryrun" if dry_run and publisher_kind != "obsidian" else publisher_kind
 
     # config.toml の Notion property override 読み込み (Phase 1 B1 / Issue #18).
     # Markdown publisher は現状 override 未対応だが、"config.toml が壊れているなら
     # どの publisher でも fail-fast すべき" 原則は保つので呼び出しは publisher
     # 種別に関わらず行う.
     property_overrides, date_property_override = _load_notion_overrides(logger)
+    if effective_kind != "obsidian":
+        # [publishers.obsidian] 節も同じ原則で検証する (結果は使わない)。obsidian は
+        # build_obsidian_publisher が両方の節を読むので二重に読まない
+        _load_obsidian_overrides(logger)
 
     publisher: Publisher
     if effective_kind == "dryrun":
@@ -388,6 +422,12 @@ def build_default_deps(
         publisher = NotionPublisher(
             client=client, target_date=target_date, logger=logger,
             property_overrides=property_overrides,
+        )
+    elif effective_kind == "obsidian":
+        # 単日・健康データだけの経路 (CLI の --publisher obsidian は ihealth.diary の
+        # 複数 source パイプラインを使う. こちらは Publisher プロトコル互換の利用向け).
+        publisher = build_obsidian_publisher(
+            config, logger=logger, dry_run=dry_run, target_date=target_date,
         )
     else:  # pragma: no cover — PUBLISHER_KINDS 検証で到達不能
         raise ConfigAppError(f"内部矛盾: effective_kind={effective_kind!r}")
@@ -499,6 +539,140 @@ def _ensure_no_property_collisions(
                 ),
             )
         seen[prop_name] = field_name
+
+
+def _load_obsidian_overrides(
+    logger: logging.Logger,
+) -> "tuple[dict[str, str], str]":
+    """``config.toml`` から Obsidian の frontmatter キー override + date_property を読む.
+
+    Notion と同じ fail-fast 方針 (不在 → 既定値, 存在して壊れている → ConfigAppError)。
+    既定 + override 統合後に同じ frontmatter キーへ 2 つの内部名が向く場合と、
+    ``date_property`` が書き込み対象キーと衝突する場合も ConfigAppError (SPEC v2 §4.5)。
+
+    Returns:
+        ``(property_overrides, date_property)``。date_property は未指定なら ``"日付"``。
+    """
+    from ihealth import config_file
+    from ihealth._toml import TomlParseError
+    from ihealth.config_file import ConfigFileError
+
+    project_root = Path(__file__).resolve().parent.parent.parent
+    path = config_file.find_config_path(project_root)
+    if path is None:
+        return {}, _OBSIDIAN_DEFAULT_DATE_PROPERTY
+
+    valid_fields = frozenset(OBSIDIAN_DEFAULT_PROPERTY_MAP.keys())
+    try:
+        data = config_file.load_config_toml(path)
+        overrides = config_file.extract_obsidian_property_overrides(
+            data, valid_field_names=valid_fields,
+        )
+        date_property = (
+            config_file.extract_obsidian_date_property(data)
+            or _OBSIDIAN_DEFAULT_DATE_PROPERTY
+        )
+    except (TomlParseError, ConfigFileError) as exc:
+        raise ConfigAppError(
+            f"config.toml の構造エラー: {exc}",
+            title="ihealth-relay: config.toml が不正です",
+            body=(
+                f"config.toml ({path}) を確認してください。\n"
+                f"{type(exc).__name__}: {exc}"
+            ),
+        ) from exc
+    except OSError as exc:
+        raise ConfigAppError(
+            f"config.toml の読み込みに失敗: {exc}",
+            title="ihealth-relay: config.toml にアクセスできません",
+            body=(
+                f"config.toml ({path}) を確認してください "
+                "(権限 / 文字エンコーディング)。\n"
+                f"{type(exc).__name__}: {exc}"
+            ),
+        ) from exc
+
+    try:
+        config_file.check_property_collisions(
+            OBSIDIAN_DEFAULT_PROPERTY_MAP,
+            overrides,
+            publisher="obsidian",
+            reserved={date_property: "date_property (日付キー)"},
+        )
+    except ConfigFileError as exc:
+        raise ConfigAppError(
+            f"Obsidian の frontmatter キーが衝突: {exc}",
+            title="ihealth-relay: config.toml の property 衝突",
+            body=(
+                f"{exc}\n"
+                "同じ frontmatter キーに 2 つの値を書くと片方が消えます。\n"
+                "config.toml の [publishers.obsidian] を編集して衝突を解消してください。"
+            ),
+        ) from exc
+    if overrides:
+        logger.debug("Obsidian frontmatter キー override: %s", overrides)
+    return overrides, date_property
+
+
+def build_obsidian_publisher(
+    config: Config,
+    *,
+    logger: logging.Logger,
+    dry_run: bool = False,
+    fill_only_empty: bool = False,
+    target_date: "date | None" = None,
+    clock: "Callable[[], Any] | None" = None,
+    sleep: "Callable[[float], None] | None" = None,
+) -> ObsidianPublisher:
+    """``.env`` + ``config.toml`` から :class:`ObsidianPublisher` を組み立てる.
+
+    - ``OBSIDIAN_VAULT_DIR`` 未設定 / vault・日記ディレクトリ不在 / キー衝突 /
+      backup 先が vault 配下 → :class:`ConfigAppError` (exit 3)
+    - ``config.toml`` の notion 節も検証する (壊れた設定ファイルはどの publisher でも
+      fail-fast という既存方針)
+    - ノート不在時の作成は ``OBSIDIAN_TEMPLATE`` があればテンプレートから
+      (``OBSIDIAN_CREATE_MISSING`` で明示も可)。書込前バックアップは
+      ``<archive_root の親>/obsidian-backup`` (``data/obsidian-backup``, gitignore 済)
+    """
+    if config.obsidian_vault_dir is None:
+        raise ConfigAppError(
+            "Obsidian publisher の vault が未設定です (OBSIDIAN_VAULT_DIR)",
+            title="ihealth-relay: Obsidian vault 未設定",
+            body=(
+                "--publisher obsidian を使うには .env に\n"
+                "OBSIDIAN_VAULT_DIR=<vault の絶対パス> を設定してください。"
+            ),
+        )
+    _load_notion_overrides(logger)
+    overrides, date_property = _load_obsidian_overrides(logger)
+    try:
+        return ObsidianPublisher(
+            vault_dir=config.obsidian_vault_dir,
+            diary_dir=config.obsidian_diary_dir,
+            logger=logger,
+            property_overrides=overrides or None,
+            template_path=config.obsidian_template,
+            dry_run=dry_run,
+            fill_only_empty=fill_only_empty,
+            date_property=date_property,
+            target_date=target_date,
+            backup_dir=config.obsidian_backup_dir(),
+            create_missing=config.effective_create_missing(),
+            create_min_age_days=config.obsidian_create_min_age_days,
+            clock=clock,
+            sleep=sleep,
+            tz=config.diary_tz,
+        )
+    except ObsidianConfigError as exc:
+        raise ConfigAppError(
+            f"Obsidian の設定が不正です: {exc}",
+            title="ihealth-relay: Obsidian 設定不備",
+            body=(
+                f"{exc}\n"
+                ".env の OBSIDIAN_VAULT_DIR / OBSIDIAN_DIARY_DIR / OBSIDIAN_TEMPLATE と "
+                "config.toml の [publishers.obsidian] を確認してください。"
+            ),
+        ) from exc
 
 
 def _load_sleep_json_archive_first(

@@ -1,0 +1,76 @@
+{
+  "data": {
+    "metrics": [
+      {
+        "name": "step_count",
+        "units": "count",
+        "data": [
+          {"date": "2030-05-15 23:59:00 +0900", "qty": 33, "source": "Sample Watch"},
+          {"date": "2030-05-16 00:05:00 +0900", "qty": 41, "source": "Sample Watch"},
+          {"date": "2030-05-16 10:00:00 +0900", "qty": 4200, "source": "Sample Watch|Sample Phone"},
+          {"date": "2030-05-16 19:00:00 +0900", "qty": 1759, "source": "Sample Phone"}
+        ]
+      },
+      {
+        "name": "walking_running_distance",
+        "units": "km",
+        "data": [
+          {"date": "2030-05-16 10:00:00 +0900", "qty": 3.1, "source": "Sample Watch|Sample Phone"},
+          {"date": "2030-05-16 19:00:00 +0900", "qty": 1.3, "source": "Sample Phone"}
+        ]
+      },
+      {
+        "name": "active_energy",
+        "units": "kcal",
+        "data": [
+          {"date": "2030-05-16 10:00:00 +0900", "qty": 250.0, "source": "Sample Watch"},
+          {"date": "2030-05-16 19:00:00 +0900", "qty": 180.2, "source": "Sample Watch"}
+        ]
+      },
+      {
+        "name": "apple_exercise_time",
+        "units": "min",
+        "data": [
+          {"date": "2030-05-16 19:00:00 +0900", "qty": 18, "source": "Sample Watch"}
+        ]
+      },
+      {
+        "name": "heart_rate",
+        "units": "count/min",
+        "data": [
+          {"date": "2030-05-16 00:05:00 +0900", "Avg": 66, "Min": 64, "Max": 69, "source": "Sample Watch"},
+          {"date": "2030-05-16 10:00:00 +0900", "Avg": 98, "Min": 92, "Max": 110, "source": "Sample Watch"},
+          {"date": "2030-05-16 19:00:00 +0900", "Avg": 128, "Min": 118, "Max": 139, "source": "Sample Watch"}
+        ]
+      },
+      {
+        "name": "resting_heart_rate",
+        "units": "count/min",
+        "data": [
+          {"date": "2030-05-16 06:00:00 +0900", "qty": 58, "source": "Sample Watch"}
+        ]
+      },
+      {
+        "name": "sleep_analysis",
+        "units": "hr",
+        "data": [
+          {
+            "date": "2030-05-16 00:00:00 +0900",
+            "totalSleep": 6.9,
+            "asleep": 0,
+            "core": 4.4,
+            "deep": 1.0,
+            "rem": 1.5,
+            "awake": 0.2,
+            "inBed": 0,
+            "sleepStart": "2030-05-15 23:58:00 +0900",
+            "sleepEnd": "2030-05-16 06:52:00 +0900",
+            "inBedStart": "2030-05-15 23:58:00 +0900",
+            "inBedEnd": "2030-05-16 06:52:00 +0900",
+            "source": "Sample Watch"
+          }
+        ]
+      }
+    ]
+  }
+}

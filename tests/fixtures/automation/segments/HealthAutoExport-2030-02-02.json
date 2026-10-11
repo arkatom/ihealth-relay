@@ -1,0 +1,28 @@
+{
+  "data": {
+    "metrics": [
+      {
+        "name": "step_count",
+        "units": "count",
+        "data": [
+          {"date": "2030-02-02 12:00:00 +0900", "qty": 2000, "source": "Sample Phone"}
+        ]
+      },
+      {
+        "name": "sleep_analysis",
+        "units": "hr",
+        "data": [
+          {"startDate": "2030-02-01 23:45:00 +0900", "endDate": "2030-02-02 00:30:00 +0900", "value": "Deep", "qty": 0.75, "source": "Sample Watch"},
+          {"startDate": "2030-02-02 00:30:00 +0900", "endDate": "2030-02-02 02:00:00 +0900", "value": "REM", "qty": 1.5, "source": "Sample Watch"},
+          {"startDate": "2030-02-02 02:00:00 +0900", "endDate": "2030-02-02 02:10:00 +0900", "value": "Awake", "source": "Sample Watch"},
+          {"startDate": "2030-02-02 02:10:00 +0900", "endDate": "2030-02-02 06:10:00 +0900", "value": "Core", "source": "Sample Watch"},
+          {"startDate": "2030-02-02 06:10:00 +0900", "endDate": "2030-02-02 06:30:00 +0900", "value": "In Bed", "qty": 0.3333333333333333, "source": "Sample Watch"},
+          {"startDate": "2030-02-02 00:00:00 +0900", "endDate": "2030-02-02 05:00:00 +0900", "value": "Asleep", "qty": 5.0, "source": "Sample Sleep App"},
+          {"startDate": "2030-02-02 15:00:00 +0900", "endDate": "2030-02-02 15:45:00 +0900", "value": "Asleep", "qty": 0.75, "source": "Sample Watch"},
+          {"startDate": "2030-02-02 15:00:00 +0900", "endDate": "2030-02-02 16:00:00 +0900", "value": "Asleep", "qty": 1.0, "source": "Sample Sleep App"},
+          {"startDate": "2030-02-02 21:30:00 +0900", "endDate": "2030-02-02 22:00:00 +0900", "value": "Core", "qty": 0.5, "source": "Sample Watch"}
+        ]
+      }
+    ]
+  }
+}
