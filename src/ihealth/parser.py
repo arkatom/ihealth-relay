@@ -30,13 +30,14 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import statistics
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
-from typing import Callable, Optional, Union
+from typing import Callable, Mapping, Optional, Union
 
-from ihealth.models import DailyHealthData
+from ihealth.models import _VALID_RANGES, DailyHealthData
 
 
 _logger = logging.getLogger(__name__)
@@ -94,8 +95,17 @@ def _sum_asleep_by_source(
     実データでは ``sources`` 配列が常に 1 要素 (AutoSleep 単独、Apple Watch10 単独)
     なので ``sources[0]`` でソース識別子が取れる。複数要素になるケースが将来現れたら
     `identifier` の結合キー化が必要。
+
+    **重複レコードは 1 回だけ数える** (2026-10 実データ検証で判明): AutoSync の
+    ``sleep_analysis/{YYYYMMDD}.hae`` は「その日に**重なる**レコード」を含むため、
+    日付をまたぐセッション (例: 前日 21:54 → 当日 01:17) は前日ファイルと当日
+    ファイルの**両方**に同一レコードとして入っている。前日 + 当日の結合 payload を
+    そのまま合計すると二重計上になる (実測で 5.8h → 9.2h) ので、
+    ``(source, start, end, asleep)`` が同じレコードは 1 回だけ数える。
+    ``start`` を持たないレコードは同一性を判定できないので従来どおり全て数える。
     """
     by_source: "dict[str, float]" = {}
+    seen: "set[tuple[object, object, object, object]]" = set()
     for rec in payload.get("data", []):
         asleep = rec.get("asleep")
         if asleep is None:
@@ -113,6 +123,13 @@ def _sum_asleep_by_source(
         if not (end_hour_min <= end_dt.hour < end_hour_max):
             continue
         src = (rec.get("sources") or [{}])[0].get("identifier", "")
+        start_at = rec.get("start")
+        if start_at is not None:
+            key = (src, start_at, end_at, asleep)
+            if key in seen:
+                # 前日 + 当日ファイルの両方に入っている同一レコード → 二重計上しない
+                continue
+            seen.add(key)
         by_source.setdefault(src, 0.0)
         by_source[src] += float(asleep)
     if not by_source:
@@ -431,43 +448,93 @@ def parse_all(
             raise
 
     # DailyHealthData の __post_init__ は各フィールドの生理学的妥当性を検証し、
-    # 違反があれば ValueError を raise する (Issue #15)。ここで catch して
-    # 該当フィールドを 1 つずつ None に落として再試行することで、1 メトリクスの
-    # 異常値 (parser のバグ / センサー誤計測) が全フィールドを道連れにしないようにする。
-    try:
-        return DailyHealthData(date=target_date, **values)  # type: ignore[arg-type]
-    except ValueError as exc:
-        _logger.warning(
-            "DailyHealthData 妥当性検証に失敗、異常フィールドを None に落として再構築: %s",
-            exc,
+    # 違反があれば ValueError を raise する (Issue #15)。構築前に
+    # drop_invalid_fields で **フィールド単位** に検証して違反フィールドだけ None に
+    # 落とすことで、1 メトリクスの異常値 (parser のバグ / センサー誤計測) が
+    # 他の正常フィールドを道連れにしないようにする。NaN / inf のように
+    # __post_init__ の比較をすり抜ける値もここで落とす。
+    return _rebuild_with_validation_drop(target_date, values)
+
+
+def _field_violation(name: str, value: object) -> "str | None":
+    """``value`` が ``name`` の妥当範囲に収まっていなければ理由を返す (OK なら None)。"""
+    # bool は int のサブクラスだが集計値としては不正 (True 歩 / False bpm は無意味)
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return f"数値ではありません ({type(value).__name__})"
+    if isinstance(value, float) and not math.isfinite(value):
+        return "有限値ではありません"
+    lo, hi = _VALID_RANGES[name]
+    if lo is not None and value < lo:
+        return f"下限 {lo} を下回っています"
+    if hi is not None and value > hi:
+        return f"上限 {hi} を超えています"
+    return None
+
+
+def drop_invalid_fields(
+    values: "Mapping[str, object]",
+    *,
+    logger: "logging.Logger | None" = None,
+) -> "dict[str, object]":
+    """各フィールドを ``models._VALID_RANGES`` で**個別に**検証し、違反だけ None にする。
+
+    旧実装 (``_rebuild_with_validation_drop`` の dict 順の累積 drop) は、違反
+    フィールドより前にある**正常な**フィールドまで None に巻き添えにしていた
+    (例: 先頭の歩数が正常でも末尾の体脂肪率が異常なら歩数も消える)。本関数は
+    フィールドごとに独立に判定するので、違反したフィールドだけが落ちる。
+
+    検証内容:
+
+    * 数値 (int / float, bool は除く) であること、float は有限値 (NaN / inf 不可)
+    * ``_VALID_RANGES`` の下限・上限 (inclusive)
+    * 相互制約 ``heart_rate_avg <= heart_rate_max``: 違反時はどちらが誤りか
+      判別できないので **両方** None にする
+
+    ``None`` の値と ``_VALID_RANGES`` に無いキーはそのまま返す (入力 dict は変更しない)。
+
+    Returns:
+        違反フィールドを None に置き換えた新しい dict (キー順は入力と同じ)。
+    """
+    log = logger or _logger
+    cleaned: "dict[str, object]" = dict(values)
+    for name, value in values.items():
+        if value is None or name not in _VALID_RANGES:
+            continue
+        reason = _field_violation(name, value)
+        if reason is not None:
+            log.warning(
+                "field %s を妥当性違反として drop (元値=%r): %s", name, value, reason,
+            )
+            cleaned[name] = None
+
+    avg = cleaned.get("heart_rate_avg")
+    peak = cleaned.get("heart_rate_max")
+    if avg is not None and peak is not None and avg > peak:  # type: ignore[operator]
+        log.warning(
+            "heart_rate_avg (%r) が heart_rate_max (%r) を超えているため両方 drop",
+            avg, peak,
         )
-        return _rebuild_with_validation_drop(target_date, values)
+        cleaned["heart_rate_avg"] = None
+        cleaned["heart_rate_max"] = None
+    return cleaned
 
 
 def _rebuild_with_validation_drop(
-    target_date: date, values: "dict[str, object]"
+    target_date: date, values: "Mapping[str, object]"
 ) -> DailyHealthData:
-    """個別フィールドを試行的に None に落として妥当性検証を通す。
+    """:func:`drop_invalid_fields` で違反フィールドだけ None にして構築する。
 
-    1 フィールドずつ順に None に置き換えて再構築を試み、成功した時点で返す。
-    ``exercise_intensity_score`` → ``heart_rate_avg`` のように依存関係を考慮して
-    「怪しい順」に試すのではなく、素朴に dict の順で試す (最悪ケースでも
-    14 回の再構築で完了)。全部 None に落としても失敗する場合は諦めて空の
-    DailyHealthData を返す (date だけは保持)。
+    (Issue #15 の後継。旧実装は dict 順に累積で None にしていたため正常フィールド
+    まで消していた。) ``models`` に将来 ``drop_invalid_fields`` が知らない制約が
+    追加された場合に備え、それでも ``ValueError`` になるときは警告を出して
+    空の DailyHealthData (date のみ) を返す (全滅させるよりは観測可能な縮退)。
     """
-    tentative = dict(values)
-    for name in list(tentative.keys()):
-        if tentative[name] is None:
-            continue
-        saved = tentative[name]
-        tentative[name] = None
-        try:
-            return DailyHealthData(date=target_date, **tentative)  # type: ignore[arg-type]
-        except ValueError:
-            # まだ別フィールドに違反があるので、このフィールドも None のまま次へ
-            _logger.warning(
-                "field %s を妥当性違反として drop (元値=%r)", name, saved,
-            )
-            continue
-    # 全部 None でも構築できない = date 以外の制約違反 (理論上あり得ない)
-    return DailyHealthData(date=target_date)
+    cleaned = drop_invalid_fields(values)
+    try:
+        return DailyHealthData(date=target_date, **cleaned)  # type: ignore[arg-type]
+    except ValueError as exc:
+        _logger.warning(
+            "DailyHealthData 妥当性検証に失敗 (未知の制約?)。全フィールドを None で構築: %s",
+            exc,
+        )
+        return DailyHealthData(date=target_date)

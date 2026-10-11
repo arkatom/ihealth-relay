@@ -10,6 +10,7 @@ unittest 標準ライブラリのみ。fixture は ``tests/fixtures/sample_healt
 
 from __future__ import annotations
 
+import logging
 import unittest
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
@@ -17,6 +18,8 @@ from pathlib import Path
 from ihealth.models import DailyHealthData
 from ihealth.parser import (
     ParseContext,
+    _rebuild_with_validation_drop,
+    drop_invalid_fields,
     parse_active_energy_kcal,
     parse_all,
     parse_body_fat_percentage,
@@ -417,6 +420,39 @@ class TestSleepHours(unittest.TestCase):
         ]}
         self.assertAlmostEqual(parse_sleep_hours(payload, self.CTX), 4.5)
 
+    def test_cross_midnight_record_in_both_files_is_counted_once(self):
+        # 実データ (2026-10 検証): AutoSync の sleep_analysis/{日付}.hae は「その日に
+        # 重なる」レコードを含むので、前日 21:54 → 当日 01:17 のセッションは前日
+        # ファイルと当日ファイルの両方に同一レコードとして入る。結合 payload で
+        # 二重計上しない (旧実装は 3.4 + 3.4 + 1.8 = 8.6h と過大になっていた)。
+        start = _mac_seconds_at_jst(2026, 4, 21, 22)
+        end = _mac_seconds_at_jst(2026, 4, 22, 1)
+        src = [{"identifier": "com.example.sleeptracker"}]
+        shared = {"asleep": 3.4, "start": start, "end": end, "sources": src}
+        today = [dict(shared),
+                 {"asleep": 1.8, "start": end + 1800,
+                  "end": _mac_seconds_at_jst(2026, 4, 22, 4), "sources": src}]
+        prev = [dict(shared)]
+        payload = {"data": [*today, *prev]}
+        self.assertAlmostEqual(parse_sleep_hours(payload, self.CTX), 5.2)
+
+    def test_distinct_records_with_same_end_are_both_counted(self):
+        # start が違えば別レコード (重複除去の対象外)
+        end = _mac_seconds_at_jst(2026, 4, 22, 6)
+        src = [{"identifier": "watch"}]
+        payload = {"data": [
+            {"asleep": 2.0, "start": end - 7200, "end": end, "sources": src},
+            {"asleep": 2.0, "start": end - 3600, "end": end, "sources": src},
+        ]}
+        self.assertAlmostEqual(parse_sleep_hours(payload, self.CTX), 4.0)
+
+    def test_duplicate_nap_record_is_counted_once(self):
+        start = _mac_seconds_at_jst(2026, 4, 22, 15)
+        end = _mac_seconds_at_jst(2026, 4, 22, 16)
+        rec = {"asleep": 1.0, "start": start, "end": end, "sources": [{"identifier": "w"}]}
+        payload = {"data": [dict(rec), dict(rec)]}
+        self.assertAlmostEqual(parse_nap_hours(payload, self.CTX), 1.0)
+
 
 class TestNapHours(unittest.TestCase):
     CTX = ParseContext(target_date=date(2026, 4, 22), max_heart_rate=178.0)
@@ -588,6 +624,36 @@ class TestParseAllWithFixtures(unittest.TestCase):
         self.assertIsNotNone(result.step_count)
         self.assertIsNotNone(result.sleep_hours)
 
+    def test_parse_all_invalid_field_does_not_drop_valid_fields(self):
+        """末尾フィールド (体脂肪率) の異常値が、先頭の正常フィールドを巻き添えにしない。
+
+        旧 ``_rebuild_with_validation_drop`` は dict 順に累積で None にしていたため、
+        body_fat_percentage (最後のフィールド) が異常だと歩数〜体重まで全部消えていた。
+        """
+        import json as _json
+        import tempfile
+        from shutil import copytree
+        with tempfile.TemporaryDirectory() as tmp:
+            dst = Path(tmp) / "2026-04-22"
+            copytree(FIXTURE_ROOT / "2026-04-22", dst)
+            fat_path = dst / "body_fat_percentage.json"
+            fat = _json.loads(fat_path.read_text(encoding="utf-8"))
+            for rec in fat["data"]:
+                rec["qty"] = 150.0   # 妥当範囲 (1-60%) 外
+            fat_path.write_text(_json.dumps(fat), encoding="utf-8")
+
+            ctx = ParseContext(target_date=date(2026, 4, 22), max_heart_rate=178.0)
+            with self.assertLogs("ihealth.parser", level="WARNING") as logs:
+                result = parse_all(dst, date(2026, 4, 22), ctx)
+        self.assertIsNone(result.body_fat_percentage)
+        self.assertTrue(any("body_fat_percentage" in line for line in logs.output))
+        # 正常フィールドは残る
+        self.assertIsNotNone(result.step_count)
+        self.assertIsNotNone(result.distance_km)
+        self.assertIsNotNone(result.heart_rate_avg)
+        self.assertAlmostEqual(result.sleep_hours, 4.0333333333, places=5)
+        self.assertAlmostEqual(result.body_mass_kg, 65.55, places=2)
+
     def test_parse_all_missing_file_gracefully(self):
         """アーカイブディレクトリに一部ファイルがない場合も parse_all は
         該当フィールドだけ None で続行する (全滅させない)。"""
@@ -600,12 +666,122 @@ class TestParseAllWithFixtures(unittest.TestCase):
             # step_count.json だけコピー、他は存在しない
             copyfile(src_dir / "step_count.json", dst / "step_count.json")
             ctx = ParseContext(target_date=date(2026, 4, 22), max_heart_rate=178.0)
-            result = parse_all(dst, date(2026, 4, 22), ctx)
+            with self.assertLogs("ihealth.parser", level="WARNING") as logs:
+                result = parse_all(dst, date(2026, 4, 22), ctx)
             self.assertIsNotNone(result.step_count)
             # その他のフィールドは all None
             self.assertIsNone(result.distance_km)
             self.assertIsNone(result.sleep_hours)
             self.assertIsNone(result.body_mass_kg)
+            # 欠けたファイルは warning で報告される (step_count 以外の 10 ディレクトリ)
+            self.assertTrue(all("archive file が見つかりません" in line for line in logs.output))
+            self.assertNotIn("step_count.json", " ".join(logs.output))
+
+
+class TestDropInvalidFields(unittest.TestCase):
+    """drop_invalid_fields: フィールド単位の妥当性検証 (Issue #15 の累積 drop バグ修正)。"""
+
+    VALID = {
+        "step_count": 8000,
+        "distance_km": 5.2,
+        "active_energy_kcal": 420.0,
+        "exercise_minutes": 30.0,
+        "exercise_intensity_score": 0.0,
+        "heart_rate_avg": 72.0,
+        "heart_rate_max": 150.0,
+        "heart_rate_resting": 58.0,
+        "oxygen_saturation": 97.0,
+        "sleep_hours": 7.0,
+        "nap_hours": None,
+        "mindful_sessions": 2,
+        "mindful_minutes": 12.0,
+        "body_mass_kg": 61.0,
+        "body_fat_percentage": 18.0,
+    }
+
+    def _drop(self, **overrides):
+        values = dict(self.VALID, **overrides)
+        with self.assertLogs("ihealth.parser", level="WARNING") as logs:
+            cleaned = drop_invalid_fields(values)
+        return cleaned, logs.output
+
+    def test_valid_values_are_untouched(self):
+        values = dict(self.VALID)
+        self.assertEqual(drop_invalid_fields(values), values)
+
+    def test_valid_leading_fields_survive_invalid_trailing_field(self):
+        # 回帰: 旧実装はここで step_count〜body_mass_kg まで全部 None にしていた
+        cleaned, logs = self._drop(body_fat_percentage=150.0)
+        self.assertIsNone(cleaned["body_fat_percentage"])
+        for name, value in self.VALID.items():
+            if name != "body_fat_percentage":
+                self.assertEqual(cleaned[name], value, name)
+        self.assertEqual(len(logs), 1)
+        self.assertIn("body_fat_percentage", logs[0])
+
+    def test_multiple_violations_are_each_dropped(self):
+        cleaned, logs = self._drop(step_count=-5, oxygen_saturation=120.0)
+        self.assertIsNone(cleaned["step_count"])
+        self.assertIsNone(cleaned["oxygen_saturation"])
+        self.assertEqual(cleaned["distance_km"], 5.2)
+        self.assertEqual(len(logs), 2)
+
+    def test_boundaries_are_inclusive(self):
+        values = dict(self.VALID, oxygen_saturation=100.0, body_fat_percentage=1.0,
+                      heart_rate_resting=150.0, sleep_hours=24.0, step_count=0)
+        self.assertEqual(drop_invalid_fields(values), values)
+
+    def test_non_finite_and_non_numeric_are_dropped(self):
+        cleaned, logs = self._drop(distance_km=float("nan"), active_energy_kcal=float("inf"),
+                                   step_count=True, mindful_minutes="12")
+        for name in ("distance_km", "active_energy_kcal", "step_count", "mindful_minutes"):
+            self.assertIsNone(cleaned[name], name)
+        self.assertEqual(len(logs), 4)
+
+    def test_avg_above_max_drops_both(self):
+        cleaned, logs = self._drop(heart_rate_avg=160.0, heart_rate_max=150.0)
+        self.assertIsNone(cleaned["heart_rate_avg"])
+        self.assertIsNone(cleaned["heart_rate_max"])
+        self.assertEqual(cleaned["heart_rate_resting"], 58.0)
+        self.assertIn("heart_rate_avg", logs[0])
+
+    def test_avg_out_of_range_does_not_drop_valid_max(self):
+        # 範囲違反の avg が先に落ちるので、相互制約では max を巻き添えにしない
+        cleaned, _logs = self._drop(heart_rate_avg=300.0)
+        self.assertIsNone(cleaned["heart_rate_avg"])
+        self.assertEqual(cleaned["heart_rate_max"], 150.0)
+
+    def test_none_and_unknown_keys_pass_through(self):
+        values = {"step_count": None, "extra": "keep", "heart_rate_avg": None}
+        self.assertEqual(drop_invalid_fields(values), values)
+
+    def test_input_is_not_mutated(self):
+        values = dict(self.VALID, body_fat_percentage=150.0)
+        snapshot = dict(values)
+        with self.assertLogs("ihealth.parser", level="WARNING"):
+            drop_invalid_fields(values)
+        self.assertEqual(values, snapshot)
+
+    def test_custom_logger(self):
+        logger = logging.getLogger("test_parser.custom")
+        with self.assertLogs(logger, level="WARNING"):
+            drop_invalid_fields({"step_count": -1}, logger=logger)
+
+
+class TestRebuildWithValidationDrop(unittest.TestCase):
+    def test_keeps_valid_fields(self):
+        values = dict(TestDropInvalidFields.VALID, body_fat_percentage=150.0)
+        with self.assertLogs("ihealth.parser", level="WARNING"):
+            result = _rebuild_with_validation_drop(date(2026, 4, 22), values)
+        self.assertIsInstance(result, DailyHealthData)
+        self.assertEqual(result.step_count, 8000)
+        self.assertEqual(result.body_mass_kg, 61.0)
+        self.assertIsNone(result.body_fat_percentage)
+
+    def test_valid_values_build_normally(self):
+        result = _rebuild_with_validation_drop(date(2026, 4, 22), TestDropInvalidFields.VALID)
+        self.assertEqual(result.as_dict()["step_count"], 8000)
+        self.assertEqual(result.date, date(2026, 4, 22))
 
 
 if __name__ == "__main__":
