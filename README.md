@@ -32,13 +32,22 @@ external Python dependencies:
   source never blocks the others.
 - **Safe edits to notes you write by hand**: only the tool's own frontmatter
   keys change; the body, other keys, comments, line endings and BOM stay
-  byte-identical. Every overwrite is preceded by a backup, and concurrent
-  edits (Obsidian, Obsidian Sync, other tools) are detected before the file is
-  replaced.
-- **Writes only values it is sure about**: a day that has not ended yet is
-  written as provisional and tracked until the final values replace it,
-  incomplete sources are skipped (the note keeps its existing values), and
-  failures are summarized in one Reminders.app reminder per run.
+  byte-identical. One of its own keys whose entry carries a comment, or that
+  appears twice, is left as it is (and reported) rather than rewritten.
+  Before anything is written, a separately implemented check compares the
+  note before and after the edit and refuses the write if anything outside
+  the tool's keys would change. Every overwrite is preceded by a backup,
+  concurrent edits (Obsidian, Obsidian Sync, other tools) are detected before
+  the file is replaced, and the note is read back afterwards to confirm the
+  values are there.
+- **Writes only values it is sure about, and follows up on the rest**: a day
+  that has not ended yet — or whose latest export was written before the day
+  ended — is written as provisional; incomplete sources are skipped (the
+  note keeps its existing values). Values that have not settled yet
+  (provisional values, weather JMA has not published, an incomplete GitHub
+  collection, …) are tracked in `data/diary-state.json` and re-processed for
+  up to 30 days, and failures and long-unsettled values are summarized in
+  one Reminders.app reminder per run.
 - **Pluggable Sinks**: `--publisher notion | markdown | stdout | sqlite | slack | dryrun | obsidian`.
   Each sink is an independent module under `src/ihealth/publishers/`.
 - **Idempotent**: re-running for the same date overwrites the existing
@@ -137,9 +146,10 @@ the Obsidian vault, Notion DB schema setup and per-sink configuration.
 
 ## Obsidian daily notes (`--publisher obsidian`)
 
-For every day in a window (by default yesterday back 7 days, plus today), the
-tool collects three sources independently and writes them into the
-frontmatter of that day's diary note:
+For every day in a window (by default yesterday back 7 days, plus today, plus
+up to 30 days back for days whose values have not settled yet — see
+[below](#values-that-have-not-settled-yet)), the tool collects three sources
+independently and writes them into the frontmatter of that day's diary note:
 
 - **Health** — Health Auto Export *automation* JSON
   (`<automation folder>/HealthAutoExport-YYYY-MM-DD.json`), supplemented by
@@ -177,7 +187,7 @@ built for — rename any of them via `config.toml`):
 | `アクティビティ時間 (分)` | `exercise_minutes` | Health | Apple Exercise Time, integer minutes |
 | `体重 (kg)` | `body_mass_kg` | Health | latest, 1 decimal (lb converted) |
 | `体脂肪率 (%)` | `body_fat_percentage` | Health | latest, 1 decimal |
-| `アクティビティ詳細` | `activity_detail` | Health | mindfulness + workouts, or `なし`; only when the automation exports workouts (see [notes](#notes-on-health-values)) |
+| `アクティビティ詳細` | `activity_detail` | Health | mindfulness, then the day's workouts (with **Include Workouts**) or Apple Exercise Time, e.g. `瞑想10分、エクササイズ21分`; `なし` on a day you wore the Watch (heart-rate data) without either; not written without heart-rate data (see [notes](#notes-on-health-values)) |
 | `気温` | `temperature` | Weather | morning / afternoon / night means + daily max / min |
 | `湿度` | `humidity` | Weather | same shape as 気温 |
 | `気圧` | `pressure` | Weather | sea-level pressure, four 6-hour means + trend marks |
@@ -223,10 +233,13 @@ Github: "[🔀 my-app:PR #12: Add login form](https://github.com/your-name/my-ap
    intensity score counts minutes, so coarser grouping undercounts it), sleep
    aggregation on (see [notes](#notes-on-health-values) for naps) and **one
    file per day**.
-   Include the metrics listed in [Collected Data](#collected-data). To get
-   `アクティビティ詳細`, also let the automation export **workouts** (without
-   them the tool cannot tell whether you exercised, so it leaves that key
-   alone). Labels differ slightly between app versions. The files appear as
+   Include the metrics listed in [Collected Data](#collected-data).
+   `アクティビティ詳細` is built from mindfulness and Apple Exercise Time
+   (`瞑想10分、エクササイズ21分`); turn on **Include Workouts** in the
+   automation to list the day's workouts by name instead
+   (`瞑想10分、ウォーキング31分`; days without a workout keep
+   `エクササイズN分`). Labels differ slightly between app versions. The
+   files appear as
    `iCloud Drive › Health Auto Export › <automation name> › HealthAutoExport-YYYY-MM-DD.json`;
    the folder name is free — the tool searches for the file pattern.
 2. **`.env`** (see `.env.example` for every key with comments; comments must
@@ -268,8 +281,8 @@ Github: "[🔀 my-app:PR #12: Add login form](https://github.com/your-name/my-ap
 | `OBSIDIAN_CREATE_MIN_AGE_DAYS` | `2` | Create notes only for days at least this old, so today's and yesterday's notes are left to you (avoids Obsidian Sync conflicts with a note created on another device). `0` allows today. |
 | `IHEALTH_LOOKBACK_DAYS` | `7` | Default window: yesterday back this many days (0–366). |
 | `IHEALTH_INCLUDE_TODAY` | `true` | Also write today's provisional values. |
-| `IHEALTH_SOURCES` | `health,weather,github` | Sources to process. |
-| `IHEALTH_TZ_OFFSET` | `+09:00` | Diary time zone: decides "today"/"yesterday" and GitHub day boundaries. |
+| `IHEALTH_SOURCES` | `health,weather,github` | Sources to process. Removing a source here also ends the tracking of its keys in `data/diary-state.json` (a one-off `--sources` does not). |
+| `IHEALTH_TZ_OFFSET` | `+09:00` | Diary time zone: decides "today"/"yesterday" and GitHub day boundaries, and when a health day ends if its records carry no UTC offset (and for AutoSync `.hae`). |
 | `IHEALTH_NETWORK_GRACE_SEC` | `60` | Seconds to wait for the network right after wake (0–600, `0` = don't wait). Connection errors that clear within this time are retried, not reported. |
 | `JMA_PREC_NO` / `JMA_BLOCK_NO` | `44` / `47662` (Tokyo) | Weather station, see [Changing the JMA station](#changing-the-jma-station). |
 | `GITHUB_TOKEN` | unset → `gh auth token` | Token used for the GitHub GraphQL API. Never logged. |
@@ -304,10 +317,11 @@ startup (exit 3) instead of silently losing a value.
 - `--fill-empty-only` keeps every key that already has a value (for
   backfills); the run report lists those keys as `kept` with both values.
   Exception: a provisional value the tool wrote itself and that is still
-  unchanged (see [When values appear](#when-values-appear)) is replaced by the
-  final value; a value you edited is kept.
+  unchanged is replaced by the final value; a value you edited is kept (see
+  [Values that have not settled yet](#values-that-have-not-settled-yet)).
 - `--dry-run` writes no note and creates no file in the vault (no backups
-  either), but still reads the sources and saves the run report. Reminders
+  either), but still reads the sources, runs the pre-write check on every
+  planned edit and saves the run report. Reminders
   it would create are only logged, and nothing is recorded as notified or
   tracked (`data/diary-state.json` is not changed), so a dry run never
   silences or alters the next real run.
@@ -340,15 +354,27 @@ waits up to `IHEALTH_NETWORK_GRACE_SEC` seconds for Wi-Fi.
 
 | Source | Today | Yesterday | 2–7 days ago |
 |---|---|---|---|
-| Health | **Provisional**: values so far, from the latest automation file; replaced on every run | **Final** once Health Auto Export has re-written yesterday's file after midnight. Until then nothing is written, so the note keeps the last provisional values — the tool remembers them and keeps re-processing that day (see below) | Same rule; a late re-export is picked up by any run within the window |
-| Weather | Never (JMA publishes a day only after it ends) | Once JMA's page is complete. The weather column (天気) is filled in later than the numbers, so this is usually a later run of the day | Same; a day that is still incomplete is not written ([failures](#failures-and-recovery)) |
-| GitHub | Activity so far (provisional, tracked like health) | Written whenever the whole collection succeeded; `該当なし` if there was no activity | Same |
+| Health | **Provisional**: values so far, from the latest automation file; replaced on every run | **Final** once Health Auto Export has re-written yesterday's file after the day ended. Until then the values of the latest file (written before midnight) are written as **provisional** and tracked until the re-export replaces them (see below) | Same rule; a late re-export is picked up by any run within the window, and afterwards by the tracking below |
+| Weather | Never (JMA publishes a day only after it ends); tracked as pending | Once JMA's page is complete. The weather column (天気) is filled in later than the numbers, so this is usually a later run of the day; until then the day is tracked as pending | Same; a day that is still incomplete is not written and stays tracked ([failures](#failures-and-recovery)) |
+| GitHub | Activity so far (provisional, tracked like health) | Written whenever the whole collection succeeded; `該当なし` if there was no activity. After an incomplete collection nothing is written and the day is tracked | Same |
 
-- A health day counts as final only when its file was written after the day
-  ended (midnight in the Mac's time zone). Health Auto Export re-writes the
-  files of recent days whenever the automation runs, but iOS runs it only
-  when the app gets background time — if values lag, open Health Auto Export
-  on the iPhone once.
+- A health day counts as final only when its automation file was written
+  after the day ended: midnight at the UTC offset of that day's own records
+  (`IHEALTH_TZ_OFFSET` when the records carry none). The file time and the
+  end of the day are compared as absolute times, so the Mac's time zone does
+  not matter. A file written earlier — an export at 20:39, say — holds the
+  day only so far: its values are written as provisional, also for a day
+  that has already ended, and replaced when Health Auto Export re-writes the
+  file. Health Auto Export re-writes the files of recent days whenever the
+  automation runs, but iOS runs it only when the app gets background time —
+  if values lag, open Health Auto Export on the iPhone once.
+- AutoSync `.hae` (supplement and fallback; their day ends at
+  `IHEALTH_TZ_OFFSET` midnight): values from a file last written before its
+  day ended are **withheld** (not written) once the day is over, because a
+  stopped AutoSync never re-exports it. For today they are provisional.
+- With sleep aggregation off, 睡眠時間 (分) also needs the previous day's
+  file. While that file is missing, unreadable or older than the night,
+  睡眠時間 alone is written as provisional; the other values are final.
 - Each health record is dated by its own UTC offset (days recorded abroad stay
   on their local date). Weather days are the station's days (JST). GitHub days
   and "today" use `IHEALTH_TZ_OFFSET`.
@@ -357,16 +383,45 @@ waits up to `IHEALTH_NETWORK_GRACE_SEC` seconds for Wi-Fi.
   older day is created only when `OBSIDIAN_TEMPLATE` (or
   `OBSIDIAN_CREATE_MISSING`) allows it, in the same folder as the nearest
   existing diary note within ±7 days (otherwise the diary root).
-- **Provisional values are tracked until they are final.** Every key written
-  as provisional (today's health, アクティビティ詳細 and Github) is recorded
-  with its value in `data/diary-state.json`. Scheduled runs (no arguments)
-  re-process those days even after they leave the 7-day window — for up to
-  30 days — and drop a key from the list once its final value has been
-  written (or you changed the value yourself). Outside the window such a
-  day is only completed: empty keys are filled and the tool's own
-  provisional values are replaced; values you wrote are kept. If a day is
-  still provisional 3 days later, you get one reminder per day
-  ("日記の暫定値が確定していません").
+
+#### Values that have not settled yet
+
+Keys that have not settled yet for one of the reasons below are recorded in
+`data/diary-state.json` (the ledger) with the date, the reason and when they
+were first seen; for a provisional value, the value the tool wrote is
+recorded too. (Health and weather that fail to load are not tracked here:
+they are reported as failures on every run and retried within the window.)
+
+| Reason | What happened | Settles when |
+|---|---|---|
+| `provisional` | The tool wrote a value that can still change: today's health, `アクティビティ詳細` and `Github`; an automation file written before its day ended; night sleep without the previous day's file | the final value is written |
+| `withheld` | A health value was not written because it would come from an AutoSync `.hae` written before the day ended | you fill it in yourself (AutoSync never re-exports it) |
+| `weather_pending` | JMA has not published the day yet | JMA's page is complete |
+| `weather_incomplete` | JMA's page for a day that should be complete is still incomplete | the page completes |
+| `github_incomplete` | The GitHub collection was incomplete | a run collects everything |
+| `unwritable` | A provisional value the tool wrote now sits in an entry with a comment or a duplicate key, so the tool will not rewrite it | you move the comment or merge the duplicate entries |
+
+- Scheduled runs (no date arguments) re-process the ledger's days for up to
+  30 days, also after they leave the 7-day window. Outside the window a day
+  is only completed: empty keys are filled and the tool's own provisional
+  values are replaced as long as they are unchanged; values you wrote are
+  kept.
+- A key also leaves the ledger when it holds a value of your own that the
+  tool will not overwrite (the day is outside the window, or the tool has no
+  value for the key), when the source's data for that day is final and
+  simply has no value for it (for example a value JMA reports as missing),
+  when you remove its source from `IHEALTH_SOURCES`, or when the note no
+  longer exists.
+- A key that is still unsettled **more than 3 days after it was first seen**
+  is added to the run's reminder as 要確認 (title
+  `日記の暫定値が確定していません (要確認)`, or `日記の値が確定していません (要確認)`
+  when other reasons are involved), with a hint per reason — at most once a
+  day. `withheld` and `weather_incomplete` rarely settle by themselves, so
+  they are reminded once and then tracked quietly.
+- A day that is still unsettled after 30 days leaves the ledger with one
+  last reminder (re-run it later with `--date`). Unsettled keys found on
+  dates older than 30 days (e.g. in a backfill) are not tracked: they are
+  listed once in the reminder and in the run report (`provisional.untracked`).
 - Apart from that, a day that leaves the 7-day window is no longer updated
   automatically; use `--date` / `--from` for it.
 
@@ -384,12 +439,35 @@ waits up to `IHEALTH_NETWORK_GRACE_SEC` seconds for Wi-Fi.
   created the automation) are computed from AutoSync `.hae` alone, with the
   AutoSync rules: main night sleep and naps separated, average heart rate
   over the individual heart rate records.
-- **アクティビティ詳細** lists mindfulness (`瞑想N分`) and each workout
-  (`ウォーキング31分`), or `なし` if neither — but only when the automation
-  JSON contains workouts (the automation exports them). Without workouts in
-  the JSON, and on days computed from AutoSync `.hae` alone, the key is not
-  written (writing `なし` or only `瞑想N分` could erase a workout that is
-  already in the note).
+- **アクティビティ詳細** starts with mindfulness (`瞑想N分`, when the day's
+  sessions add up to at least 1 minute), followed by
+  - the day's workouts by name (`ウォーキング31分`; English names are
+    translated, unknown ones kept) when the automation exports workouts
+    (**Include Workouts**) and the day has any of at least 1 minute (a
+    shorter workout counts as none), or
+  - otherwise Apple Exercise Time as `エクササイズN分` (at least 1 minute).
+    Days computed from AutoSync `.hae` alone use this rule too.
+
+  The parts are joined with `、`, e.g. `瞑想10分、エクササイズ21分`. A day with
+  none of these gets `なし` if it has heart-rate data (you wore the Watch but
+  did not exercise — Health Auto Export leaves Apple Exercise Time out on
+  such days). Without heart-rate data the key is not written and keeps its
+  value, even if Apple Exercise Time reports 0 minutes. It is not written
+  either — even with heart-rate data — when one of the inputs could not be
+  read (including an AutoSync `.hae` used to fill a gap that is unreadable
+  or was written before the day ended). Minutes are rounded the same way as
+  瞑想時間 (分) and アクティビティ時間 (分).
+
+  Within the default window (yesterday back `IHEALTH_LOOKBACK_DAYS` = 7 days,
+  plus today) this key is the tool's like its other keys: whatever it
+  computes — `なし` and `エクササイズN分` included — replaces whatever the key
+  holds, so an activity detail you typed by hand in the last 7 days can be
+  replaced. To keep one, add a comment to its line
+  (`アクティビティ詳細: "ヨガ30分" # 手入力`): an entry with a comment is left as
+  it is (reported as `kept`). If your notes list workouts by name (e.g.
+  migrated from the predecessor), turn on **Include Workouts** in the
+  automation so the tool writes workout names too; otherwise days in the
+  window are rewritten as `エクササイズN分`.
 - **運動強度スコア** uses `BIRTH_DATE` for the maximum heart rate.
 
 ### Failures and recovery
@@ -404,23 +482,56 @@ waits up to `IHEALTH_NETWORK_GRACE_SEC` seconds for Wi-Fi.
   configuration errors (exit 3) and unexpected errors (exit 1). A reminder
   that could not be created (e.g. `osascript` failed or timed out) is not
   counted as sent; the next run tries again.
-- **Run report** `logs/diary-report-<UTC timestamp>.json` after every run
-  (including `--dry-run`, kept 30 days): for each date the note's status and
-  path, the backup path, each source's status (`complete` / `partial` /
-  `failed` / `nodata` / `skipped`) and, per key, the action (`insert` /
-  `update` / `unchanged` / `kept` / `missing` / `failed` / `skipped`) with a
-  reason such as `not_final`, `not_published`, `incomplete_day`, `no_value`,
-  `source_failed`, `source_incomplete`, `too_recent`, `create_disabled`.
-- **Data freshness** (once per day, `logs/.stale_notified`; the exit code is
-  unaffected; added to the run's reminder if there is one):
-  `HAE オートメーション停止の疑い` when the newest automation file is older
-  than today − 3 days; `HAE オートメーション出力が見つかりません` when no
-  automation file exists at all and no day of the run got any health data;
-  `日記の暫定値が確定していません` when provisional values are still not final
-  after 3 days (and, once, when a day is dropped after 30 days).
+- **Run report** `logs/diary-report-<UTC timestamp>.json` for every run
+  (including `--dry-run`, kept 30 days):
+  - It is created when the run starts, with `status: "running"` and the
+    dates the run will process (`planned_dates`; `revisit_dates` are the
+    ones added from the ledger). Each date's result is appended to the
+    journal `logs/diary-report-<UTC timestamp>.jsonl` (and flushed to disk)
+    as soon as the date is done, so a crash leaves the finished dates on
+    disk.
+  - At the end the report gets every date's result, `status` (`finished`,
+    or `interrupted` with the unprocessed `remaining_dates`), `processed`
+    and `exit_code`, and the journal is deleted.
+  - Per date: the note's status and path, the backup path, each source's
+    status (`complete` / `partial` / `failed` / `nodata` / `skipped`), the
+    keys that are still unsettled (`unresolved`) and, per key, the action
+    (`insert` / `update` / `unchanged` / `kept` / `missing` / `failed` /
+    `skipped`) with a reason such as `not_final`, `not_published`,
+    `incomplete_day`, `no_value`, `source_failed`, `source_incomplete`,
+    `too_recent`, `create_disabled`. A key kept because of a comment or a
+    duplicate key has a `warning` (`comment present …` / `duplicate key …`);
+    a key that left the ledger has `resolved` (its earlier reason) and, when
+    it left without a final value, `resolution` (`user_value` /
+    `no_value_final` / `source_deselected`).
+  - `provisional` shows the ledger after the run: `unresolved`, `overdue`
+    (more than 3 days), `expired` (dropped after 30 days) and `untracked`
+    (dates older than 30 days), each as date → key → reason.
+  - If the report cannot be created, the run stops before touching any
+    note; if a date's result cannot be appended, the remaining dates are not
+    processed; if the final report cannot be written, the journal is kept.
+    Each of these is a failure (exit 12, with a reminder that says where the
+    partial results are).
+- **Data freshness** (added to the run's reminder; the exit code is
+  unaffected): `HAE オートメーション停止の疑い` when the newest automation file
+  is older than today − 3 days; `HAE オートメーション出力が見つかりません` when
+  no automation file exists at all and no day of the run got any health
+  data; `日記の暫定値が確定していません (要確認)` / `日記の値が確定していません
+  (要確認)` when values are still unsettled more than 3 days after they were
+  first seen ([details](#values-that-have-not-settled-yet)). These are
+  repeated at most once per day (`logs/.stale_notified`). One-time items —
+  the single reminder for `withheld` / `weather_incomplete`, a day dropped
+  from the ledger after 30 days, unsettled keys on dates older than 30
+  days — are sent once: `logs/.freshness_notified` remembers what was sent
+  today, so an item found by a later run of the same day (e.g. a backfill)
+  is still reported. If the reminder could not be created, the dropped days
+  and old dates are kept in `data/diary-state.json` (`unreported`) and sent
+  by the next run.
 - **Exit code**: `0` nothing failed (data that is simply not there yet is not
-  a failure), `12` some source failed or a note needs your attention, `11` a
-  note could not be written or every source failed for every date, `3`
+  a failure), `12` some source failed, a note needs your attention, or the
+  run report or `data/diary-state.json` could not be saved, `11` a note could
+  not be written (including a write that could not be confirmed and a write
+  refused by the pre-write check) or every source failed for every date, `3`
   configuration error (vault or diary directory missing, broken
   `config.toml`, key collision). A failed source never blocks the others, and
   its keys are left untouched.
@@ -429,24 +540,42 @@ waits up to `IHEALTH_NETWORK_GRACE_SEC` seconds for Wi-Fi.
 
 | Symptom | Meaning | Fix |
 |---|---|---|
-| Reminder "HAE オートメーション停止の疑い" | The iPhone automation has not exported for more than 3 days | On the iPhone, open Health Auto Export, check the automation is enabled and iCloud Drive is syncing, and run it once. The next run fills the last 7 days; for a longer gap run `./bin/ihealth-run --publisher obsidian --from <first missing day> --sources health`. |
-| Yesterday's health values missing or still provisional (`not_final` in the report) | Yesterday's file was last written before midnight | Usually nothing — scheduled runs re-process the day until Health Auto Export re-exports it (open the app to speed it up). If it is not final within 3 days you get the reminder below. |
-| Reminder "日記の暫定値が確定していません" | Health Auto Export has not re-written that day's file after the day ended (automation stopped, or its export range does not include past days) | On the iPhone, open Health Auto Export, run the automation and check that its export range covers the last few days. The day is re-processed automatically for 30 days; after that run `./bin/ihealth-run --publisher obsidian --date <day>`. |
+| Reminder "HAE オートメーション停止の疑い" | The iPhone automation has not exported for more than 3 days | On the iPhone, open Health Auto Export, check the automation is enabled and iCloud Drive is syncing, and run it once. The next run fills the last 7 days (and the days still in the ledger); for a longer gap run `./bin/ihealth-run --publisher obsidian --from <first missing day> --sources health`. |
+| Yesterday's health values still provisional (`provisional` in the report) | Yesterday's latest automation file was written before midnight; its values were written as provisional | Usually nothing: a scheduled run replaces them once Health Auto Export re-exports the day (open the app to speed it up). If they are still provisional more than 3 days after they were first written, the 要確認 reminder below tells you. |
+| Reminder "日記の暫定値が確定していません (要確認)" or "日記の値が確定していません (要確認)" | Values have not settled for more than 3 days; the reminder lists the dates, keys and reasons with a hint for each | `provisional`: on the iPhone, open Health Auto Export, run the automation and check that its export range covers the last few days. `weather_pending` / `weather_incomplete`: JMA may be missing data; fill the value in yourself if you need it. `github_incomplete`: see the GitHub row. `withheld`: fill the value in yourself if you need it. `unwritable`: see the comment row. Days are re-processed automatically for 30 days; after that run `./bin/ihealth-run --publisher obsidian --date <day>`. |
+| A health key is not written, `not_final` in the report | The value would come from an AutoSync `.hae` written before the day ended; a stopped AutoSync never re-exports it (reason `withheld` in the ledger) | Fill the value in yourself if you need it; that also ends the tracking. |
+| A key is reported as `kept` with a warning `comment present …` or `duplicate key …` | The entry of one of the tool's keys has a comment (at the end of the key line, on a line of its own inside the entry, at the end of a continuation line, or after a `\|` / `>` header), or the key appears more than once. The tool does not rewrite that key; the other keys are written | Move the comment to its own line above the key, or merge the duplicate entries into one; the next run writes the key. |
 | Reminder "HAE オートメーション出力が見つかりません" | No `HealthAutoExport-YYYY-MM-DD.json` under `HEALTH_EXPORT_DIR` (or its parent when it points at `AutoSync`) | Point `HEALTH_EXPORT_DIR` at the Health Auto Export `Documents` folder and check the automation (iCloud Drive / JSON) on the iPhone. |
 | Note not updated (`note.status: missing`) | No `YYYY-MM-DD.md`, and the tool may not create it (`too_recent`, `create_disabled`) | Create the note in Obsidian (or set `OBSIDIAN_TEMPLATE`), then `./bin/ihealth-run --publisher obsidian --date <day>`. |
 | Reminder "日記ノートの確認が必要" | The note has no frontmatter and still contains Templater `<% … %>`, or the template cannot be used | Open the note in Obsidian and apply the template (or fix `OBSIDIAN_TEMPLATE`), then re-run that date. |
-| GitHub failure (`[github]`, token / partial) | `Github` was not written for the window (incomplete lists are never written) | `gh auth login` or fix `GITHUB_TOKEN`; check `GITHUB_OWNERS` / `GITHUB_EXCLUDE_REPOS` format; re-run `--sources github --from <d1> --to <d2>`. |
+| GitHub failure (`[github]`, token / partial) | `Github` was not written for the window (incomplete lists are never written); the days are tracked (`github_incomplete`) and filled by a later complete run | `gh auth login` or fix `GITHUB_TOKEN`; check `GITHUB_OWNERS` / `GITHUB_EXCLUDE_REPOS` format; re-run `--sources github --from <d1> --to <d2>`. |
 | Weather failure (`[weather]`) | JMA unreachable / page layout changed, or two or more past days in a row are still incomplete (including pages with no hourly rows — a closed station or wrong `JMA_PREC_NO` / `JMA_BLOCK_NO`) | Re-run later with `--sources weather --date <day>`; check the page in a browser. |
-| Exit 11, "日記の書き込み失敗" | The note could not be written (permissions, frontmatter Obsidian cannot read either such as a missing closing `---`, or it kept changing during the write) | Fix the note, then re-run that date. |
+| Exit 11, "日記の書き込み失敗" | The note could not be written: permissions; frontmatter Obsidian cannot read either, such as a missing closing `---`; the note kept changing during the write; the read-back after the write kept showing different content (another program saved the note right after each write — the reminder lists the backups taken before each write); or the pre-write check found a change outside the tool's keys (nothing was written — this is a bug, please report it) | Check the note (restore it from the backup if needed), then re-run that date. |
+| Exit 12, "日記の実行レポートを保存できません" / "日記の未確定の値の台帳を保存できません" | `logs/` or `data/` cannot be written (disk full, permissions). If the report could not be created at the start, no note was touched | Free up space or fix the permissions, then re-run (scheduled runs re-process the window). |
 | A note changed in a way you don't want | — | Restore it from `data/obsidian-backup/<UTC date>/<note>.<UTC time>.md` (saved before every overwrite, kept 30 days), or from Obsidian's File recovery / Obsidian Sync version history. |
 
+Before anything is written — before the backup and the temporary file, and
+also in `--dry-run` — a check that is implemented separately from the
+frontmatter editor compares the note before and after the edit: the body
+after the closing `---`, the `---` lines, and every frontmatter line outside
+the keys being written (other entries, entries left as they were, comment
+lines, blank lines) must be byte-identical and in the same order, and each
+written key must end up with exactly one entry. If not, nothing is written
+and the run fails (exit 11).
+
 The tool re-checks the note immediately before the atomic replace and
-starts over if Obsidian or another program changed it meanwhile (up to 3
-attempts in total, then it gives up without writing).
-A change made in the microseconds between that check and the replace cannot
-be detected (Obsidian offers no lock to share). The backup holds the content
-the tool edited, not such a last-moment change — recover that from
-Obsidian's File recovery core plugin or Obsidian Sync's version history.
+starts over if Obsidian or another program changed it meanwhile. After the
+replace (or after creating a note) it reads the note back: if the content is
+not what it wrote — another program saved the note right after — the write
+does not count as done; the tool re-reads the latest content and applies its
+values again. Both kinds of retry share one limit of 3 attempts in total; if
+the values still cannot be confirmed, the run fails (exit 11) and the
+reminder lists the backups taken before each write.
+A change made in the microseconds between the pre-replace check and the
+replace cannot be detected (Obsidian offers no lock to share). The backup
+holds the content the tool edited, not such a last-moment change — recover
+that from Obsidian's File recovery core plugin or Obsidian Sync's version
+history.
 
 ### GitHub scope
 
@@ -514,7 +643,8 @@ exists. The tool waits at least 1 second between requests to JMA.
 >   vault syncs (Obsidian Sync, iCloud, git, ...).
 > - **Obsidian backups**: before overwriting a note the tool copies it to
 >   `data/obsidian-backup/` (mode 0600, gitignored, kept 30 days) — these are
->   copies of your diary.
+>   copies of your diary. The ledger `data/diary-state.json` and the run
+>   reports in `logs/` also contain values written to your notes.
 > - **Obsidian diary requests**: the JMA request contains only the station and
 >   date; the GitHub GraphQL API is called with your token, which is never
 >   written to logs, reminders or run reports.
@@ -628,6 +758,12 @@ PYTHONPATH=src /usr/bin/python3 -m unittest discover tests
 ./bin/ihealth-run --date 2026-04-22
 ```
 
+`tests/test_e2e_diary.py` runs the whole Obsidian pipeline on synthetic
+fixtures (`tests/fixtures/e2e/`: automation JSON, JMA pages, GitHub GraphQL
+responses, diary notes) with only external I/O replaced — HTTP, `gh`, iCloud
+materialization, the clock and Reminders — for a normal day, the JST
+midnight boundary, a mid-day export and missing data.
+
 CI: see [`.github/workflows/ci.yml`](.github/workflows/ci.yml). Tests run
 on macOS + Linux against Python 3.9 / 3.10 / 3.11 / 3.12 (3.9 and 3.10 on
 Linux only, as the macOS arm64 runners no longer provide them).
@@ -647,8 +783,8 @@ Linux only, as the macOS arm64 runners no longer provide them).
 | 8 | `StdoutAppError` | stdout write failed (closed, encoding, …) |
 | 9 | `SQLiteAppError` | SQLite I/O / SQL / lock contention |
 | 10 | `SlackAppError` | Slack webhook HTTP failure |
-| 11 | `ObsidianAppError` | Obsidian: a diary note could not be written, or every source failed for every date |
-| 12 | `DiaryPartialFailureError` | Obsidian: some source failed for some dates, a note needs your attention, or `data/diary-state.json` could not be saved |
+| 11 | `ObsidianAppError` | Obsidian: a diary note could not be written (including a write that could not be confirmed by reading it back, and a write refused by the pre-write check), or every source failed for every date |
+| 12 | `DiaryPartialFailureError` | Obsidian: some source failed for some dates, a note needs your attention, or the run report / `data/diary-state.json` could not be saved (if the report cannot be created at the start, no note is written) |
 
 Exit codes 1 and 3–12 create a Reminders.app reminder so the failure stays
 visible until acknowledged (argument errors, exit 2, are only printed). For

@@ -1228,9 +1228,17 @@ class ProvisionalLedgerTest(DiaryTestBase):
             set(result.days[0].provisional_keys),
             {"歩数 (歩)", "睡眠時間 (分)", "アクティビティ詳細", "Github"},
         )
-        entry = self._ledger()["dates"][PROV_DAY.isoformat()]["keys"]
-        self.assertEqual(entry["歩数 (歩)"], 468)
-        self.assertEqual(entry["Github"], "該当なし")
+        # 台帳の形式 2 (W3-2d): キーごとに理由・初回検出日時 (この実行の開始 = 21 時 JST)・
+        # 本ツールが書いた暫定値 (形式 1 は値だけだった)
+        ledger = self._ledger()
+        self.assertEqual(ledger["version"], 2)
+        entry = ledger["dates"][PROV_DAY.isoformat()]["keys"]
+        self.assertEqual(
+            entry["歩数 (歩)"],
+            {"reason": "provisional", "since": "2030-01-16T12:00:00+00:00", "value": 468},
+        )
+        self.assertEqual(entry["Github"]["value"], "該当なし")
+        self.assertEqual(entry["Github"]["reason"], "provisional")
 
     def _final_loader(self, today: date) -> FakeLoader:
         return FakeLoader({PROV_DAY: health_ok(PROV_DAY, steps=9000)}, latest=today)
@@ -1535,7 +1543,8 @@ class MissingAutomationTest(DiaryTestBase):
         folder.mkdir()
         fixture = AUTOMATION_FIXTURES / "aggregated" / "HealthAutoExport-2030-01-15.json"
         shutil.copyfile(fixture, folder / fixture.name)
-        final = datetime(2030, 1, 16, 12, 0).timestamp()
+        # 対象日の終了後に書かれた出力 (tz 付きで指定して実行環境の tz に依存させない)
+        final = datetime(2030, 1, 16, 12, 0, tzinfo=timezone.utc).timestamp()
         os.utime(folder / fixture.name, (final, final))
         self.write_note(YESTERDAY)
         config = replace(self.config, health_export_dir=docs / "AutoSync", network_grace_sec=0.0)
@@ -1566,28 +1575,977 @@ class WeatherZeroRowsTest(DiaryTestBase):
 
 
 class ActivityDetailWithoutWorkoutsTest(DiaryTestBase):
-    """ワークアウトを出力しないオートメーションでは、既存のアクティビティ詳細を消さない。"""
+    """ワークアウトを出力しないオートメーション (W3-7)。
 
-    def test_existing_activity_detail_is_kept_byte_identical(self):
+    wave 2 までは「ワークアウト未出力ならアクティビティ詳細を書かない」だったが、W3-7 で
+    「Apple のエクササイズ時間 (apple_exercise_time) を "エクササイズN分" として書く」に変わり、
+    W3-7 改訂で「瞑想も運動も無い日は、心拍がある (Watch を着けていた) なら "なし"、心拍も無い
+    日だけ書かない (既存値を保持)」になった。実 HealthLoader + 実パーサで確かめる。
+    """
+
+    FIXTURE = AUTOMATION_FIXTURES / "aggregated" / "HealthAutoExport-2030-01-15.json"
+    ORIGINAL_DETAIL = 'アクティビティ詳細: "ジョギング34分"\n'
+
+    def _run_with_payload(self, payload: dict):
         docs = self.root / "Documents"
         folder = docs / "Sample Automation"
         folder.mkdir(parents=True)
-        fixture = AUTOMATION_FIXTURES / "aggregated" / "HealthAutoExport-2030-01-15.json"
-        shutil.copyfile(fixture, folder / fixture.name)
-        final = datetime(2030, 1, 16, 12, 0).timestamp()
-        os.utime(folder / fixture.name, (final, final))
-        original = note_text(YESTERDAY).replace("アクティビティ詳細:\n", 'アクティビティ詳細: "ジョギング34分"\n')
-        self.write_note(YESTERDAY, original)
+        path = folder / self.FIXTURE.name
+        path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+        # 対象日の終了後に書かれた (確定の) 出力。tz 付きで指定して実行環境の tz に依存させない
+        final = datetime(2030, 1, 16, 12, 0, tzinfo=timezone.utc).timestamp()
+        os.utime(path, (final, final))
+        self.write_note(
+            YESTERDAY, note_text(YESTERDAY).replace("アクティビティ詳細:\n", self.ORIGINAL_DETAIL),
+        )
         config = replace(self.config, health_export_dir=docs, network_grace_sec=0.0)
         deps = self.deps()
         deps.health_loader_factory = None   # 実 HealthLoader + 実パーサ
         deps.clock = lambda: datetime(2030, 1, 20, 3, 0, tzinfo=timezone.utc)
         options = DiaryOptions(dates=(YESTERDAY,), today=date(2030, 1, 20), sources=("health",))
-        result = run_diary(config, options, LOGGER, deps)
+        return run_diary(config, options, LOGGER, deps)
+
+    def _payload(self) -> dict:
+        return json.loads(self.FIXTURE.read_text(encoding="utf-8"))
+
+    def test_exercise_time_stands_in_for_unexported_workouts(self):
+        # fixture: 瞑想 2.6 + 3.0 分, エクササイズ時間 3 分, workouts なし
+        result = self._run_with_payload(self._payload())
+        text = self.read(YESTERDAY)
+        self.assertIn('"歩数 (歩)": 501\n', text)
+        self.assertIn('アクティビティ詳細: "瞑想6分、エクササイズ3分"\n', text)
+        self.assertEqual(result.days[0].keys["アクティビティ詳細"]["action"], "update")
+
+    def test_existing_activity_detail_is_kept_without_any_activity_data(self):
+        # 瞑想・エクササイズ時間に加えて心拍も無い (Watch を着けていない) 日 → 書かない (既存値を保持)。
+        # W3-7 改訂で「なし」の根拠が心拍になったので、心拍も取り除く (心拍がある日は下の
+        # test_heart_rate_without_activity_records_writes_nashi)
+        payload = self._payload()
+        payload["data"]["metrics"] = [
+            metric for metric in payload["data"]["metrics"]
+            if metric["name"] not in ("mindful_minutes", "apple_exercise_time", "heart_rate")
+        ]
+        result = self._run_with_payload(payload)
         text = self.read(YESTERDAY)
         self.assertIn('"歩数 (歩)": 501\n', text, "他の健康キーは書く")
-        self.assertIn('アクティビティ詳細: "ジョギング34分"\n', text)
+        self.assertIn(self.ORIGINAL_DETAIL, text, "瞑想も運動も心拍も無ければ書かない")
         self.assertEqual(result.days[0].keys["アクティビティ詳細"]["action"], "missing")
+
+    def test_heart_rate_without_activity_records_writes_nashi(self):
+        # 実際の HAE の運動 0 分の日 (apple_exercise_time / mindful_minutes の出力なし、心拍あり)
+        # → Watch を着けていて運動 0 分 = 「なし」を書く (既定 window の中なので既存値を上書きする。
+        # 旧: 運動のデータが無いので書かない。WAVE3 W3-7 改訂で意図的に変更)
+        payload = self._payload()
+        payload["data"]["metrics"] = [
+            metric for metric in payload["data"]["metrics"]
+            if metric["name"] not in ("mindful_minutes", "apple_exercise_time")
+        ]
+        result = self._run_with_payload(payload)
+        text = self.read(YESTERDAY)
+        self.assertIn('"歩数 (歩)": 501\n', text)
+        self.assertIn('アクティビティ詳細: "なし"\n', text)
+        self.assertEqual(result.days[0].keys["アクティビティ詳細"]["action"], "update")
+        self.assertEqual(result.days[0].keys["アクティビティ詳細"]["old"], '"ジョギング34分"')
+
+    def test_meditation_without_exercise_data_writes_meditation_only(self):
+        # W3-7 改訂の規則 1 (瞑想 ≥1 分なら "瞑想N分") どおり、エクササイズ時間のデータが無い日でも
+        # 瞑想は書く (既定 window の中なので既存値を上書きする)。「書かない (None)」は瞑想も運動も
+        # 無く心拍も無い日だけの規則 (リーダー決定で確定)
+        payload = self._payload()
+        payload["data"]["metrics"] = [
+            metric for metric in payload["data"]["metrics"]
+            if metric["name"] != "apple_exercise_time"
+        ]
+        result = self._run_with_payload(payload)
+        self.assertIn('アクティビティ詳細: "瞑想6分"\n', self.read(YESTERDAY))
+        self.assertEqual(result.days[0].keys["アクティビティ詳細"]["action"], "update")
+        self.assertEqual(result.days[0].keys["アクティビティ詳細"]["old"], '"ジョギング34分"')
+
+
+# ======================================================================
+# 未確定の値の台帳 (W3-2d): 暫定値だけでなく、保留・天気の公開待ち / 未完成・
+# GitHub の取得不完全も、確定するまで追跡する
+# ======================================================================
+
+
+#: 台帳のテストの「今日」。
+T0 = date(2030, 1, 16)
+
+
+class UnresolvedLedgerTest(DiaryTestBase):
+    """暫定値以外の未確定 (保留 / 天気 / GitHub) も台帳で追跡し、window の外でも埋める。"""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.config = replace(self.config, network_grace_sec=0.0)
+        self.ledger_path = self.root / "data" / "diary-state.json"
+
+    def _run(
+        self,
+        today: date,
+        dates: "tuple[date, ...]",
+        *,
+        loader: "FakeLoader | None" = None,
+        weather: "Callable[..., WeatherSummary] | None" = None,
+        github: "Callable[..., GitHubActivity] | None" = None,
+        sources: "tuple[str, ...]" = ("weather",),
+        revisit: bool = True,
+        hour: int = 12,
+    ):
+        self.weather_today = today
+        deps = self.deps(loader=loader, weather=weather, github=github)
+        deps.clock = lambda: datetime.combine(today, time(hour, 0), tzinfo=JST)
+        options = DiaryOptions(
+            dates=dates, today=today, sources=sources, revisit_unresolved=revisit,
+        )
+        return run_diary(self.config, options, LOGGER, deps)
+
+    @staticmethod
+    def _window(today: date) -> "tuple[date, ...]":
+        return resolve_dates(today=today, lookback_days=7, include_today=True)
+
+    def _ledger_dates(self) -> dict:
+        return json.loads(self.ledger_path.read_text(encoding="utf-8"))["dates"]
+
+    @staticmethod
+    def _day(result, d: date):
+        return next(day for day in result.days if day.date == d)
+
+    def test_pending_weather_is_tracked_and_filled_after_the_window(self):
+        day = T0 - timedelta(days=1)
+        self.write_note(day)
+
+        def pending(d: date, **kwargs: Any) -> WeatherSummary:
+            return weather_incomplete(d, pending=True)
+
+        first = self._run(T0, self._window(T0), weather=pending)
+        self.assertEqual(first.exit_code, 0, "公開待ちは失敗ではない")
+        self.assertEqual(self.notifications, [])
+        keys = self._ledger_dates()[day.isoformat()]["keys"]
+        self.assertEqual(set(keys), {"気温", "湿度", "気圧", "天気", "日照時間", "降水量"})
+        self.assertEqual(
+            keys["気温"], {"reason": "weather_pending", "since": "2030-01-16T03:00:00+00:00"},
+        )
+        self.assertEqual(self._day(first, day).unresolved["天気"], "weather_pending")
+        self.assertTrue(self._day(first, day).tracked)
+
+        later = T0 + timedelta(days=8)   # day は 7 日の window の外
+        self.assertNotIn(day, self._window(later))
+        second = self._run(later, self._window(later))
+        self.assertIn(day, second.dates, "未確定の天気がある日は window の外でも処理する")
+        self.assertIn('天気: "3時: 晴れ☀️, 6時: 曇☁️"\n', self.read(day))
+        self.assertEqual(self._day(second, day).keys["天気"]["resolved"], "weather_pending")
+        self.assertNotIn(day.isoformat(), self._ledger_dates(), "埋まったら台帳から外れる")
+
+    def test_incomplete_weather_day_needs_attention_after_three_days_unresolved(self):
+        # 「3 日超」は初回検出から数える: 対象日 (T0 の 3 日前) から数えると、初めて見つけた
+        # 実行でいきなり要確認になってしまう (backfill した直近の日など)
+        day = D2
+        self.write_note(day)
+
+        def incomplete(d: date, **kwargs: Any) -> WeatherSummary:
+            return weather_incomplete(d, pending=False) if d == day else weather_ok(d)
+
+        first = self._run(T0, (day,), weather=incomplete, revisit=False)
+        self.assertEqual(first.exit_code, 0, "1 日だけの未完成は失敗ではない")
+        self.assertEqual(self._day(first, day).unresolved["気温"], "weather_incomplete")
+        self.assertEqual(first.report["provisional"]["overdue"], {})
+        self.assertEqual(self.notifications, [])
+
+        three_days = T0 + timedelta(days=3)
+        not_yet = self._run(three_days, self._window(three_days), weather=incomplete)
+        self.assertEqual(self.notifications, [], "初回検出から 3 日ちょうどではまだ知らせない")
+        self.assertEqual(not_yet.report["provisional"]["overdue"], {})
+        self.assertEqual(
+            self._ledger_dates()[day.isoformat()]["keys"]["気温"]["since"],
+            "2030-01-16T03:00:00+00:00", "初回検出日時は引き継ぐ",
+        )
+
+        four_days = T0 + timedelta(days=4)
+        result = self._run(four_days, self._window(four_days), weather=incomplete)
+        self.assertEqual(result.exit_code, 0, "要確認の通知は終了コードを変えない")
+        self.assertEqual(len(self.notifications), 1)
+        title, body = self.notifications[0]
+        self.assertIn("要確認", title)
+        self.assertIn(day.isoformat(), body)
+        self.assertIn("天気が未完成", body)
+        self.assertIn("気温", body)
+        self.assertIn("気象庁", body, "理由に応じて確かめることを書く")
+        self.assertEqual(
+            result.report["provisional"]["overdue"][day.isoformat()]["天気"], "weather_incomplete",
+        )
+        self._run(four_days, self._window(four_days), weather=incomplete)
+        self.assertEqual(len(self.notifications), 1, "同じ日には 1 回だけ")
+
+    def test_incomplete_github_is_tracked_until_collection_completes(self):
+        self.write_note(D2, note_text(D2, github='"既存の値"'))
+
+        def partial(client: Any, start: date, end: date, **kwargs: Any) -> GitHubActivity:
+            return GitHubActivity(
+                days={start + timedelta(days=i): [] for i in range((end - start).days + 1)},
+                complete=False, errors=["owner/repo: HTTP 502"], repos_scanned=3,
+                repos_failed=1, owners_listed=1,
+            )
+
+        first = self._run(T0, (D2,), github=partial, sources=("github",), revisit=False)
+        self.assertEqual(first.exit_code, 12)
+        self.assertIn('Github: "既存の値"\n', self.read(D2))
+        self.assertEqual(
+            self._ledger_dates()[D2.isoformat()]["keys"]["Github"],
+            {"reason": "github_incomplete", "since": "2030-01-16T03:00:00+00:00"},
+        )
+
+        later = T0 + timedelta(days=8)
+        second = self._run(later, self._window(later), sources=("github",))
+        self.assertIn(D2, second.dates)
+        # window の外は fill-only: 本ツールが書いた暫定値ではない既存値は上書きしない
+        self.assertIn('Github: "既存の値"\n', self.read(D2))
+        self.assertEqual(self._day(second, D2).keys["Github"]["action"], "kept")
+        self.assertNotIn(D2.isoformat(), self._ledger_dates(), "取りきれたら台帳から外れる")
+
+    def test_failed_github_collection_is_tracked_as_incomplete(self):
+        self.write_note(D2)
+        result = self._run(T0, (D2,), github=lambda c, s, e, **k: github_failed([s]),
+                           sources=("github",), revisit=False)
+        self.assertEqual(result.days[0].unresolved, {"Github": "github_incomplete"})
+        self.assertIn(D2.isoformat(), self._ledger_dates())
+
+    def test_withheld_health_keys_are_tracked_and_filled_when_final(self):
+        self.write_note(D2)
+        withheld = HealthLoadResult(
+            health=DailyHealthData(date=D2, step_count=500),
+            activity_detail=None, source="automation", detail="synthetic",
+            status=STATUS_COMPLETE, withheld_fields=("sleep_hours",),
+        )
+        first = self._run(T0, (D2,), loader=FakeLoader({D2: withheld}),
+                          sources=("health",), revisit=False)
+        self.assertEqual(first.exit_code, 0, "保留は失敗ではない")
+        self.assertEqual(first.days[0].unresolved, {"睡眠時間 (分)": "withheld"})
+        self.assertEqual(
+            self._ledger_dates()[D2.isoformat()]["keys"],
+            {"睡眠時間 (分)": {"reason": "withheld", "since": "2030-01-16T03:00:00+00:00"}},
+        )
+        self.assertIn('"睡眠時間 (分)":\n', self.read(D2))
+
+        later = T0 + timedelta(days=8)
+        second = self._run(later, self._window(later), loader=FakeLoader({D2: health_ok(D2)}),
+                           sources=("health",))
+        self.assertIn(D2, second.dates)
+        self.assertIn('"睡眠時間 (分)": 450\n', self.read(D2))
+        self.assertEqual(self._day(second, D2).keys["睡眠時間 (分)"]["resolved"], "withheld")
+        self.assertEqual(self._ledger_dates(), {})
+
+    def test_unresolved_keys_older_than_revisit_period_are_reported_not_tracked(self):
+        # 30 日より前 (過去分の backfill): 自動では処理し直せないので台帳には入れず、1 回知らせる
+        old = T0 - timedelta(days=PROVISIONAL_REVISIT_DAYS + 10)
+        self.write_note(old)
+
+        def incomplete(d: date, **kwargs: Any) -> WeatherSummary:
+            return weather_incomplete(d, pending=False)
+
+        result = self._run(T0, (old,), weather=incomplete, revisit=False)
+        self.assertEqual(result.exit_code, 0)
+        self.assertFalse(result.days[0].tracked)
+        self.assertEqual(result.days[0].unresolved["気温"], "weather_incomplete")
+        self.assertEqual(
+            result.report["provisional"]["untracked"][old.isoformat()]["気温"], "weather_incomplete",
+        )
+        self.assertEqual(result.report["provisional"]["expired"], {}, "追跡していないので「やめた」ではない")
+        self.assertFalse(self.ledger_path.exists())
+        self.assertEqual(len(self.notifications), 1)
+        title, body = self.notifications[0]
+        self.assertIn("要確認", title)
+        self.assertIn(old.isoformat(), body)
+        self.assertIn("自動では処理し直しません", body)
+        self._run(T0, (old,), weather=incomplete, revisit=False)
+        self.assertEqual(len(self.notifications), 1, "同じ日には 1 回だけ")
+
+    def test_format_1_ledger_is_read_and_rewritten_as_format_2(self):
+        # wave 2 までの台帳 (キー → 暫定値) も読める。初回検出日時は不明なので日付から数える
+        day = T0 - timedelta(days=10)
+        self.write_note(day, note_text(day, steps="468").replace(
+            "Github:\n", 'Github: "該当なし"\n'))
+        self.ledger_path.parent.mkdir(parents=True, exist_ok=True)
+        self.ledger_path.write_text(json.dumps({
+            "version": 1,
+            "dates": {day.isoformat(): {"keys": {"歩数 (歩)": 468, "Github": "該当なし"}}},
+        }, ensure_ascii=False), encoding="utf-8")
+        loader = FakeLoader({day: health_ok(day, steps=9000)})
+        result = self._run(T0, self._window(T0), loader=loader, sources=("health",))
+        self.assertIn(day, result.dates)
+        self.assertIn('"歩数 (歩)": 9000\n', self.read(day), "形式 1 の暫定値のままなら置き換える")
+        saved = json.loads(self.ledger_path.read_text(encoding="utf-8"))
+        self.assertEqual(saved["version"], 2)
+        self.assertEqual(
+            saved["dates"][day.isoformat()]["keys"],
+            {"Github": {"reason": "provisional", "since": None, "value": "該当なし"}},
+            "GitHub は今回処理していないので追跡を続ける",
+        )
+        self.assertEqual(
+            result.report["provisional"]["overdue"][day.isoformat()], {"Github": "provisional"},
+        )
+
+
+class PartialDayExportLedgerTest(DiaryTestBase):
+    """日の途中で書き出された HAE の出力 (W3-2h: 終わった日でも暫定値として返る) を、
+    実 HealthLoader 経由で暫定値として書き、確定した出力が来たら台帳から外す。"""
+
+    def test_partial_export_of_a_past_day_is_tracked_until_final(self):
+        docs = self.root / "Documents"
+        folder = docs / "Sample Automation"
+        folder.mkdir(parents=True)
+        fixture = AUTOMATION_FIXTURES / "aggregated" / "HealthAutoExport-2030-01-15.json"
+        target = folder / fixture.name
+        shutil.copyfile(fixture, target)
+        # 対象日 (record の offset +09:00) の終わりより前 = 途中経過の出力
+        partial = datetime(2030, 1, 15, 21, 0, tzinfo=JST).timestamp()
+        os.utime(target, (partial, partial))
+        self.write_note(YESTERDAY)
+        config = replace(self.config, health_export_dir=docs, network_grace_sec=0.0)
+        later_today = date(2030, 1, 17)
+        deps = self.deps()
+        deps.health_loader_factory = None   # 実 HealthLoader + 実パーサ
+        deps.clock = lambda: datetime(2030, 1, 17, 3, 0, tzinfo=timezone.utc)
+        options = DiaryOptions(dates=(YESTERDAY,), today=later_today, sources=("health",))
+        ledger_path = self.root / "data" / "diary-state.json"
+
+        first = run_diary(config, options, LOGGER, deps)
+        day = first.days[0]
+        self.assertTrue(day.provisional)
+        self.assertIn('"歩数 (歩)": 501\n', self.read(YESTERDAY), "途中経過でも値は書く")
+        self.assertEqual(day.unresolved["歩数 (歩)"], "provisional")
+        self.assertIn("歩数 (歩)", day.provisional_keys)
+        keys = json.loads(ledger_path.read_text(encoding="utf-8"))["dates"]["2030-01-15"]["keys"]
+        self.assertEqual(keys["歩数 (歩)"]["value"], 501)
+        self.assertEqual(first.exit_code, 0)
+
+        # 日付が変わった後に書き直された (確定の) 出力が来た
+        final = datetime(2030, 1, 16, 1, 0, tzinfo=JST).timestamp()
+        os.utime(target, (final, final))
+        second = run_diary(config, options, LOGGER, deps)
+        self.assertFalse(second.days[0].provisional)
+        self.assertEqual(second.days[0].unresolved, {})
+        self.assertEqual(second.days[0].keys["歩数 (歩)"]["resolved"], "provisional")
+        self.assertEqual(json.loads(ledger_path.read_text(encoding="utf-8"))["dates"], {})
+
+
+# ======================================================================
+# 台帳から外れる条件 (wave 3 レビュー指摘): 利用者が書いた値 / 欠測で確定 / source を外した /
+# 書き換えられない暫定値 / 1 回だけ知らせる理由 / 一回きりの通知の取りこぼし
+# ======================================================================
+
+
+class _LedgerRuns:
+    """台帳のテストの共通処理 (:class:`DiaryTestBase` と組み合わせる)。"""
+
+    root: Path
+    config: Config
+
+    def _ledger_setup(self) -> None:
+        self.config = replace(self.config, network_grace_sec=0.0)
+        self.ledger_path = self.root / "data" / "diary-state.json"
+
+    def _run(
+        self,
+        today: date,
+        dates: "tuple[date, ...]",
+        *,
+        loader: "FakeLoader | None" = None,
+        weather: "Callable[..., WeatherSummary] | None" = None,
+        github: "Callable[..., GitHubActivity] | None" = None,
+        sources: "tuple[str, ...]" = ("weather",),
+        revisit: bool = True,
+        hour: int = 12,
+        config: "Config | None" = None,
+        notifier: "Callable[[str, str], Any] | None" = None,
+    ):
+        self.weather_today = today  # type: ignore[attr-defined]
+        deps = self.deps(loader=loader, weather=weather, github=github)  # type: ignore[attr-defined]
+        deps.clock = lambda: datetime.combine(today, time(hour, 0), tzinfo=JST)
+        if notifier is not None:
+            deps.notifier = notifier
+        options = DiaryOptions(
+            dates=dates, today=today, sources=sources, revisit_unresolved=revisit,
+        )
+        return run_diary(config or self.config, options, LOGGER, deps)
+
+    @staticmethod
+    def _window(today: date) -> "tuple[date, ...]":
+        return resolve_dates(today=today, lookback_days=7, include_today=True)
+
+    def _ledger(self) -> dict:
+        return json.loads(self.ledger_path.read_text(encoding="utf-8"))
+
+    @staticmethod
+    def _day(result, d: date):
+        return next(day for day in result.days if day.date == d)
+
+    def _edit_note(self, d: date, old: str, new: str) -> None:
+        path = self.diary / f"{d.isoformat()}.md"  # type: ignore[attr-defined]
+        text = path.read_text(encoding="utf-8")
+        assert old in text, old
+        path.write_text(text.replace(old, new, 1), encoding="utf-8")
+
+
+def _withheld_sleep(d: date) -> HealthLoadResult:
+    """睡眠だけ保留 (停止済み AutoSync の途中までの出力) した確定の結果。"""
+    return HealthLoadResult(
+        health=DailyHealthData(date=d, step_count=500), activity_detail=None,
+        source="automation", detail="synthetic", status=STATUS_COMPLETE,
+        withheld_fields=("sleep_hours",),
+    )
+
+
+class LedgerResolutionTest(_LedgerRuns, DiaryTestBase):
+    def setUp(self) -> None:
+        super().setUp()
+        self._ledger_setup()
+
+    def test_pending_weather_key_that_stays_missing_on_the_completed_page_is_dropped(self):
+        # finding: 公開待ちで追跡した天気が、完成したページで欠測 (降水量に ']' がある日など)
+        # だった → 台帳に 30 日残り、4 日目から毎日「天気の公開待ち」の要確認を送り続けていた
+        day = T0
+        self.write_note(day)
+
+        def weather(d: date, **kwargs: Any) -> WeatherSummary:
+            if d >= kwargs["today"]:
+                return weather_incomplete(d, pending=True)
+            return replace(weather_ok(d), precipitation=None)  # 完成した日。降水量だけ欠測
+
+        self._run(day, (day,), weather=weather, revisit=False)
+        self.assertEqual(
+            self._ledger()["dates"][day.isoformat()]["keys"]["降水量"]["reason"], "weather_pending",
+        )
+        nxt = day + timedelta(days=1)
+        second = self._run(nxt, self._window(nxt), weather=weather)
+        item = self._day(second, day).keys["降水量"]
+        self.assertEqual((item["action"], item["reason"]), ("missing", "no_value"))
+        self.assertEqual((item["resolved"], item["resolution"]), ("weather_pending", "no_value_final"))
+        self.assertIn('天気: "3時: 晴れ☀️, 6時: 曇☁️"\n', self.read(day))
+        self.assertIn("降水量:\n", self.read(day))
+        self.assertNotIn(day.isoformat(), self._ledger()["dates"])
+        for offset in range(2, 9):
+            later = day + timedelta(days=offset)
+            self._run(later, self._window(later), weather=weather)
+        self.assertEqual(self.notifications, [], "欠測で確定したキーの要確認を送り続けない")
+
+    def test_withheld_key_filled_by_hand_stops_being_tracked(self):
+        # finding: 保留のキーは自動では埋まらないのに、手で記入しても毎日要確認が来ていた
+        self.write_note(D2)
+        self._run(T0, (D2,), loader=FakeLoader({D2: _withheld_sleep(D2)}, latest=T0),
+                  sources=("health",), revisit=False)
+        self.assertEqual(
+            self._ledger()["dates"][D2.isoformat()]["keys"]["睡眠時間 (分)"]["reason"], "withheld",
+        )
+        self._edit_note(D2, '"睡眠時間 (分)":\n', '"睡眠時間 (分)": 420\n')
+        later = T0 + timedelta(days=1)
+        result = self._run(later, self._window(later),
+                           loader=FakeLoader({D2: _withheld_sleep(D2)}, latest=later),
+                           sources=("health",))
+        item = self._day(result, D2).keys["睡眠時間 (分)"]
+        self.assertEqual((item["resolved"], item["resolution"]), ("withheld", "user_value"))
+        self.assertEqual(self._ledger()["dates"], {})
+        self.assertIn('"睡眠時間 (分)": 420\n', self.read(D2), "手で書いた値には触らない")
+
+    def test_withheld_key_is_reported_once_then_tracked_quietly(self):
+        # finding: 保留のキーに 4 日目から 30 日目まで毎日要確認を送っていた → 1 回だけ知らせ、
+        # その後は黙って追跡を続ける (オートメーションが値を出せば埋まる)
+        self.write_note(D2)
+
+        def run(offset: int, result: "HealthLoadResult | None" = None):
+            today = T0 + timedelta(days=offset)
+            loader = FakeLoader({D2: result or _withheld_sleep(D2)}, latest=today)
+            window = (D2,) if offset == 0 else self._window(today)
+            return self._run(today, window, loader=loader, sources=("health",), revisit=offset > 0)
+
+        for offset in range(0, 4):
+            run(offset)
+        self.assertEqual(self.notifications, [], "3 日ちょうどまでは知らせない")
+        fourth = run(4)
+        self.assertEqual(len(self.notifications), 1)
+        title, body = self.notifications[0]
+        self.assertIn("要確認", title)
+        self.assertIn(f"{D2.isoformat()}: 睡眠時間 (分) (保留)", body)
+        self.assertIn("この 1 回だけ", body)
+        self.assertEqual(
+            fourth.report["provisional"]["overdue"][D2.isoformat()], {"睡眠時間 (分)": "withheld"},
+        )
+        self.assertIs(
+            self._ledger()["dates"][D2.isoformat()]["keys"]["睡眠時間 (分)"]["notified"], True,
+        )
+        for offset in (5, 6, 10):
+            later = run(offset)
+            self.assertEqual(
+                later.report["provisional"]["overdue"][D2.isoformat()], {"睡眠時間 (分)": "withheld"},
+                "レポートには残す",
+            )
+        self.assertEqual(len(self.notifications), 1, "保留の要確認は毎日は送らない")
+        self.assertIn(D2.isoformat(), self._ledger()["dates"], "追跡は続ける")
+        run(12, health_ok(D2))  # その後オートメーションが値を出した (window の外: fill-only)
+        self.assertIn('"睡眠時間 (分)": 450\n', self.read(D2))
+        self.assertEqual(self._ledger()["dates"], {})
+
+    def test_incomplete_weather_day_is_reported_once_and_cleared_by_a_manual_fill(self):
+        # 確定済みのはずの日の天気が未完成 (気象庁の欠測の疑い) も、自動ではまず埋まらないので
+        # 要確認は 1 回だけ。手で記入したキーは追跡をやめる
+        self.write_note(D2)
+
+        def incomplete(d: date, **kwargs: Any) -> WeatherSummary:
+            return weather_incomplete(d, pending=False) if d == D2 else weather_ok(d)
+
+        self._run(T0, (D2,), weather=incomplete, revisit=False)
+        for offset in (4, 5, 6):
+            today = T0 + timedelta(days=offset)
+            self._run(today, self._window(today), weather=incomplete)
+        self.assertEqual(len(self.notifications), 1)
+        self.assertIn("天気が未完成の日は、この 1 回だけ", self.notifications[0][1])
+        self._edit_note(D2, "気温:\n", "気温: 手で記入\n")
+        today = T0 + timedelta(days=7)
+        result = self._run(today, self._window(today), weather=incomplete)
+        item = self._day(result, D2).keys["気温"]
+        self.assertEqual((item["resolved"], item["resolution"]), ("weather_incomplete", "user_value"))
+        self.assertNotIn("気温", self._ledger()["dates"][D2.isoformat()]["keys"])
+        self.assertIn("湿度", self._ledger()["dates"][D2.isoformat()]["keys"])
+        self.assertEqual(len(self.notifications), 1)
+
+    def test_source_removed_from_settings_stops_tracking_its_keys(self):
+        # finding: source を外した後も、その source の未確定のキーを 30 日追跡して要確認を送っていた
+        self.write_note(D2)
+        self._run(T0, (D2,), github=lambda c, s, e, **k: github_failed([s]),
+                  sources=("github",), revisit=False)
+        self.assertIn(D2.isoformat(), self._ledger()["dates"])
+        # 一時的に --sources weather で走らせただけ (設定は github を含む): 次の定時実行が
+        # 処理するので追跡を続ける
+        nxt = T0 + timedelta(days=1)
+        one_off = self._run(nxt, self._window(nxt), sources=("weather",))
+        self.assertEqual(self._day(one_off, D2).unresolved, {"Github": "github_incomplete"})
+        # IHEALTH_SOURCES から github を外した: 今後も確定しないので追跡をやめる
+        config = replace(self.config, sources=("health", "weather"))
+        later = T0 + timedelta(days=2)
+        result = self._run(later, self._window(later), sources=("weather",), config=config)
+        item = self._day(result, D2).keys["Github"]
+        self.assertEqual((item["action"], item["reason"]), ("skipped", "source_not_selected"))
+        self.assertEqual((item["resolved"], item["resolution"]),
+                         ("github_incomplete", "source_deselected"))
+        self.assertEqual(self._ledger()["dates"], {})
+
+    def test_provisional_value_without_a_final_value_stays_tracked_until_cleared(self):
+        # 確定した出力にその値が無い: 本ツールの暫定値がノートに残っている間は追跡を続け
+        # (確定値の顔で黙って残さない)、利用者が消したら (埋める値も無いので) 追跡をやめる
+        self.write_note(T0)
+        self._run(T0, (T0,), loader=FakeLoader({T0: health_ok(T0, steps=1200, provisional=True)},
+                                                latest=T0),
+                  sources=("health",), revisit=False)
+        final = HealthLoadResult(
+            health=DailyHealthData(date=T0, sleep_hours=7.5), activity_detail="瞑想5分",
+            source="automation", detail="synthetic", status=STATUS_COMPLETE,
+        )
+        nxt = T0 + timedelta(days=1)
+        result = self._run(nxt, self._window(nxt), loader=FakeLoader({T0: final}, latest=nxt),
+                           sources=("health",))
+        self.assertEqual(self._day(result, T0).unresolved, {"歩数 (歩)": "provisional"})
+        self._edit_note(T0, '"歩数 (歩)": 1200\n', '"歩数 (歩)":\n')
+        later = T0 + timedelta(days=2)
+        result = self._run(later, self._window(later), loader=FakeLoader({T0: final}, latest=later),
+                           sources=("health",))
+        item = self._day(result, T0).keys["歩数 (歩)"]
+        self.assertEqual((item["resolved"], item["resolution"]), ("provisional", "no_value_final"))
+        self.assertEqual(self._ledger()["dates"], {})
+
+    def test_provisional_entry_that_became_unwritable_stays_tracked_and_is_reported(self):
+        # finding (+ e2e の報告): 暫定値の行が重複 (Obsidian Sync のマージ) / コメント付きに
+        # なると kept + warning で書けないのに「解決」として台帳から消え、暫定値が確定値の顔で
+        # 残っていた
+        self.write_note(T0)
+        self._run(T0, (T0,), loader=FakeLoader({T0: health_ok(T0, steps=1200, provisional=True)},
+                                                latest=T0),
+                  sources=("health",), revisit=False)
+        self._edit_note(T0, '"歩数 (歩)": 1200\n', '"歩数 (歩)": 1200\n歩数 (歩): 1200\n')
+        later = T0 + timedelta(days=4)
+        result = self._run(later, self._window(later),
+                           loader=FakeLoader({T0: health_ok(T0, steps=9876)}, latest=later),
+                           sources=("health",))
+        item = self._day(result, T0).keys["歩数 (歩)"]
+        self.assertEqual(item["action"], "kept")
+        self.assertTrue(item["warning"].startswith("duplicate key"), item["warning"])
+        self.assertEqual(item["unresolved"], "unwritable")
+        self.assertNotIn("resolved", item)
+        self.assertEqual(
+            self._ledger()["dates"][T0.isoformat()]["keys"],
+            {"歩数 (歩)": {"reason": "unwritable", "since": "2030-01-16T03:00:00+00:00", "value": 1200}},
+        )
+        self.assertEqual(len(self.notifications), 1)
+        title, body = self.notifications[0]
+        self.assertIn("要確認", title)
+        self.assertIn("歩数 (歩) (コメント / 重複キーのため書き換えられない)", body)
+        self.assertIn("1 つにまとめる", body)
+        # 利用者が 1 つにまとめた → 次の実行で確定値に置き換わり台帳から外れる
+        self._edit_note(T0, '"歩数 (歩)": 1200\n歩数 (歩): 1200\n', '"歩数 (歩)": 1200\n')
+        nxt = later + timedelta(days=1)
+        self._run(nxt, self._window(nxt), loader=FakeLoader({T0: health_ok(T0, steps=9876)}, latest=nxt),
+                  sources=("health",))
+        self.assertIn('"歩数 (歩)": 9876\n', self.read(T0))
+        self.assertEqual(self._ledger()["dates"], {})
+
+    def test_comment_added_to_a_provisional_value_depends_on_the_value(self):
+        # 暫定値の行にコメントが付いた: 値が暫定値のままなら書き換えられない (unwritable)、
+        # 利用者が値も書き換えていたら利用者の値 (追跡をやめる)
+        cases = (
+            (T0, "1200  # メモ", "unwritable"),
+            (T0 + timedelta(days=40), "5000  # 手で数えた", None),   # 別の日 (前の日は台帳の外)
+        )
+        for day, written, expected in cases:
+            with self.subTest(written=written):
+                self.write_note(day)
+                self._run(day, (day,),
+                          loader=FakeLoader({day: health_ok(day, steps=1200, provisional=True)},
+                                            latest=day),
+                          sources=("health",), revisit=False)
+                self._edit_note(day, '"歩数 (歩)": 1200\n', f'"歩数 (歩)": {written}\n')
+                nxt = day + timedelta(days=1)
+                result = self._run(nxt, (day,),
+                                   loader=FakeLoader({day: health_ok(day, steps=9876)}, latest=nxt),
+                                   sources=("health",), revisit=False)
+                item = self._day(result, day).keys["歩数 (歩)"]
+                self.assertEqual(item["action"], "kept")
+                self.assertTrue(item["warning"].startswith("comment present"), item["warning"])
+                self.assertEqual(item.get("unresolved"), expected)
+                entry = self._ledger()["dates"].get(day.isoformat(), {}).get("keys", {})
+                if expected is None:
+                    self.assertEqual(item["resolution"], "user_value")
+                    self.assertNotIn("歩数 (歩)", entry)
+                else:
+                    self.assertEqual(entry["歩数 (歩)"]["reason"], expected)
+                    self.assertEqual(entry["歩数 (歩)"]["value"], 1200)
+
+    def test_comment_on_a_value_the_user_wrote_is_not_tracked(self):
+        # 本ツールの暫定値が無い entry のコメント (W3-3 の kept + warning) は従来どおりレポートだけ
+        self.write_note(D2, note_text(D2, steps="777  # 手で測った"))
+        result = self._run(T0, (D2,), loader=FakeLoader({D2: health_ok(D2)}, latest=T0),
+                           sources=("health",), revisit=False)
+        item = result.days[0].keys["歩数 (歩)"]
+        self.assertEqual(item["action"], "kept")
+        self.assertTrue(item["warning"].startswith("comment present"), item["warning"])
+        self.assertNotIn("unresolved", item)
+        self.assertFalse(self.ledger_path.exists(), "追跡するものが無い")
+
+    def test_only_the_night_sleep_of_a_segment_day_is_tracked_as_provisional(self):
+        # finding: segment 形式の夜主睡眠が前日ファイル不足で暫定なだけなのに、その日の健康の
+        # キー全部を暫定値として台帳で追跡していた (実 HealthLoader + 実パーサ)
+        docs = self.root / "Documents"
+        folder = docs / "Sample Automation"
+        folder.mkdir(parents=True)
+        src = AUTOMATION_FIXTURES / "segments" / "HealthAutoExport-2030-02-02.json"
+        shutil.copyfile(src, folder / src.name)   # 前日 (02-01) のファイルは無い
+        final = datetime(2030, 2, 3, 12, 0, tzinfo=timezone.utc).timestamp()
+        os.utime(folder / src.name, (final, final))
+        day = date(2030, 2, 2)
+        self.write_note(day, note_text(day).replace('"睡眠時間 (分)":\n', '"睡眠時間 (分)":\n昼寝時間:\n'))
+        config = replace(self.config, health_export_dir=docs)
+        deps = self.deps()
+        deps.health_loader_factory = None   # 実 HealthLoader
+        deps.clock = lambda: datetime(2030, 2, 5, 3, 0, tzinfo=timezone.utc)
+        options = DiaryOptions(dates=(day,), today=date(2030, 2, 5), sources=("health",))
+        result = run_diary(config, options, LOGGER, deps)
+        (report,) = result.days
+        self.assertTrue(report.provisional)
+        self.assertEqual(report.source_details["health"]["provisional_fields"], ["sleep_hours"])
+        self.assertEqual(report.unresolved, {"睡眠時間 (分)": "provisional"})
+        self.assertIn('"歩数 (歩)": 2000\n', self.read(day))
+        self.assertEqual(
+            list(self._ledger()["dates"][day.isoformat()]["keys"]), ["睡眠時間 (分)"],
+        )
+
+    def test_health_loader_gets_an_aware_clock(self):
+        # e2e の報告: Mac のローカル時刻 (naive) に直して渡していたため、夏時間の切り替わり
+        # (同じ壁時計の時刻が 2 回ある 1 時間) で日の終わりの判定がずれていた
+        self.write_note(D2)
+        seen: "list[datetime]" = []
+        moment = datetime(2030, 4, 6, 15, 20, tzinfo=timezone.utc)
+
+        def factory(config: Config, logger: logging.Logger, now: "Callable[[], datetime]") -> FakeLoader:
+            seen.append(now())
+            return FakeLoader({D2: health_ok(D2)})
+
+        deps = self.deps()
+        deps.health_loader_factory = factory
+        deps.clock = lambda: moment
+        self.run_diary((D2,), deps, sources=("health",))
+        self.assertEqual(len(seen), 1)
+        self.assertIsNotNone(seen[0].utcoffset(), "aware のまま渡す")
+        self.assertEqual(seen[0], moment)
+        naive = self.deps()
+        naive.health_loader_factory = factory
+        naive.clock = lambda: moment.replace(tzinfo=None)   # naive な時計は UTC とみなす
+        self.run_diary((D2,), naive, sources=("health",))
+        self.assertEqual(seen[1], moment)
+        self.assertIsNotNone(seen[1].utcoffset())
+
+
+class OneShotNoticeTest(_LedgerRuns, DiaryTestBase):
+    """一回きりの「要確認」(台帳から外した日 / 追跡しない古い日) を取りこぼさない。"""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self._ledger_setup()
+
+    @staticmethod
+    def _incomplete(d: date, **kwargs: Any) -> WeatherSummary:
+        return weather_incomplete(d, pending=False)
+
+    def test_untracked_days_found_after_an_earlier_notice_today_are_still_reported(self):
+        # finding: 朝の実行がデータの鮮度の通知 (停止の疑い) を送った日は、後の backfill で
+        # 見つかった 30 日より前の未確定の値 (台帳に入れず 1 回だけ知らせる約束) が日付だけの
+        # 抑止で通知されずに失われていた
+        self.write_note(T0)
+        stale = FakeLoader({T0: health_ok(T0, provisional=True)}, latest=T0 - timedelta(days=5))
+        self._run(T0, (T0,), loader=stale, sources=("health",), revisit=False, hour=7)
+        self.assertEqual(len(self.notifications), 1)
+        self.assertIn("停止の疑い", self.notifications[0][0])
+        old = T0 - timedelta(days=PROVISIONAL_REVISIT_DAYS + 10)
+        self.write_note(old)
+        result = self._run(T0, (old,), weather=self._incomplete, revisit=False, hour=10)
+        self.assertEqual(len(self.notifications), 2, "朝の通知とは別の内容なので送る")
+        title, body = self.notifications[1]
+        self.assertIn("要確認", title)
+        self.assertIn(old.isoformat(), body)
+        self.assertIn("自動では処理し直しません", body)
+        self.assertNotIn("停止の疑い", body, "今日すでに送った部分は繰り返さない")
+        self.assertIs(result.report["notifications"]["stale"]["delivered"], True)
+        again = self._run(T0, (old,), weather=self._incomplete, revisit=False, hour=11)
+        self.assertEqual(len(self.notifications), 2, "同じ内容は同じ日に 2 回送らない")
+        self.assertTrue(again.report["notifications"]["stale"]["suppressed"])
+
+    def test_expired_days_are_reported_again_when_the_reminder_could_not_be_created(self):
+        # finding: 台帳から外した (30 日超) 日を、リマインダーを作れなかった実行の前に台帳から
+        # 消していたため、次の実行で知らせる内容が無くなっていた
+        day = T0 - timedelta(days=PROVISIONAL_REVISIT_DAYS + 1)
+        self.ledger_path.parent.mkdir(parents=True, exist_ok=True)
+        self.ledger_path.write_text(json.dumps({"version": 2, "dates": {day.isoformat(): {"keys": {
+            "気温": {"reason": "weather_incomplete", "since": "2029-12-10T00:00:00+00:00"},
+        }}}}), encoding="utf-8")
+        attempts: "list[str]" = []
+        yesterday = (T0 - timedelta(days=1),)
+        first = self._run(T0, yesterday, notifier=lambda title, body: attempts.append(body) or False)
+        self.assertEqual(len(attempts), 1)
+        self.assertIn(day.isoformat(), attempts[0])
+        self.assertIs(first.report["notifications"]["stale"]["delivered"], False)
+        saved = self._ledger()
+        self.assertEqual(saved["dates"], {})
+        self.assertEqual(
+            saved["unreported"], {"expired": {day.isoformat(): {"気温": "weather_incomplete"}}},
+            "送れなかった一回きりの通知は台帳に残す",
+        )
+        second = self._run(T0, yesterday, hour=13)
+        self.assertEqual(len(self.notifications), 1)
+        self.assertIn(day.isoformat(), self.notifications[0][1])
+        self.assertIn("自動の再処理をやめました", self.notifications[0][1])
+        self.assertEqual(
+            second.report["provisional"]["carried_over"],
+            {"expired": {day.isoformat(): {"気温": "weather_incomplete"}}},
+        )
+        self.assertNotIn("unreported", self._ledger(), "送れたら台帳から消す")
+        self._run(T0, yesterday, hour=14)
+        self.assertEqual(len(self.notifications), 1)
+
+    def test_untracked_days_survive_a_failed_reminder(self):
+        old = T0 - timedelta(days=PROVISIONAL_REVISIT_DAYS + 10)
+        self.write_note(old)
+        self._run(T0, (old,), weather=self._incomplete, revisit=False,
+                  notifier=lambda title, body: False)
+        self.assertEqual(
+            set(self._ledger()["unreported"]["untracked"][old.isoformat()]),
+            {"気温", "湿度", "気圧", "天気", "日照時間", "降水量"},
+        )
+        self.assertEqual(self._ledger()["dates"], {}, "台帳 (追跡) には入れない")
+        nxt = T0 + timedelta(days=1)
+        self._run(nxt, (nxt - timedelta(days=1),), weather=lambda d, **k: weather_ok(d))
+        self.assertEqual(len(self.notifications), 1)
+        self.assertIn(old.isoformat(), self.notifications[0][1])
+        self.assertNotIn("unreported", self._ledger())
+
+    def test_carried_item_found_again_is_sent_once_and_cleared(self):
+        # 送れなかった項目と同じ内容をこの実行でも見つけた (同じ古い日の backfill をやり直した)
+        old = T0 - timedelta(days=PROVISIONAL_REVISIT_DAYS + 10)
+        self.write_note(old)
+        self._run(T0, (old,), weather=self._incomplete, revisit=False,
+                  notifier=lambda title, body: False)
+        self.assertIn("unreported", self._ledger())
+        nxt = T0 + timedelta(days=1)
+        self._run(nxt, (old,), weather=self._incomplete, revisit=False)
+        self.assertEqual(len(self.notifications), 1)
+        self.assertEqual(self.notifications[0][1].count(old.isoformat()), 1, "同じ日を 2 回並べない")
+        self.assertNotIn("unreported", self._ledger(), "送れたら繰り越しも消す")
+        later = T0 + timedelta(days=2)
+        self._run(later, (later - timedelta(days=1),), weather=lambda d, **k: weather_ok(d))
+        self.assertEqual(len(self.notifications), 1)
+
+    def test_dry_run_does_not_touch_unreported_items(self):
+        day = T0 - timedelta(days=PROVISIONAL_REVISIT_DAYS + 1)
+        self.ledger_path.parent.mkdir(parents=True, exist_ok=True)
+        payload = json.dumps({"version": 2, "dates": {}, "unreported": {"expired": {
+            day.isoformat(): {"気温": "weather_incomplete"},
+        }}})
+        self.ledger_path.write_text(payload, encoding="utf-8")
+        self.weather_today = T0
+        deps = self.deps()
+        deps.clock = lambda: datetime.combine(T0, time(12, 0), tzinfo=JST)
+        options = DiaryOptions(dates=(T0 - timedelta(days=1),), today=T0, sources=("weather",),
+                               dry_run=True, revisit_unresolved=True)
+        result = run_diary(self.config, options, LOGGER, deps)
+        self.assertEqual(self.notifications, [])
+        self.assertTrue(result.report["notifications"]["stale"]["dry_run"])
+        self.assertEqual(self.ledger_path.read_text(encoding="utf-8"), payload)
+        # 今日すでに送った (台帳から消すのに失敗して残っている) 項目でも、dry-run は台帳を書かない
+        from ihealth.diary import ONE_SHOT_EXPIRED, _OneShot
+        sent = _OneShot(ONE_SHOT_EXPIRED, day, (("気温", "weather_incomplete"),)).signature()
+        self.logs.mkdir(parents=True, exist_ok=True)
+        (self.logs / ".freshness_notified").write_text(
+            json.dumps({"date": T0.isoformat(), "signatures": [sent]}), encoding="utf-8",
+        )
+        again = run_diary(self.config, options, LOGGER, deps)
+        self.assertTrue(again.report["notifications"]["stale"]["suppressed"])
+        self.assertEqual(self.ledger_path.read_text(encoding="utf-8"), payload)
+
+
+# ======================================================================
+# 実行レポート (W3-5): 開始時に予定の日付一覧で作り、日付ごとに journal へ追記する
+# ======================================================================
+
+
+class RunReportTest(DiaryTestBase):
+    """途中で落ちても / 保存に失敗しても、全数台帳 (予定 = 処理済み + 未処理) が残る。"""
+
+    def _files(self) -> "tuple[list[Path], list[Path]]":
+        return (
+            sorted(self.logs.glob("diary-report-*.json")),
+            sorted(self.logs.glob("diary-report-*.jsonl")),
+        )
+
+    @staticmethod
+    def _lines(path: Path) -> "list[dict]":
+        return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+
+    def test_finished_report_lists_planned_dates_and_drops_the_journal(self):
+        for d in (D2, D3):
+            self.write_note(d)
+        result = self.run_diary((D2, D3), self.deps(), sources=("health",))
+        reports, journals = self._files()
+        self.assertEqual(reports, [result.report_path])
+        self.assertEqual(journals, [], "確定したら journal は消す (中身はレポートに入った)")
+        data = json.loads(result.report_path.read_text(encoding="utf-8"))
+        self.assertEqual(data["version"], 2)
+        self.assertEqual(data["status"], "finished")
+        self.assertEqual(data["planned_dates"], ["2030-01-13", "2030-01-14"])
+        self.assertEqual(data["processed"], 2)
+        self.assertEqual(data["remaining_dates"], [])
+        self.assertEqual([day["date"] for day in data["dates"]], ["2030-01-13", "2030-01-14"])
+
+    def test_crash_mid_run_leaves_planned_dates_and_processed_results(self):
+        for d in (D1, D2, D3):
+            self.write_note(d)
+
+        def load(d: date) -> HealthLoadResult:
+            if d == D2:
+                raise KeyboardInterrupt  # 途中でプロセスが止まった
+            return health_ok(d)
+
+        with self.assertRaises(KeyboardInterrupt):
+            self.run_diary((D1, D2, D3), self.deps(loader=FakeLoader(load)), sources=("health",))
+        reports, journals = self._files()
+        self.assertEqual(len(reports), 1)
+        self.assertEqual(len(journals), 1)
+        started = json.loads(reports[0].read_text(encoding="utf-8"))
+        self.assertEqual(started["status"], "running")
+        self.assertEqual(started["planned_dates"], ["2030-01-12", "2030-01-13", "2030-01-14"])
+        self.assertEqual(started["journal"], journals[0].name)
+        lines = self._lines(journals[0])
+        self.assertEqual([line["type"] for line in lines], ["start", "day"])
+        self.assertEqual(lines[0]["planned_dates"], started["planned_dates"])
+        self.assertEqual(lines[1]["date"], "2030-01-12")
+        self.assertEqual(lines[1]["keys"]["歩数 (歩)"]["action"], "update")
+        self.assertIn('"歩数 (歩)": 4321\n', self.read(D1))
+        self.assertEqual(self.read(D3), note_text(D3))
+
+    def test_journal_append_failure_stops_before_more_notes_are_changed(self):
+        for d in (D1, D2, D3):
+            self.write_note(d)
+        real_append = __import__("ihealth.diary", fromlist=["_append_jsonl"])._append_jsonl
+        calls = {"n": 0}
+
+        def flaky_append(path: Path, item: Any) -> None:
+            calls["n"] += 1
+            if calls["n"] == 3:   # start, D1 の後は書けたが D2 の後で容量不足
+                raise OSError(28, "No space left on device")
+            real_append(path, item)
+
+        with mock.patch("ihealth.diary._append_jsonl", side_effect=flaky_append):
+            result = self.run_diary((D1, D2, D3), self.deps(), sources=("health",))
+        self.assertEqual(result.exit_code, 12)
+        self.assertEqual([day.date for day in result.days], [D1, D2])
+        self.assertEqual(self.read(D3), note_text(D3), "記録できない書き換えはしない")
+        data = json.loads(result.report_path.read_text(encoding="utf-8"))
+        self.assertEqual(data["status"], "interrupted")
+        self.assertEqual(data["processed"], 2)
+        self.assertEqual(data["remaining_dates"], ["2030-01-14"])
+        # 全数台帳: 予定 N 日 = 処理済み (結果あり) + 未処理 (重複も漏れも無い)
+        processed = [day["date"] for day in data["dates"]]
+        self.assertEqual(processed, ["2030-01-12", "2030-01-13"])
+        self.assertEqual(sorted(processed + data["remaining_dates"]), data["planned_dates"])
+        self.assertEqual(len(self.notifications), 1)
+        title, body = self.notifications[0]
+        self.assertIn("実行レポート", title)
+        self.assertIn("残り 1 日は未処理", body)
+        self.assertIn("No space left on device", body)
+
+    def test_report_that_cannot_be_created_blocks_every_write(self):
+        self.write_note(D2)
+        self.logs.write_text("logs はファイルになっている", encoding="utf-8")
+        with self.assertLogs("test-diary", level="ERROR"):
+            result = self.run_diary((D2,), self.deps(), sources=("health", "github"))
+        self.assertEqual(result.exit_code, 12)
+        self.assertEqual(result.days, ())
+        self.assertIsNone(result.report_path)
+        self.assertEqual(self.read(D2), note_text(D2), "日記には一切触れない")
+        self.assertEqual(self.collector_calls, [], "ネットワーク待ち・GitHub の収集もしない")
+        self.assertEqual(self.probe_calls, [])
+        self.assertFalse((self.root / "data" / "obsidian-backup").exists())
+        self.assertFalse((self.root / "data" / "diary-state.json").exists())
+        self.assertEqual(len(self.notifications), 1)
+        title, body = self.notifications[0]
+        self.assertIn("実行レポートを保存できません", title)
+        self.assertIn("日記を更新しませんでした", body)
+        self.assertEqual(result.report["remaining_dates"], ["2030-01-13"])
+
+    def test_final_report_failure_is_a_failure_and_keeps_the_journal(self):
+        self.write_note(D2)
+        diary_module = __import__("ihealth.diary", fromlist=["_write_text_atomic"])
+        real_write = diary_module._write_text_atomic
+        report_writes: "list[str]" = []
+
+        def failing_final(path: Path, text: str) -> None:
+            if path.name.startswith("diary-report-") and path.suffix == ".json":
+                report_writes.append(path.name)
+                if len(report_writes) > 1:   # 開始時は書けたが、確定で容量不足
+                    raise OSError(28, "No space left on device")
+            real_write(path, text)
+
+        with mock.patch("ihealth.diary._write_text_atomic", side_effect=failing_final):
+            with self.assertLogs("test-diary", level="ERROR"):
+                result = self.run_diary((D2,), self.deps(), sources=("health",))
+        self.assertEqual(result.exit_code, 12, "台帳なしで成功終了しない")
+        self.assertIn('"歩数 (歩)": 4321\n', self.read(D2))
+        reports, journals = self._files()
+        self.assertEqual(len(journals), 1, "確定できなければ journal を残す")
+        lines = self._lines(journals[0])
+        self.assertEqual([line["type"] for line in lines], ["start", "day", "finish"])
+        self.assertEqual(lines[-1]["exit_code"], 12)
+        self.assertEqual(
+            json.loads(reports[0].read_text(encoding="utf-8"))["status"], "running",
+        )
+        title, body = self.notifications[0]
+        self.assertIn("実行レポートを保存できません", title)
+        self.assertIn(journals[0].name, body)
 
 
 class LaunchAgentScheduleTest(unittest.TestCase):

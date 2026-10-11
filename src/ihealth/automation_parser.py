@@ -12,10 +12,14 @@
         "workouts": [...]          # 任意 (オートメーションで含めた場合のみ)
     }}
 
-``data.workouts`` が **無い** 出力 (HAE のオートメーションでワークアウトを含めない設定 =
-``includeWorkouts=false``) では、その日にワークアウトがあったかを判断できない。
-そのためアクティビティ詳細は ``None`` (= 書かない) にする (``"なし"`` / ``"瞑想N分"`` と
-断定すると、実際にあったワークアウトを含む既存の値を上書きしてしまう)。
+アクティビティ詳細 (``"瞑想3分、エクササイズ21分"`` 等) は :func:`compose_activity_detail`
+の規則で組む: 瞑想 (合計 1 分以上) → ワークアウト (``data.workouts`` を出力している設定で
+当日のワークアウトがある日) / Apple のエクササイズ時間 (``apple_exercise_time``。ワークアウトを
+出力しない設定 = ``includeWorkouts=false``、または出力していて当日のワークアウトが無い日)。
+どれも無い日は **心拍のデータがある** (Watch を着けていた) なら ``"なし"``、無ければ ``None``
+(= 書かない)。HAE は運動 0 分の日に ``apple_exercise_time`` 自体を出力しない (qty 0 の
+record は出てこない) ので、「運動 0 分」と「記録なし」はエクササイズ時間ではなく心拍の
+有無で分ける。
 
 主対象は ``aggregateData=true`` (record = 1 分集計) / ``aggregateSleep=true``
 (睡眠は 1 日 1 レコードの集計値) の設定。非集計の睡眠 segment 形式
@@ -48,7 +52,7 @@ import statistics
 from collections.abc import Mapping
 from dataclasses import dataclass
 from dataclasses import fields as dataclass_fields
-from datetime import date, datetime, time, timedelta, timezone
+from datetime import date, datetime, time, timedelta, timezone, tzinfo
 from types import MappingProxyType
 from typing import Callable, Iterable, Sequence, TypeVar
 
@@ -86,6 +90,54 @@ WORKOUTS_LABEL = "workouts"
 HEALTH_FIELDS: "tuple[str, ...]" = tuple(
     f.name for f in dataclass_fields(DailyHealthData) if f.name != "date"
 )
+
+#: metric → その metric から求めるフィールド (集計に失敗したら全部「値を決められない」)。
+METRIC_FIELDS: "Mapping[str, tuple[str, ...]]" = MappingProxyType({
+    METRIC_STEP_COUNT: ("step_count",),
+    METRIC_DISTANCE: ("distance_km",),
+    METRIC_ACTIVE_ENERGY: ("active_energy_kcal",),
+    METRIC_EXERCISE_TIME: ("exercise_minutes",),
+    METRIC_HEART_RATE: ("exercise_intensity_score", "heart_rate_avg", "heart_rate_max"),
+    METRIC_RESTING_HEART_RATE: ("heart_rate_resting",),
+    METRIC_OXYGEN_SATURATION: ("oxygen_saturation",),
+    METRIC_SLEEP: ("sleep_hours", "nap_hours"),
+    METRIC_MINDFUL: ("mindful_sessions", "mindful_minutes"),
+    METRIC_BODY_MASS: ("body_mass_kg",),
+    METRIC_BODY_FAT: ("body_fat_percentage",),
+})
+
+#: アクティビティ詳細の「活動なし」(旧 Notion 時代と同じ表記)。
+ACTIVITY_NONE = "なし"
+#: 当日のワークアウトが無い日 (出力しない設定 / 出力していて当日 0 件) に、Apple の
+#: エクササイズ時間 (``apple_exercise_time``) をアクティビティ詳細に書くときの名前
+#: (``"エクササイズ21分"``)。
+EXERCISE_NAME_JA = "エクササイズ"
+#: アクティビティ詳細の瞑想の名前 (``"瞑想3分"``)。
+MINDFUL_NAME_JA = "瞑想"
+#: アクティビティ詳細が依存する瞑想のフィールド。
+MINDFUL_FIELDS: "frozenset[str]" = frozenset({"mindful_sessions", "mindful_minutes"})
+#: 心拍 (``heart_rate``) から求めるフィールド。どれかに値がある日 = Watch を着けていた日
+#: (アクティビティ詳細の ``"なし"`` の根拠。:func:`has_heart_rate`)。
+HEART_RATE_FIELDS: "tuple[str, ...]" = METRIC_FIELDS[METRIC_HEART_RATE]
+
+
+def has_heart_rate(health: DailyHealthData) -> bool:
+    """心拍のデータがある日か (平均 / 最大心拍数・運動強度スコアのどれかに値がある)。
+
+    Apple Watch を着けていた日の目安。着けていた日にエクササイズ時間の記録が無ければ
+    運動 0 分 (HAE は 0 分の日に ``apple_exercise_time`` を出力しない) とみなし、
+    アクティビティ詳細を ``"なし"`` にする根拠に使う。補完・妥当性検証を終えた最終的な
+    値で判定するので、心拍を読めなかった (集計失敗 / 保留) 日は False (= 「なし」と断定しない)。
+    """
+    return any(getattr(health, name) is not None for name in HEART_RATE_FIELDS)
+
+
+def _unknown_field_set(failed_metrics: "Iterable[str]", dropped_fields: "Iterable[str]") -> "set[str]":
+    """集計に失敗した metric のフィールドと妥当性違反で落としたフィールドの集合。"""
+    unknown = set(dropped_fields)
+    for metric in failed_metrics:
+        unknown.update(METRIC_FIELDS.get(metric, ()))
+    return unknown
 
 
 # ---------- 単位換算 ----------
@@ -219,10 +271,11 @@ class AutomationParseResult:
 
     Attributes:
         health: 集計結果 (妥当性違反フィールドは None に落とし済み)
-        activity_detail: ``"瞑想3分、ウォーキング20分"`` / ``"なし"``。
-            payload に metrics が 1 件も無い / 対象日のデータが 1 つも無い /
-            ``data.workouts`` が含まれていない (ワークアウトを出力しない設定) /
-            瞑想かワークアウトを解釈できなかったときは ``None`` (= 書かない)
+        activity_detail: ``"瞑想3分、ウォーキング20分"`` / ``"瞑想3分、エクササイズ21分"`` /
+            ``"なし"`` (:func:`compose_activity_detail` の規則)。payload に metrics が
+            1 件も無い / 瞑想も運動も無く心拍のデータも無い (Watch を着けていない) /
+            結果が依存する瞑想・ワークアウト・エクササイズ時間を解釈できなかったときは
+            ``None`` (= 書かない)
         has_metrics: payload に metric が 1 件以上あったか
         sleep_mode: ``"aggregated"`` / ``"segments"`` / ``None`` (睡眠データなし)
         errors: 集計できなかった metric の説明 (該当フィールドは None)
@@ -231,8 +284,8 @@ class AutomationParseResult:
             :data:`WORKOUTS_LABEL`)
         workouts: 対象日のワークアウト ``(日本語名, 分)``。``data.workouts`` が無い
             (出力しない設定) / 解釈できなかったら ``None``
-        workouts_included: payload に ``data.workouts`` があったか (False なら
-            ワークアウトの有無を判断できないので activity_detail を書かない)
+        workouts_included: payload に ``data.workouts`` があったか (False = ワークアウトを
+            出力しない設定。アクティビティ詳細はエクササイズ時間から組む)
         main_sleep_end: segment 形式で、対象日の夜主睡眠に数えた segment の最遅終了時刻
             (record 自身の offset)。夜主睡眠が無い / aggregated なら ``None``
         main_sleep_needs_prev: segment 形式で、対象日の夜主睡眠のセッションが
@@ -253,6 +306,22 @@ class AutomationParseResult:
     main_sleep_end: "datetime | None" = None
     main_sleep_needs_prev: bool = False
     workouts_included: bool = False
+
+    @property
+    def unknown_fields(self) -> "tuple[str, ...]":
+        """値を決められなかったフィールド (定義順)。
+
+        metric の集計に失敗した (:attr:`failed_metrics`) フィールドと、妥当性違反で
+        落とした (:attr:`dropped_fields`) フィールド。「その日のデータが無い」(None)
+        とは区別する (アクティビティ詳細で「なし」と断定しないために使う)。
+        """
+        unknown = _unknown_field_set(self.failed_metrics, self.dropped_fields)
+        return tuple(name for name in HEALTH_FIELDS if name in unknown)
+
+    @property
+    def workouts_known(self) -> bool:
+        """ワークアウトを解釈できたか (出力しない設定も True。集計失敗だけ False)。"""
+        return WORKOUTS_LABEL not in self.failed_metrics
 
 
 # ---------- 汎用ヘルパー ----------
@@ -1048,25 +1117,81 @@ def extract_workouts(
     return _workouts(payload, target_date, strict=False) or []
 
 
-def build_activity_detail(
-    mindful_minutes: "float | None",
-    workouts: "Sequence[tuple[str, float]]" = (),
-) -> str:
-    """``"瞑想3分、ウォーキング20分"`` 形式のアクティビティ詳細。何も無ければ ``"なし"``。
+def _whole_minutes(value: "float | None") -> int:
+    """日記に書く分の値と同じ丸め (``int(round(x))``。``瞑想時間 (分)`` /
+    ``アクティビティ時間 (分)`` の書き込み値と一致させる)。None は 0。"""
+    if value is None:
+        return 0
+    return int(round(value))
 
-    瞑想は合計分 (round) が 1 以上のときだけ、ワークアウトも round が 1 以上のもの
-    だけを ``"、"`` で連結する。
+
+def compose_activity_detail(
+    mindful_minutes: "float | None",
+    workouts: "Sequence[tuple[str, float]] | None",
+    exercise_minutes: "float | None",
+    *,
+    heart_rate_present: bool = False,
+    mindful_known: bool = True,
+    workouts_known: bool = True,
+    exercise_known: bool = True,
+) -> "str | None":
+    """アクティビティ詳細 (``"瞑想3分、エクササイズ21分"`` / ``"なし"``) を組む。書けなければ None。
+
+    規則 (WAVE3 W3-7 改訂、オートメーション JSON と AutoSync .hae の両経路で共通):
+
+    1. 瞑想の合計分 (round) が 1 以上なら ``"瞑想{n}分"``
+    2. ワークアウトを出力している設定 (``workouts`` が None でない) で当日のワークアウトが
+       1 件以上ある (round が 1 以上のもの) なら、各ワークアウト ``"{日本語名}{n}分"``
+       (round が 1 以上のもの、渡された順。エクササイズ時間は足さない)。それ以外
+       (出力していない設定 = ``workouts=None``。AutoSync 経路も常にこちら / 出力していて
+       当日 0 件 (1 分未満だけの日も含む)) は、Apple のエクササイズ時間の合計分 (round) が
+       1 以上なら ``"エクササイズ{n}分"``
+    3. 1 と 2 を ``"、"`` で連結する (並びは 瞑想 → ワークアウト / エクササイズ)
+    4. 何も無い日は、心拍のデータがある (``heart_rate_present``。Watch を着けていた) なら
+       ``"なし"`` (着けていた日にエクササイズ時間の記録が無い = 運動 0 分。HAE は 0 分の日に
+       ``apple_exercise_time`` 自体を出力しない)。心拍のデータも無い (Watch を着けていない /
+       心拍を読めなかった) 日は ``None`` (書かない = 既存値を保持)
+    5. 結果が依存する入力 (瞑想・ワークアウト、2 でエクササイズ時間を使うときはエクササイズ
+       時間) を解釈できなかった (``*_known=False``) ときは ``None`` (取りこぼした一覧や誤った
+       ``"なし"`` を確定値として書かない)
+
+    分の丸めは日記に書く ``瞑想時間 (分)`` / ``アクティビティ時間 (分)`` と同じ
+    ``int(round(x))`` (両者の表記が食い違わない)。
+
+    Args:
+        mindful_minutes: 瞑想の合計分 (データが無ければ None)
+        workouts: ``(日本語名, 分)`` の並び。ワークアウトを出力しない設定なら None
+            (出力していて当日 0 件なら空)
+        exercise_minutes: エクササイズ時間の合計分。その日の record が無ければ None
+        heart_rate_present: その日に心拍のデータがあるか (:func:`has_heart_rate`)。
+            既定 False (= 「なし」を書かない安全側)
+        mindful_known / workouts_known / exercise_known: その入力を解釈できたか
+            (集計失敗 / 妥当性違反で落とした / 補完元の .hae を読めない・保留した = False)
     """
+    if not mindful_known or not workouts_known:
+        return None
     parts: "list[str]" = []
-    if mindful_minutes is not None:
-        minutes = int(round(mindful_minutes))
+    mindful = _whole_minutes(mindful_minutes)
+    if mindful >= 1:
+        parts.append(f"{MINDFUL_NAME_JA}{mindful}分")
+    workout_parts: "list[str]" = []
+    for name, workout_minutes in workouts or ():
+        minutes = _whole_minutes(workout_minutes)
         if minutes >= 1:
-            parts.append(f"瞑想{minutes}分")
-    for name, workout_minutes in workouts:
-        minutes = int(round(workout_minutes))
-        if minutes >= 1:
-            parts.append(f"{name}{minutes}分")
-    return "、".join(parts) if parts else "なし"
+            workout_parts.append(f"{name}{minutes}分")
+    if workout_parts:
+        parts.extend(workout_parts)
+    elif not exercise_known:
+        # ワークアウトの一覧が無い日はエクササイズ時間で組むが、それを決められない
+        return None
+    else:
+        exercise = _whole_minutes(exercise_minutes)
+        if exercise >= 1:
+            parts.append(f"{EXERCISE_NAME_JA}{exercise}分")
+    if parts:
+        return "、".join(parts)
+    # 何も無い日: Watch を着けていた (心拍がある) なら運動 0 分 = 「なし」、着けていなければ書かない
+    return ACTIVITY_NONE if heart_rate_present else None
 
 
 # ---------- エントリポイント ----------
@@ -1128,6 +1253,65 @@ def has_data_for(payload: "Mapping[str, object] | None", target_date: date) -> b
             if any(stamp.date() == target_date for stamp in parsed):
                 return True
     return False
+
+
+def _record_groups(payload: "Mapping[str, object] | None") -> "list[list]":
+    """``data.metrics[].data`` と ``data.workouts`` の record 配列 (形の合うものだけ)。"""
+    data = payload.get("data") if isinstance(payload, Mapping) else None
+    if not isinstance(data, Mapping):
+        return []
+    groups: "list[list]" = []
+    metrics = data.get("metrics")
+    if isinstance(metrics, list):
+        for metric in metrics:
+            if isinstance(metric, Mapping) and isinstance(metric.get("data"), list):
+                groups.append(metric["data"])
+    workouts = data.get("workouts")
+    if isinstance(workouts, list):
+        groups.append(workouts)
+    return groups
+
+
+def record_day_end(
+    payload: "Mapping[str, object] | None",
+    target_date: date,
+    default_tz: tzinfo,
+) -> datetime:
+    """``target_date`` の終わり (翌日 0:00) を aware な datetime で返す。
+
+    「対象日が終わったか」「ファイルが対象日の終わりより後に書かれたか (確定か)」の
+    判定に使う。Mac のローカル tz ではなく、**その日の record 自身の offset**
+    (``"2030-01-15 05:02:00 +0900"`` の ``+0900``) の暦日で終わりを決める:
+
+    * 対象日 (record 自身の offset の暦日) の日時を持つ record の offset ごとに
+      「翌日 0:00」を求め、最も遅いものを返す (旅行などで offset が混在しても、
+      どの offset の暦日でも対象日が終わった時点 = 安全側)
+    * offset 付きの日時を持つ対象日の record が無ければ ``default_tz`` (日記の基準 tz)
+      の翌日 0:00
+
+    対象は ``data.metrics[].data[]`` と ``data.workouts[]`` の日時キー
+    (``date`` / ``startDate`` / ``start`` / ``endDate`` / ``end`` / ``sleepStart`` /
+    ``sleepEnd``)。
+    """
+    offsets: "set[timedelta]" = set()
+    for records in _record_groups(payload):
+        for record in records:
+            if not isinstance(record, Mapping):
+                continue
+            for key in _ANY_DATE_KEYS:
+                stamp = parse_hae_datetime(record.get(key))
+                if stamp is None or stamp.date() != target_date:
+                    continue
+                offset = stamp.utcoffset()
+                if offset is not None:
+                    offsets.add(offset)
+    next_day = target_date + timedelta(days=1)
+    if not offsets:
+        return datetime.combine(next_day, time.min, tzinfo=default_tz)
+    return max(
+        (datetime.combine(next_day, time.min, tzinfo=timezone(offset)) for offset in offsets),
+        key=_epoch,
+    )
 
 
 def parse_automation_day_detailed(
@@ -1226,16 +1410,22 @@ def parse_automation_day_detailed(
     health = _rebuild_with_validation_drop(target_date, cleaned)
 
     present = bool(metrics)
-    mindful_unknown = METRIC_MINDFUL in failed or "mindful_minutes" in dropped
-    if not present or workouts is None or mindful_unknown:
-        # metric が無い / ワークアウトを出力しない設定 (data.workouts が無い) /
-        # 瞑想やワークアウトを解釈できなかった → 「なし」「瞑想N分」とは言えない
+    unknown = _unknown_field_set(failed, dropped)
+    if not present:
+        # metric が 1 件も無い (ワークアウトだけのファイル等) → 判断材料が無い
         activity_detail: "str | None" = None
-    elif all(cleaned.get(name) is None for name in HEALTH_FIELDS) and not workouts:
-        # metric はあるが対象日のデータが 1 つも無い → 「活動なし」とは言えない
-        activity_detail = None
     else:
-        activity_detail = build_activity_detail(health.mindful_minutes, workouts)
+        # workouts は「出力しない設定」でも「集計失敗」でも None。失敗は workouts_known で
+        # 区別する (出力しない設定ならエクササイズ時間から組む)
+        activity_detail = compose_activity_detail(
+            health.mindful_minutes,
+            workouts,
+            health.exercise_minutes,
+            heart_rate_present=has_heart_rate(health),
+            mindful_known=not (unknown & MINDFUL_FIELDS),
+            workouts_known=WORKOUTS_LABEL not in failed,
+            exercise_known="exercise_minutes" not in unknown,
+        )
 
     return AutomationParseResult(
         health=health,
@@ -1262,7 +1452,8 @@ def parse_automation_day(
 ) -> "tuple[DailyHealthData, str | None]":
     """オートメーション JSON 1 日分を ``(DailyHealthData, activity_detail)`` に集計する。
 
-    ``activity_detail`` は payload に metric が 1 件も無ければ ``None``。
+    ``activity_detail`` は :func:`compose_activity_detail` の規則 (payload に metric が
+    1 件も無い / 瞑想も運動も心拍も無い日は ``None``)。
     詳細 (エラー / 睡眠モード / drop されたフィールド) が必要なら
     :func:`parse_automation_day_detailed` を使う。
     """

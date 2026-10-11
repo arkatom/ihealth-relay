@@ -11,24 +11,35 @@ import os
 import stat
 import tempfile
 import time
+import unicodedata
 import unittest
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Callable
 from unittest import mock
 
-from ihealth.frontmatter import split_frontmatter, upsert_frontmatter
+import ihealth.frontmatter as frontmatter_module
+from ihealth.frontmatter import (
+    WARNING_COMMENT_PRESENT,
+    WARNING_DUPLICATE_KEY,
+    FieldChange,
+    split_frontmatter,
+    upsert_frontmatter,
+)
 from ihealth.models import DailyHealthData
 from ihealth.publishers.obsidian import (
     DEFAULT_PROPERTY_MAP,
     HEALTH_FIELDS,
     VALUE_CONVERTERS,
+    EditInvariantError,
     NotePublishOutcome,
     ObsidianConfigError,
     ObsidianPublishError,
     ObsidianPublisher,
     TemplateExpansionError,
     expand_template,
+    verify_edit_invariants,
 )
 from ihealth.records import WEATHER_FIELDS, DiaryRecord
 
@@ -1453,6 +1464,588 @@ class TestPublishProtocolWarnings(_VaultCase):
         with self.assertLogs("test-obsidian-publisher", level="WARNING") as logs:
             self.make_publisher().publish(_health(step_count=1))
         self.assertTrue(any("status=skipped" in line for line in logs.output))
+
+
+# ---------------------------------------------------------------------------
+# WAVE3 W3-1 (前半): 書込後の確認が一致しなければ成功扱いにせず、最新の内容に upsert し直す
+# ---------------------------------------------------------------------------
+
+class _OverwriteAfterWritePublisher(ObsidianPublisher):
+    """書き込み (置換 / 新規作成) の直後・確認読込の前に ``overwrites`` を 1 つずつ実行する fake.
+
+    = 置換の直後に Obsidian (古いバッファの保存) / Obsidian Sync / 他のツールがノートを
+    保存・移動した状況.
+    """
+
+    def __init__(
+        self, *args: object, overwrites: "list[Callable[[Path], None]]", **kwargs: object,
+    ) -> None:
+        super().__init__(*args, **kwargs)  # type: ignore[arg-type]
+        self.overwrites = list(overwrites)
+
+    def _verify_written(self, path: Path, expected: bytes, attempt: int) -> bool:  # type: ignore[override]
+        if self.overwrites:
+            self.overwrites.pop(0)(path)
+        return super()._verify_written(path, expected, attempt)
+
+
+def _writer(text: str) -> "Callable[[Path], None]":
+    def _write(path: Path) -> None:
+        path.write_bytes(text.encode("utf-8"))
+    return _write
+
+
+class TestVerifyAfterWrite(_VaultCase):
+    RECORD_UPDATES = {"歩数 (歩)": 5555, "Github": "x"}
+
+    def _record(self) -> DiaryRecord:
+        return DiaryRecord(date=D, health=_health(step_count=5555), github="x")
+
+    def _make(self, overwrites: "list[Callable[[Path], None]]", **kwargs: object):
+        params: "dict[str, object]" = {
+            "vault_dir": self.vault, "logger": _logger(), "backup_dir": self.backup_dir,
+            "clock": lambda: FIXED_NOW, "sleep": lambda _s: None, "tz": JST,
+        }
+        params.update(kwargs)
+        return _OverwriteAfterWritePublisher(overwrites=overwrites, **params)
+
+    def _backups(self) -> "list[Path]":
+        return sorted(self.backup_dir.rglob("*.md")) if self.backup_dir.exists() else []
+
+    def test_overwritten_right_after_replace_is_reapplied_on_latest_content(self):
+        # 置換直後に Obsidian が「こちらの値を含まない古いバッファ + 利用者の追記」を保存した
+        path = self.write_note("2030-01-02.md", EXISTING_NOTE)
+        stale = EXISTING_NOTE + "Obsidian で追記した行\n"
+        pub = self._make([_writer(stale)])
+        with self.assertLogs("test-obsidian-publisher", level="WARNING") as logs:
+            outcome = pub.publish_record(self._record())
+        expected, _ = upsert_frontmatter(stale, self.RECORD_UPDATES)
+        self.assertEqual(path.read_text(encoding="utf-8"), expected)  # 両方の内容が残る
+        self.assertEqual(outcome.status, "updated")
+        self.assertEqual(outcome.written_keys, ("歩数 (歩)", "Github"))
+        # 書込前バックアップは 2 つ: 元の内容 / 2 回目の書き込みの基 (他のプログラムの保存内容)
+        day_dir = self.backup_dir / "2030-01-05"
+        first = day_dir / "2030-01-02.20300105T040506Z.md"
+        second = day_dir / "2030-01-02.20300105T040506Z-1.md"
+        self.assertEqual(self._backups(), sorted([first, second]))
+        self.assertEqual(first.read_bytes(), EXISTING_NOTE.encode("utf-8"))
+        self.assertEqual(second.read_bytes(), stale.encode("utf-8"))
+        self.assertEqual(outcome.backup_path, second)
+        self.assertTrue(any("やり直します" in line for line in logs.output), logs.output)
+        self.assertFalse(any("次回実行" in line for line in logs.output))
+
+    def test_persistent_overwrite_is_an_error_not_a_success(self):
+        path = self.write_note("2030-01-02.md", EXISTING_NOTE)
+        other = EXISTING_NOTE + "他のプログラムが保存した行\n"
+        pub = self._make([_writer(other)] * 3)
+        with self.assertLogs("test-obsidian-publisher", level="WARNING") as logs:
+            with self.assertRaises(ObsidianPublishError) as ctx:
+                pub.publish_record(self._record())
+        self.assertNotIsInstance(ctx.exception, EditInvariantError)
+        message = str(ctx.exception)
+        self.assertIn("確認できません", message)
+        self.assertIn("3 回試行", message)
+        self.assertIn("書き込み 3 回", message)
+        backups = self._backups()
+        self.assertEqual(len(backups), 3)
+        for backup in backups:
+            self.assertIn(str(backup), message)  # どこから戻せるかがメッセージで分かる
+        # 最後に保存されたのは他のプログラムの内容 (こちらの値は残っていない)
+        self.assertEqual(path.read_text(encoding="utf-8"), other)
+        self.assertTrue(any("試行回数の上限" in line for line in logs.output), logs.output)
+        self.assertFalse(any("次回実行" in line for line in logs.output + [message]))
+
+    def test_single_attempt_fails_immediately(self):
+        self.write_note("2030-01-02.md", EXISTING_NOTE)
+        pub = self._make([_writer(EXISTING_NOTE)], max_attempts=1)
+        with self.assertLogs("test-obsidian-publisher", level="WARNING"):
+            with self.assertRaises(ObsidianPublishError) as ctx:
+                pub.publish_record(self._record())
+        self.assertIn("1 回試行", str(ctx.exception))
+
+    def test_overwrite_that_kept_our_values_is_reported_as_written(self):
+        # 他のプログラムがこちらの書いた内容を読み込んでから保存し直した (本文に追記):
+        # 最終試行では値が既に同じ (unchanged) だが、値を書いたのはこの実行なので update と報告
+        path = self.write_note("2030-01-02.md", EXISTING_NOTE)
+
+        def reload_and_append(p: Path) -> None:
+            p.write_bytes(p.read_bytes() + "追記\n".encode("utf-8"))
+
+        pub = self._make([reload_and_append])
+        with self.assertLogs("test-obsidian-publisher", level="WARNING"):
+            outcome = pub.publish_record(self._record())
+        written, _ = upsert_frontmatter(EXISTING_NOTE, self.RECORD_UPDATES)
+        self.assertEqual(path.read_text(encoding="utf-8"), written + "追記\n")
+        self.assertEqual(outcome.status, "updated")
+        self.assertEqual([c.action for c in outcome.changes], ["update", "update"])
+        self.assertEqual(outcome.written_keys, ("歩数 (歩)", "Github"))
+        # バックアップはこの実行の前の内容 (最終試行では書いていない)
+        assert outcome.backup_path is not None
+        self.assertEqual(outcome.backup_path.read_bytes(), EXISTING_NOTE.encode("utf-8"))
+        self.assertEqual(len(self._backups()), 1)
+
+    def test_overwrite_that_dropped_our_value_is_not_reported_as_written(self):
+        # 直後に保存された内容ではこちらの値が消え、利用者のコメント付きの値になっていた
+        # → 書き直せない (kept) ので「この実行で書いた」とは報告しない
+        path = self.write_note("2030-01-02.md", EXISTING_NOTE)
+        other = EXISTING_NOTE.replace("Github:\n", "Github: 手入力  # メモ\n", 1)
+        pub = self._make([_writer(other)])
+        with self.assertLogs("test-obsidian-publisher", level="WARNING"):
+            outcome = pub.publish_record(DiaryRecord(date=D, github="x"))
+        self.assertEqual(path.read_text(encoding="utf-8"), other)
+        self.assertEqual(outcome.status, "unchanged")
+        self.assertEqual([c.action for c in outcome.changes], ["kept"])
+        self.assertTrue(outcome.changes[0].warning.startswith(WARNING_COMMENT_PRESENT))  # type: ignore[union-attr]
+        self.assertEqual(outcome.written_keys, ())
+        self.assertIsNone(outcome.backup_path)
+
+    def test_note_moved_right_after_write_is_found_and_verified(self):
+        # 確認読込に失敗 (直後にサブフォルダへ移動された) → 探し直し、移動先で値を確かめる
+        original = self.write_note("2030-01-02.md", EXISTING_NOTE)
+        moved = self.diary / "2030" / "2030-01-02.md"
+
+        def move(p: Path) -> None:
+            moved.parent.mkdir()
+            os.replace(p, moved)
+
+        pub = self._make([move])
+        with self.assertLogs("test-obsidian-publisher", level="WARNING") as logs:
+            outcome = pub.publish_record(DiaryRecord(date=D, github="x"))
+        expected, _ = upsert_frontmatter(EXISTING_NOTE, {"Github": "x"})
+        self.assertFalse(original.exists())
+        self.assertEqual(moved.read_text(encoding="utf-8"), expected)
+        self.assertEqual((outcome.status, outcome.path), ("updated", moved))
+        self.assertEqual(outcome.written_keys, ("Github",))
+        self.assertTrue(any("確認読込に失敗" in line for line in logs.output), logs.output)
+
+    def test_unreadable_right_after_write_is_retried(self):
+        path = self.write_note("2030-01-02.md", EXISTING_NOTE)
+        real_read_bytes = Path.read_bytes
+        calls: "list[Path]" = []
+
+        def flaky_read_bytes(self_path: Path) -> bytes:
+            calls.append(self_path)
+            if len(calls) == 1:
+                raise PermissionError("synthetic: denied")
+            return real_read_bytes(self_path)
+
+        class _FlakyVerifyPublisher(ObsidianPublisher):
+            def _verify_written(self, p: Path, expected: bytes, attempt: int) -> bool:  # type: ignore[override]
+                with mock.patch.object(Path, "read_bytes", flaky_read_bytes):
+                    return super()._verify_written(p, expected, attempt)
+
+        pub = _FlakyVerifyPublisher(
+            vault_dir=self.vault, logger=_logger(), backup_dir=self.backup_dir,
+            clock=lambda: FIXED_NOW, sleep=lambda _s: None, tz=JST,
+        )
+        with self.assertLogs("test-obsidian-publisher", level="WARNING") as logs:
+            outcome = pub.publish_record(self._record())
+        expected, _ = upsert_frontmatter(EXISTING_NOTE, self.RECORD_UPDATES)
+        self.assertEqual(path.read_text(encoding="utf-8"), expected)
+        self.assertEqual(outcome.status, "updated")
+        self.assertEqual(outcome.written_keys, ("歩数 (歩)", "Github"))
+        self.assertTrue(any("確認読込に失敗" in line for line in logs.output), logs.output)
+
+    def test_created_note_overwritten_right_after_creation_is_updated(self):
+        # 作った直後に Obsidian Sync が別端末の同名ノートで上書きした → そのノートに upsert し直す
+        synced = EXISTING_NOTE + "別端末で書いた本文\n"
+        pub = self._make([_writer(synced)], template_path=self.template)
+        with self.assertLogs("test-obsidian-publisher", level="WARNING"):
+            outcome = pub.publish_record(DiaryRecord(date=D, health=_health(step_count=9)))
+        path = self.diary / "2030-01-02.md"
+        expected, _ = upsert_frontmatter(synced, {"歩数 (歩)": 9})
+        self.assertEqual(path.read_text(encoding="utf-8"), expected)
+        self.assertEqual((outcome.status, outcome.path), ("updated", path))
+        assert outcome.backup_path is not None
+        self.assertEqual(outcome.backup_path.read_bytes(), synced.encode("utf-8"))
+        self.assertEqual([p.name for p in self.diary.iterdir()], ["2030-01-02.md"])
+
+    def test_normal_write_is_verified_without_warnings(self):
+        self.write_note("2030-01-02.md", EXISTING_NOTE)
+        pub = self._make([])
+        with self.assertLogs("test-obsidian-publisher", level="WARNING") as logs:
+            _logger().warning("sentinel")  # assertNoLogs (3.10+) の代わり
+            outcome = pub.publish_record(self._record())
+        self.assertEqual(outcome.status, "updated")
+        self.assertEqual(logs.output, ["WARNING:test-obsidian-publisher:sentinel"])
+
+    def test_note_emptied_right_after_write_is_an_error_not_a_benign_skip(self):
+        # finding: 書いた直後に他のプログラムがノートを空にすると、やり直しの試行が「直前に
+        # 変更された空ノート」として skipped (recently_modified) を返し、想定内の skip として
+        # exit 0・通知なし・バックアップの場所も無しで終わっていた (元の内容はバックアップにしか無い)
+        path = self.write_note("2030-01-02.md", EXISTING_NOTE)
+
+        def empty_now(p: Path) -> None:
+            p.write_bytes(b"")
+            stamp = FIXED_NOW.timestamp()
+            os.utime(p, (stamp, stamp))   # 今さっき変更された空ノート
+
+        pub = self._make([empty_now], template_path=self.template)
+        with self.assertLogs("test-obsidian-publisher", level="WARNING"):
+            with self.assertRaises(ObsidianPublishError) as ctx:
+                pub.publish_record(self._record())
+        self.assertNotIsInstance(ctx.exception, EditInvariantError)
+        message = str(ctx.exception)
+        self.assertIn("確認できません", message)
+        self.assertIn("status=skipped, reason=recently_modified", message)
+        (backup,) = self._backups()
+        self.assertIn(str(backup), message)   # どこから戻せるかがメッセージで分かる
+        self.assertEqual(backup.read_bytes(), EXISTING_NOTE.encode("utf-8"))
+        self.assertEqual(path.read_bytes(), b"", "空にされたノートにはそれ以上書かない")
+
+    def test_note_moved_out_of_the_diary_right_after_write_is_an_error(self):
+        path = self.write_note("2030-01-02.md", EXISTING_NOTE)
+        outside = self.vault / "移動先.md"
+
+        def move_out(p: Path) -> None:
+            os.replace(p, outside)
+
+        pub = self._make([move_out])   # テンプレート無し: 作り直せない (missing)
+        with self.assertLogs("test-obsidian-publisher", level="WARNING"):
+            with self.assertRaises(ObsidianPublishError) as ctx:
+                pub.publish_record(self._record())
+        self.assertIn("status=missing", str(ctx.exception))
+        self.assertFalse(path.exists())
+        self.assertTrue(outside.exists())
+
+
+# ---------------------------------------------------------------------------
+# WAVE3 W3-1 (後半): 書込前の独立した不変条件チェック (編集ロジックとは別実装)
+# ---------------------------------------------------------------------------
+
+#: 担当外の行・コメント・空行・block 値を含む合成ノート.
+RICH_NOTE = (
+    "---\n"
+    "# 行頭コメント\n"
+    "名前: 毎日の習慣 2030-01-02\n"
+    "日付: 2030-01-02\n"
+    "朝散歩:\n"
+    "  - カーテンを開ける\n"
+    "歩数 (歩): 100  # 手動で入れた値\n"
+    "睡眠時間 (分):\n"
+    "\n"
+    "Github: |-\n"
+    "  [a](https://example.com/1)\n"
+    "  [b](https://example.com/2)\n"
+    "\n"
+    "# 末尾コメント\n"
+    "天気:\n"
+    "---\n"
+    "# 毎日の習慣 2030-01-02（水）\n"
+    "\n"
+    "- 合成の本文メモ\n"
+)
+
+
+class TestVerifyEditInvariants(unittest.TestCase):
+    """:func:`verify_edit_invariants` 単体: 正しい編集は通し、担当外の変更は必ず止める."""
+
+    CORPUS = (
+        EXISTING_NOTE,
+        RICH_NOTE,
+        expand_template(TEMPLATE, D),
+        "---\n日付: 2030-01-04\n---\n\n# 🤖 2030-01-04の日報\n",
+        "# frontmatter の無いノート\n本文\n",
+        "﻿# BOM 付き・frontmatter 無し\n",
+        "﻿---\r\n日付: 2030-01-02\r\n歩数 (歩):\r\n---\r\n本文\r\n",
+        "---\n日付: 2030-01-02\n---",
+        "---\n\"歩数 (歩)\": 1\n'天気': 晴\nGithub:\n  - a\n\n  - b\n# c\n\n---\nbody\n",
+        "---\nGithub: \"[x](u)\n  続き\"\n天気: |+\n  晴\n\n\n---\nbody\n",
+        "---\n日付: 1\r\n歩数 (歩):\r\n---\r\nbody\r\n",                 # 改行の混在
+        "---\nGithub:\n---\n本文\n---\n歩数 (歩): 本文中の偽 frontmatter\n",  # 本文の key 風の行
+        # 担当 entry の後ろの字下げ付きコメント行 (entry の外: 編集は残す)
+        "---\n歩数 (歩): 100\n  # 手入力 (消さないで)\n\n  # もう 1 行\n天気: 晴\n---\nbody\n",
+    )
+    UPDATES = {"歩数 (歩)": 5555, "睡眠時間 (分)": 420, "Github": "y", "天気": "晴", "新キー": 1}
+    KEY_SETS = (
+        ("歩数 (歩)",), ("Github",), ("天気", "新キー"), tuple(UPDATES),
+    )
+
+    def test_real_editor_outputs_pass(self):
+        checked = 0
+        for old in self.CORPUS:
+            for keys in self.KEY_SETS:
+                for fill_only_empty in (False, True):
+                    new, changes = upsert_frontmatter(
+                        old, {k: self.UPDATES[k] for k in keys}, fill_only_empty=fill_only_empty,
+                    )
+                    changed = [c.key for c in changes if c.action in ("insert", "update")]
+                    verify_edit_invariants(old.encode("utf-8"), new.encode("utf-8"), changed)
+                    checked += new != old
+        self.assertGreater(checked, 40)  # 実際に書き換わる組み合わせを十分に通している
+
+    def _rich_pair(self) -> "tuple[bytes, str, list[str]]":
+        new, changes = upsert_frontmatter(RICH_NOTE, {"睡眠時間 (分)": 420, "Github": "y", "新キー": 1})
+        changed = [c.key for c in changes if c.action in ("insert", "update")]
+        self.assertEqual(sorted(changed), ["Github", "新キー", "睡眠時間 (分)"])
+        verify_edit_invariants(RICH_NOTE.encode("utf-8"), new.encode("utf-8"), changed)
+        return RICH_NOTE.encode("utf-8"), new, changed
+
+    def test_every_kind_of_collateral_change_is_detected(self):
+        old, new, changed = self._rich_pair()
+        mutations = {
+            "担当外 entry を削除": lambda t: t.replace("日付: 2030-01-02\n", "", 1),
+            "担当外 entry の値を変更": lambda t: t.replace("日付: 2030-01-02", "日付: 2030-01-03", 1),
+            "担当外 entry の順序を入れ替え": lambda t: t.replace(
+                "名前: 毎日の習慣 2030-01-02\n日付: 2030-01-02\n",
+                "日付: 2030-01-02\n名前: 毎日の習慣 2030-01-02\n", 1,
+            ),
+            "担当外の継続行を削除": lambda t: t.replace("  - カーテンを開ける\n", "", 1),
+            "行頭コメントを削除": lambda t: t.replace("# 行頭コメント\n", "", 1),
+            "末尾コメントを削除": lambda t: t.replace("# 末尾コメント\n", "", 1),
+            "entry の後ろの空行を削除": lambda t: t.replace("\n\n# 末尾コメント", "\n# 末尾コメント", 1),
+            "書かなかった担当 entry (kept) を変更": lambda t: t.replace(
+                "歩数 (歩): 100  # 手動で入れた値\n", "歩数 (歩): 5555\n", 1,
+            ),
+            "担当外の行を追加": lambda t: t.replace("天気:\n", "天気:\n余計: 1\n", 1),
+            "担当キーを重複して追加": lambda t: t.replace('Github: "y"\n', 'Github: "y"\nGithub: "y"\n', 1),
+            "本文を 1 文字変更": lambda t: t.replace("合成の本文メモ", "合成の本文メモ。", 1),
+            "本文の末尾改行を削除": lambda t: t[:-1],
+            "BOM を追加": lambda t: "﻿" + t,
+            "区切り行の改行を CRLF に": lambda t: t.replace("---\n", "---\r\n", 1),
+            "frontmatter を削除": lambda t: t[t.index("---\n# 毎日") + 4:],
+        }
+        for label, mutate in mutations.items():
+            mutated = mutate(new)
+            self.assertNotEqual(mutated, new, label)
+            with self.assertRaises(EditInvariantError, msg=label) as ctx:
+                verify_edit_invariants(old, mutated.encode("utf-8"), changed)
+            # メッセージに日記の内容を出さない (行番号だけ)
+            self.assertNotIn("カーテン", str(ctx.exception), label)
+            self.assertNotIn("本文メモ", str(ctx.exception), label)
+
+    def test_indented_comment_after_a_written_entry_is_protected(self):
+        # finding: 字下げ付きのコメント行 (と直前の空行) は書き換えた entry の範囲とみなされ、
+        # 編集の不具合で消えても / 書き換わっても検出できなかった (行頭のコメントは検出できた)
+        old = "---\n歩数 (歩): 100\n\n  # 手入力: 万歩計の値 (消さないで)\n体重 (kg): 60\n---\n本文\n"
+        new, changes = upsert_frontmatter(old, {"歩数 (歩)": 8123})
+        self.assertIn("  # 手入力", new)   # 正しい編集はコメントを残す
+        verify_edit_invariants(old.encode("utf-8"), new.encode("utf-8"), ["歩数 (歩)"])
+        broken = {
+            "字下げ付きコメントを削除": new.replace("  # 手入力: 万歩計の値 (消さないで)\n", "", 1),
+            "字下げ付きコメントを書き換え": new.replace("# 手入力", "# 書換", 1),
+            "コメントの前の空行を削除": new.replace("8123\n\n", "8123\n", 1),
+            "entry とコメントを丸ごと 1 行に": new.replace(
+                "8123\n\n  # 手入力: 万歩計の値 (消さないで)\n", "8123\n", 1),
+        }
+        for label, mutated in broken.items():
+            self.assertNotEqual(mutated, new, label)
+            with self.assertRaises(EditInvariantError, msg=label):
+                verify_edit_invariants(old.encode("utf-8"), mutated.encode("utf-8"), ["歩数 (歩)"])
+        # 継続行の間にコメントがある entry (正しい編集なら kept で書き換えない) を壊れた編集が
+        # 1 行にした場合も、コメントとその直前の空行は残っていなければならない
+        inner = "---\nGithub:\n  - a\n\n  # メモ\n  - b\n天気: 晴\n---\n"
+        verify_edit_invariants(
+            inner.encode("utf-8"), '---\nGithub: "x"\n\n  # メモ\n天気: 晴\n---\n'.encode("utf-8"),
+            ["Github"],
+        )
+        with self.assertRaises(EditInvariantError):
+            verify_edit_invariants(
+                inner.encode("utf-8"), '---\nGithub: "x"\n  # メモ\n天気: 晴\n---\n'.encode("utf-8"),
+                ["Github"],
+            )
+
+    def test_changed_key_must_end_up_with_exactly_one_entry(self):
+        old = b"---\na: 1\n---\n"
+        with self.assertRaises(EditInvariantError):
+            verify_edit_invariants(old, old, ["b"])  # 書いたはずの b が無い
+        with self.assertRaises(EditInvariantError):
+            verify_edit_invariants(b"---\na: 1\na: 2\n---\n", b"---\na: 9\na: 2\n---\n", ["a"])
+        verify_edit_invariants(old, b"---\na: 2\n---\n", ["a"])
+
+    def test_note_without_frontmatter_may_only_gain_changed_keys(self):
+        old = "本文\n".encode("utf-8")
+        verify_edit_invariants(old, '---\nGithub: "x"\n---\n本文\n'.encode("utf-8"), ["Github"])
+        with self.assertRaises(EditInvariantError):
+            verify_edit_invariants(old, '---\nGithub: "x"\n他: 1\n---\n本文\n'.encode("utf-8"), ["Github"])
+        with self.assertRaises(EditInvariantError):
+            verify_edit_invariants(old, '---\nGithub: "x"\n---\n本文!\n'.encode("utf-8"), ["Github"])
+
+    def test_quoted_and_nfd_keys_are_recognised(self):
+        nfd = unicodedata.normalize("NFD", "アクティビティ時間 (分)")
+        for line in ('"歩数 (歩)": 1\n', "'歩数 (歩)': 1\n", '"\\u6b69\\u6570 (\\u6b69)": 1\n'):
+            old = f"---\n{line}b: 2\n---\n".encode("utf-8")
+            new = f"---\n{line.split(':')[0]}: 5\nb: 2\n---\n".encode("utf-8")
+            verify_edit_invariants(old, new, ["歩数 (歩)"])
+        verify_edit_invariants(
+            f"---\n{nfd}:\n---\n".encode("utf-8"), f"---\n{nfd}: 3\n---\n".encode("utf-8"),
+            ["アクティビティ時間 (分)"],
+        )
+
+
+class TestIndependentCheckBlocksBrokenEditor(_VaultCase):
+    """編集ロジックを壊しても、独立チェックが書く前に止めること (mutation テスト)."""
+
+    def _broken_upsert(self, mutate: "Callable[[str], str]"):
+        real = upsert_frontmatter
+
+        def broken(text: str, updates, **kwargs):  # type: ignore[no-untyped-def]
+            new_text, changes = real(text, updates, **kwargs)
+            return mutate(new_text), changes
+
+        return mock.patch("ihealth.publishers.obsidian.upsert_frontmatter", broken)
+
+    def _assert_nothing_written(self, path: Path, before: bytes) -> None:
+        self.assertEqual(path.read_bytes(), before)
+        self.assertFalse(self.backup_dir.exists())  # バックアップも作らない (= 書く前に止めた)
+        self.assertEqual(sorted(p.name for p in path.parent.iterdir()), [path.name])  # tmp も無い
+
+    def test_dropping_a_non_target_line_is_blocked_before_writing(self):
+        path = self.write_note("2030-01-02.md", EXISTING_NOTE)
+        drop = self._broken_upsert(lambda t: t.replace("日付: 2030-01-02\n", "", 1))
+        with drop, self.assertRaises(EditInvariantError) as ctx:
+            self.make_publisher().publish_record(DiaryRecord(date=D, github="x"))
+        self._assert_nothing_written(path, EXISTING_NOTE.encode("utf-8"))
+        self.assertIsInstance(ctx.exception, ObsidianPublishError)  # 書込失敗系 (exit 11)
+        self.assertNotIsInstance(ctx.exception, ObsidianConfigError)
+        self.assertIn(str(path), str(ctx.exception))
+
+    def test_body_change_is_blocked_before_writing(self):
+        path = self.write_note("2030-01-02.md", EXISTING_NOTE)
+        with self._broken_upsert(lambda t: t.replace("合成の本文メモ", "合成の本文メモ!", 1)):
+            with self.assertRaises(EditInvariantError):
+                self.make_publisher().publish_record(DiaryRecord(date=D, github="x"))
+        self._assert_nothing_written(path, EXISTING_NOTE.encode("utf-8"))
+
+    def test_dry_run_reports_the_refusal_without_writing(self):
+        self.write_note("2030-01-02.md", EXISTING_NOTE)
+        before = self.tree()
+        with self._broken_upsert(lambda t: t.replace("名前: 毎日の習慣 2030-01-02\n", "", 1)):
+            with self.assertRaises(EditInvariantError):
+                self.make_publisher(dry_run=True).publish_record(DiaryRecord(date=D, github="x"))
+        self.assertEqual(self.tree(), before)
+
+    def test_new_note_from_broken_editor_is_not_created(self):
+        with self._broken_upsert(lambda t: t.replace("日記: false\n", "", 1)):
+            with self.assertRaises(EditInvariantError):
+                self.make_publisher(template_path=self.template).publish_record(
+                    DiaryRecord(date=D, github="x"),
+                )
+        self.assertEqual(list(self.diary.iterdir()), [])
+
+    def test_empty_note_is_not_initialised_by_broken_editor(self):
+        path = self.write_note("2030-01-02.md", "")
+        with self._broken_upsert(lambda t: t.replace("日記: false\n", "", 1)):
+            with self.assertRaises(EditInvariantError):
+                self.make_publisher(template_path=self.template).publish_record(
+                    DiaryRecord(date=D, github="x"),
+                )
+        self._assert_nothing_written(path, b"")
+
+    def test_entry_reported_as_kept_must_stay_byte_identical(self):
+        note = EXISTING_NOTE.replace("歩数 (歩):\n", "歩数 (歩): 100  # 手動\n", 1)
+        path = self.write_note("2030-01-02.md", note)
+        overwrite_kept = self._broken_upsert(
+            lambda t: t.replace("歩数 (歩): 100  # 手動\n", "歩数 (歩): 5555\n", 1),
+        )
+        with overwrite_kept, self.assertRaises(EditInvariantError):
+            self.make_publisher().publish_record(
+                DiaryRecord(date=D, health=_health(step_count=5555), github="x"),
+            )
+        self._assert_nothing_written(path, note.encode("utf-8"))
+
+    def test_pre_w3_3_comment_dropping_edit_is_blocked(self):
+        # W3-3 以前の編集 (コメントを挟んだ entry を丸ごと 1 行にしてコメントを消す) を模す
+        note = EXISTING_NOTE.replace("Github:\n", "Github:\n  - a\n# メモ\n  - b\n", 1)
+        path = self.write_note("2030-01-02.md", note)
+
+        def old_behaviour(text: str, updates, **kwargs):  # type: ignore[no-untyped-def]
+            new_text = text.replace("Github:\n  - a\n# メモ\n  - b\n", 'Github: "x"\n', 1)
+            return new_text, [FieldChange("Github", "update", "\n  - a\n# メモ\n  - b", '"x"')]
+
+        with mock.patch("ihealth.publishers.obsidian.upsert_frontmatter", old_behaviour):
+            with self.assertRaises(EditInvariantError):
+                self.make_publisher().publish_record(DiaryRecord(date=D, github="x"))
+        self._assert_nothing_written(path, note.encode("utf-8"))
+
+    def test_broken_editor_tokenizer_is_caught_by_the_independent_check(self):
+        # 編集ロジック内部 (entry 範囲の計算) を壊す: 各 entry が次の行まで飲み込む.
+        # 独立チェックはこの関数を使わないので、壊れた編集結果を見抜ける.
+        real_end = frontmatter_module._multiline_end
+
+        def swallow_next_line(lines, key_idx, close_idx, value_head):  # type: ignore[no-untyped-def]
+            return max(real_end(lines, key_idx, close_idx, value_head), min(key_idx + 1, close_idx - 1))
+
+        path = self.write_note("2030-01-02.md", EXISTING_NOTE)
+        record = DiaryRecord(date=D, health=_health(step_count=5555))
+        with mock.patch.object(frontmatter_module, "_multiline_end", swallow_next_line):
+            broken, changes = frontmatter_module.upsert_frontmatter(EXISTING_NOTE, {"歩数 (歩)": 5555})
+            # 前提の確認: 壊れた編集は担当外の「睡眠時間 (分):」を消し、それでも update と報告する
+            self.assertNotIn("睡眠時間 (分):", broken)
+            self.assertEqual([c.action for c in changes], ["update"])
+            with self.assertRaises(EditInvariantError):
+                self.make_publisher().publish_record(record)
+            self._assert_nothing_written(path, EXISTING_NOTE.encode("utf-8"))
+            # 対照: 独立チェックを外すと、同じ壊れた編集がそのまま書き込まれてしまう
+            with mock.patch("ihealth.publishers.obsidian.verify_edit_invariants", lambda *a: None):
+                self.make_publisher(backup_dir=None).publish_record(record)
+        self.assertNotIn("睡眠時間 (分):", path.read_text(encoding="utf-8"))
+
+
+# ---------------------------------------------------------------------------
+# WAVE3 W3-3: コメント付き / 重複した担当キーは publisher でも書かずにレポートに残す
+# ---------------------------------------------------------------------------
+
+class TestKeptForSafety(_VaultCase):
+    def test_commented_and_duplicated_keys_are_kept_others_written(self):
+        note = (
+            EXISTING_NOTE
+            .replace("歩数 (歩):\n", "歩数 (歩): 100  # 手動で入れた値\n", 1)
+            .replace("気温:\n", "気温:\n気温: 重複\n", 1)
+        )
+        path = self.write_note("2030-01-02.md", note)
+        record = DiaryRecord(
+            date=D, health=_health(step_count=5555), weather=_weather(), github="x",
+        )
+        with self.assertLogs("test-obsidian-publisher", level="WARNING") as logs:
+            outcome = self.make_publisher().publish_record(record)
+        changes = {c.key: c for c in outcome.changes}
+        self.assertEqual(changes["歩数 (歩)"].action, "kept")
+        self.assertTrue(changes["歩数 (歩)"].warning.startswith(WARNING_COMMENT_PRESENT))  # type: ignore[union-attr]
+        self.assertEqual(changes["気温"].action, "kept")
+        self.assertTrue(changes["気温"].warning.startswith(WARNING_DUPLICATE_KEY))  # type: ignore[union-attr]
+        self.assertEqual(changes["Github"].action, "update")
+        text = path.read_text(encoding="utf-8")
+        self.assertIn("歩数 (歩): 100  # 手動で入れた値\n", text)
+        self.assertIn("気温:\n気温: 重複\n", text)
+        self.assertIn('Github: "x"\n', text)
+        self.assertEqual(outcome.status, "updated")
+        self.assertTrue(any(WARNING_COMMENT_PRESENT in line for line in logs.output))
+        self.assertTrue(any(WARNING_DUPLICATE_KEY in line for line in logs.output))
+
+    def test_existing_states_reads_without_writing(self):
+        # 未確定の値の台帳が「利用者が手で書いた値か」を判定するための読み取り
+        note = EXISTING_NOTE.replace("歩数 (歩):\n", "歩数 (歩): 1200  # メモ\n", 1).replace(
+            "体重 (kg):\n", "体重 (kg): 64.5\n", 1).replace("気温:\n", "気温:\n気温: 重複\n", 1)
+        path = self.write_note("2030-01-02.md", note)
+        before = path.stat()
+        pub = self.make_publisher()
+        states = pub.existing_states(path, {
+            "歩数 (歩)": 1200, "体重 (kg)": 64.8, "睡眠時間 (分)": None, "天気": None,
+            "気温": None, "Github": "x", "無いキー": None,
+        })
+        self.assertEqual(states, {
+            "歩数 (歩)": "same", "体重 (kg)": "other", "睡眠時間 (分)": "empty", "天気": "empty",
+            "気温": "unknown", "Github": "empty", "無いキー": "empty",
+        })
+        self.assertEqual(path.read_bytes(), note.encode("utf-8"))
+        self.assertEqual(path.stat().st_mtime_ns, before.st_mtime_ns)
+        missing = pub.existing_states(self.diary / "無い.md", {"歩数 (歩)": 1})
+        self.assertEqual(missing, {"歩数 (歩)": "unknown"})
+        broken = self.write_note("2030-01-03.md", "---\n歩数 (歩): 1\n")   # 閉じ --- が無い
+        self.assertEqual(pub.existing_states(broken, {"歩数 (歩)": 1}), {"歩数 (歩)": "unknown"})
+
+    def test_note_with_only_kept_keys_is_not_rewritten(self):
+        note = EXISTING_NOTE.replace("Github:\n", "Github:  # あとで書く\n", 1)
+        path = self.write_note("2030-01-02.md", note)
+        before = path.stat()
+        with self.assertLogs("test-obsidian-publisher", level="WARNING"):
+            outcome = self.make_publisher().publish_record(DiaryRecord(date=D, github="x"))
+        self.assertEqual(outcome.status, "unchanged")
+        self.assertEqual([c.action for c in outcome.changes], ["kept"])
+        self.assertIsNone(outcome.backup_path)
+        self.assertEqual(path.read_bytes(), note.encode("utf-8"))
+        self.assertEqual(path.stat().st_mtime_ns, before.st_mtime_ns)
 
 
 if __name__ == "__main__":

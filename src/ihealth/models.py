@@ -1,6 +1,6 @@
 """publisher (Notion / Markdown / stdout / SQLite / Slack) に書き込む 1 日分の集計済みヘルスデータ。
 
-13 フィールドすべて ``Optional`` で、データ欠落は ``None`` で表現する
+``date`` 以外の健康 15 フィールドはすべて ``Optional`` で、データ欠落は ``None`` で表現する
 (その日は測っていない / センサー断 / iPhone 同期失敗 などを区別しない)。
 
 ## None 扱いの方針 (Issue #15)
@@ -104,7 +104,7 @@ class DailyHealthData:
             )
 
     def iter_fields(self) -> "Iterator[tuple[str, object]]":
-        """``(field_name, value)`` を 14 フィールドぶん順に yield する。
+        """``(field_name, value)`` を ``date`` + 健康 15 フィールドの 16 個ぶん順に yield する。
 
         ``date`` 以外は Python 型 (int / float / None) をそのまま返す。
         ログ出力 / テスト / デバッグで使う。Notion 書き込み向けの変換は

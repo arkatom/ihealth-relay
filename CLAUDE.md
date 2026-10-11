@@ -156,7 +156,7 @@ Obsidian の既定キーは日本語 (`publishers/obsidian.py` の `DEFAULT_PROP
 
 | 内部名 | source | Obsidian キー (既定) | 書式 (前身互換) |
 |---|---|---|---|
-| activity_detail | 健康 (mindful_minutes + JSON の `data.workouts`) | `アクティビティ詳細` | `"瞑想3分、ウォーキング31分"` (ワークアウト名は英→日、未知名はそのまま) / 何も無ければ `"なし"` / 判断できない日は書かない。**JSON に `data.workouts` が無い (オートメーションがワークアウトを書き出さない設定) 日と AutoSync `.hae` だけの日は書かない** (運動の有無を判断できず、`"なし"` で既存のワークアウト記録を消すため) |
+| activity_detail | 健康 (mindful_minutes + JSON の `data.workouts` / apple_exercise_time + 「なし」の根拠に heart_rate。AutoSync `.hae` だけの日も同じ規則) | `アクティビティ詳細` | `automation_parser.compose_activity_detail`: ① 瞑想 (合計 round ≥ 1) `"瞑想N分"` → ② 当日のワークアウト (round ≥ 1 分のもの。1 分未満はワークアウト無しと同じ) があれば各 `"{日本語名}N分"` (英→日、未知名はそのまま。エクササイズ時間は足さない)、無ければ (ワークアウト未出力 / 当日 0 件) `apple_exercise_time` が round ≥ 1 なら `"エクササイズN分"`、を `"、"` で連結 (例 `"瞑想3分、エクササイズ21分"`)。③ 何も無い日は心拍データがある (`has_heart_rate`: 補完・妥当性検証後の平均 / 最大心拍数・運動強度スコアのどれかに値 = Watch 装着) なら `"なし"`、無ければ書かない (qty 0 のエクササイズ record があっても心拍が無ければ書かない)。④ 依存する入力 (瞑想・ワークアウト・使う場合のエクササイズ時間) が集計失敗 / 妥当性違反 / 補完元 `.hae` の保留・読込失敗なら、心拍があっても書かない |
 | temperature | 気象庁 | `気温` | `"朝:平均{:.1f}℃, 昼:平均{:.1f}℃, 夜:平均{:.1f}℃（最高:{:.1f}℃, 最低:{:.1f}℃）"` |
 | humidity | 気象庁 | `湿度` | `"朝:平均{:.1f}%, 昼:平均{:.1f}%, 夜:平均{:.1f}%（最高:{}%, 最低:{}%）"` (最高・最低は整数) |
 | pressure | 気象庁 (海面気圧) | `気圧` | `"1-6時:平均{:.1f}hPa{mark}, 7-12時:…, 13-18時:…, 19-24時:…"`。span の最大 − 次 span のいずれか ≥ 5 → `⤵️💣️`、次 span のいずれか − span の最小 ≥ 5 → `⤴️⚠️` (最後の span は無印) |
@@ -191,7 +191,8 @@ GitHub の対象: 自分が owner の repo + 所属 org の repo (owner ごと�
 - オートメーション JSON の睡眠は aggregateSleep=true だと 1 日 1 レコードの集計値で、**昼寝を分離できない** (`sleep_hours` = 昼寝込みの総睡眠、`nap_hours` = None)。HAE 側で aggregateSleep=false にすると segment 形式になり、AutoSync と同じ規則で分離できる (前日ファイルも併読)
 - オートメーション JSON の record の日時 (`"2026-10-10 05:02:00 +0900"`) は **record 自身の offset の暦日**で対象日と比較する (JST 固定にしない)
 - オートメーションの当日ファイルは途中経過。**mtime が対象日の終了より前のファイルを確定値として書かない** (過去日なら保留、今日なら暫定)。今日の暫定値は台帳で追跡する (HAE の再出力は数週間遅れることがある)
-- 実際のオートメーション設定は `includeWorkouts=false` (JSON に `data.workouts` が無い)。この形でアクティビティ詳細を `"なし"` / `"瞑想N分"` と断定すると移行済みの `"…、フィットネスウォーク52分"` などを消すので書かない
+- HAE は運動 0 分の日に `apple_exercise_time` 自体を出力しない (qty 0 の record は出ない)。アクティビティ詳細の `"なし"` を「エクササイズ時間 0 分」で判定すると実データでは永久に書けないので、**心拍の有無** (Watch を着けていたか) で「運動 0 分」と「記録なし」を分ける。心拍は補完・妥当性検証後の最終値で見る (JSON に無く AutoSync `.hae` で補えた心拍も根拠になり、心拍の集計失敗・保留・読込失敗の日は `"なし"` と断定しない)
+- 実際のオートメーション設定は `includeWorkouts=false` (JSON に `data.workouts` が無い) なので、アクティビティ詳細は `"エクササイズN分"` になる。既定 window (昨日から `IHEALTH_LOOKBACK_DAYS` = 7 日 + 今日) では `"なし"` / `"エクササイズN分"` もキーの既存値を上書きする (直近 7 日に手で書いたアクティビティ詳細や、前身から移行した `"…、フィットネスウォーク52分"` も置き換わる。この挙動はリーダー決定で維持)。守りたい値は entry にコメントを付ければ書き換えない (`kept`)。ワークアウト名で書きたいなら HAE のオートメーションで **Include Workouts** を有効にする
 - `HEALTH_EXPORT_DIR=…/AutoSync` は `HealthMetrics` が無くても (フォルダ名 `AutoSync` で) 親からオートメーションを探す
 - iCloud の競合コピー (`HealthAutoExport-2026-10-10 2.json`) は対象外 (ファイル名の完全一致)
 - 秒単位タイムスタンプ (`start`/`end`) は **Mac absolute time** (2001-01-01 UTC 起点) なので、必要に応じて `datetime(2001,1,1) + timedelta(seconds=...)` で変換
@@ -226,7 +227,7 @@ GitHub の対象: 自分が owner の repo + 所属 org の repo (owner ごと�
 - **気象庁への配慮**: リクエスト間隔は 1 秒以上 (`diary.WEATHER_MIN_INTERVAL_SEC`)、User-Agent に repo URL。5xx / 429 / 通信エラーは指数バックオフで再試行、4xx は即失敗。見出しから列を特定できない (レイアウト変更) ときは黙って誤パースせず `WeatherError`
 - **GitHub API**: GraphQL のサーバ側 timeout (約 10 秒) に備え、history の page 件数を 100 → 50 → 25 → 10 と縮めて取り直す。403 / 429 の Retry-After は最大 60 秒まで待つ (それ以上は失敗)
 - **launchd の起動時刻は `IHEALTH_PUBLISHER` で決まる**: `install-launchd.sh` が `.env` を読み、obsidian なら 07:00 / 12:00 / 21:00、それ以外 (未設定 = notion を含む) は 07:00 だけにする (テンプレートの `IHEALTH_OBSIDIAN_EXTRA_RUNS_BEGIN`〜`END` を消す)。`IHEALTH_PUBLISHER` を変えたら再実行する。`--print-plist` で登録内容だけ確認できる
-- **launchd.log はローテーションされない**: launchd 経由 (標準エラーが端末でない) では標準エラーへのログを WARNING 以上に絞る (`__main__._quiet_stderr_when_not_tty`。`--verbose` では絞らない)。全ログは `logs/run.log`
+- **launchd.log はローテーションされない**: launchd 経由 (標準エラーが端末でない) では標準エラーへのログを WARNING 以上に絞る (`__main__._quiet_stderr_when_not_tty`)。`--verbose` と dry-run (`--dry-run` / dryrun publisher = `--publisher dryrun` か `IHEALTH_PUBLISHER=dryrun`) では絞らない (dry-run は起動行と変更内容のログが出力そのものなので、`> out.txt 2>&1` やパイプの先にも INFO を出す)。launchd は `--dry-run` を付けないので、`IHEALTH_PUBLISHER=dryrun` にしていない限り定時実行の launchd.log は絞られたまま。全ログは `logs/run.log`
 - **`.env` の必須キー**: 常時必須キーは `HEALTH_EXPORT_DIR` / `BIRTH_DATE`。`NOTION_SECRET` / `DATABASE_ID` は notion を使うときだけ必須 (obsidian / markdown / stdout / sqlite / slack / dryrun では空でも起動できる)。`OBSIDIAN_VAULT_DIR` は obsidian のとき必須。`.env` には ihealth-relay が参照しないキーを残さないこと (`gitignore` 済とはいえ、誤コミット時の漏洩リスクを最小化する)。`.env` は行末コメントに対応しない (`KEY=値 # メモ` は `# メモ` まで値になる)
 - **プロセス環境変数でだけ効く調整値**: `IHEALTH_MATERIALIZE_TIMEOUT_SEC` / `IHEALTH_RETRY_WAIT_SEC` / `IHEALTH_RETRY_MAX` は `os.environ` から読む (`.env` に書いても効かない)
 - **実 vault を触る作業の前にはバックアップ**: 実データでの検証は vault のコピーか `--dry-run` で行い、書き込み後は「担当キー以外が byte 不変か」を機械的に確認する

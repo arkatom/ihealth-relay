@@ -15,6 +15,28 @@ I/O は一切しない (文字列 → 文字列). ファイルの読み書き・
 閉じ ``---`` 以降の本文、BOM、改行コード、末尾改行の有無 — は 1 byte も変えない.
 Unicode 正規化 (NFC/NFD) もしない (実ノートの本文には NFD 文字列が混在する).
 
+## 書き換えずに保持する entry (``kept`` + warning)
+
+entry を 1 行に置き換えるとその entry の中のコメントは消えてしまう. 重複キーは
+どの entry が有効な値なのか Obsidian / YAML パーサごとに解釈が分かれる. そのため
+次の担当キーは **値を更新せず** ``action="kept"`` とし、``FieldChange.warning`` に
+理由を残す (frontmatter 全体は拒否しない. 他のキーは通常どおり書く):
+
+- entry にコメントがある: key 行の行末コメント (``歩数 (歩): 1  # 手動``.
+  YAML としてコメントになる位置の ``#`` だけ. quoted scalar の中の ``#`` や
+  ``a#b`` は値の一部), entry の内側のコメント行 (継続行の間に挟まった ``# …``),
+  継続行の行末コメント (``  - a  # メモ``), block scalar の header のコメント
+  (``|- # メモ``). warning は :data:`WARNING_COMMENT_PRESENT` で始まる.
+  既存値が新しい値と同じなら書く必要が無いので ``unchanged`` (warning なし).
+- 担当キーの entry が frontmatter に 2 個以上ある (plain / quoted / NFC・NFD の
+  表記違いも同じキーとして数える): 値が同じでも ``kept``. warning は
+  :data:`WARNING_DUPLICATE_KEY` で始まる.
+
+コメントの判定は YAML パーサではなく字句の走査で、閉じない quote など迷う形は
+コメント扱い (= 書かない側) に倒している. 既知の限界: block sequence の要素の
+plain scalar が次の行に続き、その継続行が ``- "…"`` で始まる形 (YAML では
+``#`` 以降がコメント) は quote の中と見なしてしまう (実ノートでは現れない形).
+
 ## 対応する frontmatter の形
 
 境界は **Obsidian 本体と同じ規則** で決める (Obsidian.app の markdown パーサは
@@ -31,9 +53,9 @@ Obsidian と解釈が食い違う形には書き込まない (:class:`Frontmatte
   後続の「空白/タブで始まる行」「``-`` で始まる block sequence 行」は同じ entry の継続.
 - 空行とコメント行 (行頭 ``#`` も、インデント付きの ``  # …`` も) は entry を延長しない.
   ただし後ろに同じ entry の継続行が続く場合 (コメントを挟んだ block 値) は entry の内側
-  として扱う (= その entry を置換するとき一緒に置き換わる. 継続行だけが孤立して YAML が
-  壊れる事故を防ぐため). 例外として、block scalar (``|`` / ``>``) の内容インデント以上に
-  字下げされた ``#`` 行はコメントではなく値の一部.
+  として扱う (継続行だけが孤立して YAML が壊れる事故を防ぐため. 内側にコメント行がある
+  entry は上記のとおり書き換えない). 例外として、block scalar (``|`` / ``>``) の内容
+  インデント以上に字下げされた ``#`` 行はコメントではなく値の一部.
 - 値が quoted scalar (``"…"`` / ``'…'``) や flow collection (``[…]`` / ``{…}``) で
   key 行のうちに閉じない場合は、閉じる行までを同じ entry とする (インデント無しの
   継続行も含む. YAML パーサと同じく、継続行を別のキーと誤認しない). frontmatter 内で
@@ -78,6 +100,12 @@ ACTION_UPDATE = "update"
 ACTION_UNCHANGED = "unchanged"
 ACTION_KEPT = "kept"
 
+#: ``FieldChange.warning`` の先頭に付く機械判別用の語 (後ろに日本語の説明が続く).
+#: 担当 entry にコメントがあるため更新しなかった.
+WARNING_COMMENT_PRESENT = "comment present"
+#: 担当キーの entry が frontmatter に複数あるため更新しなかった.
+WARNING_DUPLICATE_KEY = "duplicate key"
+
 
 class FrontmatterError(ValueError):
     """frontmatter を安全に書き換えられない (閉じ ``---`` 欠落 / 解釈不能な行 など)."""
@@ -91,12 +119,15 @@ class FieldChange:
         key: ``updates`` に渡されたキー.
         action: ``"insert"`` (新規追記) / ``"update"`` (値を置換) /
             ``"unchanged"`` (既存値と意味的に同一なので触らない) /
-            ``"kept"`` (``fill_only_empty`` で既存の非空値を保持).
+            ``"kept"`` (既存値を保持. ``fill_only_empty`` で既存の非空値を残した場合
+            (warning なし) と、entry にコメントがある / キーが重複しているため安全に
+            書き換えられない場合 (warning あり) がある).
         old: 既存の raw 値テキスト (key 行のコロン以降を前後空白除去したもの +
-            継続行を ``\\n`` 連結). ``insert`` では ``None``.
+            継続行を ``\\n`` 連結). 重複キーでは最初の entry のもの. ``insert`` では ``None``.
         new: 新しい raw 値テキスト (:func:`render_scalar` の出力). ``kept`` でも
             「書くはずだった値」を入れる (既存値との不一致を台帳に残せるように).
-        warning: 重複キーなど、処理はしたが注意が必要な状況の説明. 通常 ``None``.
+        warning: 書き換えなかった理由など注意が必要な状況の説明. 通常 ``None``.
+            :data:`WARNING_COMMENT_PRESENT` / :data:`WARNING_DUPLICATE_KEY` で始まる.
     """
 
     key: str
@@ -456,6 +487,7 @@ class _Entry:
     value_head: str
     start: int   # key 行の index (frontmatter 外も含めた lines の index)
     end: int     # 最後の継続行 + 1 (exclusive)
+    value_end: int  # key 行の値 (複数行の quoted / flow ならその閉じ行) の最後の行の index
 
 
 @dataclass(frozen=True)
@@ -676,6 +708,7 @@ def _parse(lines: "list[str]") -> "_Parsed | None":
     current: "_KeyLine | None" = None
     current_start = -1
     current_last = -1
+    current_value_end = -1
     block_indent: "int | None" = None  # 現 entry が block scalar のときの内容インデント
 
     def _flush() -> None:
@@ -684,6 +717,7 @@ def _parse(lines: "list[str]") -> "_Parsed | None":
                 key=current.key, key_raw=current.key_raw,
                 value_head=current.value_head,
                 start=current_start, end=current_last + 1,
+                value_end=current_value_end,
             ))
 
     i = 1
@@ -716,6 +750,7 @@ def _parse(lines: "list[str]") -> "_Parsed | None":
         current = parsed
         current_start = i
         current_last = _multiline_end(lines, i, close_idx, parsed.value_head)
+        current_value_end = current_last
         header = _block_header(parsed.value_head)
         block_indent = (
             None if header is None else _block_content_indent(lines, i, close_idx, header)
@@ -964,6 +999,151 @@ def _check_anchor_references(
 
 
 # ---------------------------------------------------------------------------
+# entry 内のコメント検出 (コメントのある entry は書き換えない)
+# ---------------------------------------------------------------------------
+
+def _has_yaml_comment(s: str, *, plain: bool = False) -> bool:
+    """``s`` (1 行、または複数行の値を ``\\n`` で連結したもの) に YAML コメントがあるか.
+
+    直前が空白・タブ・改行 (または ``s`` の先頭) の ``#`` をコメントとみなす. ただし
+    **トークンの先頭** (``s`` の先頭・``- `` / ``? `` / ``: `` の後・flow の ``[`` ``{``
+    ``,`` の後・anchor / tag の後) で始まり ``s`` の中で閉じる quoted scalar
+    (``"…"`` / ``'…'``) の中身は飛ばす (``"PR #1"`` はコメントではない).
+    閉じない quote は中身と断定できないので、以降を plain として走査する
+    (= ``#`` をコメント扱いする側に倒す).
+
+    Args:
+        s: 走査する文字列. key 行なら値部 (コロンの後ろ)、継続行なら行全体.
+        plain: ``True`` なら plain scalar の継続行として走査する (行頭の ``- `` や
+            quote をトークンとして扱わない. YAML では plain の継続行の ``#`` は
+            quote の中に見えてもコメントになる).
+    """
+    n = len(s)
+    i = 0
+    token_start = not plain
+    depth = 0  # flow collection の入れ子の深さ
+    while i < n:
+        ch = s[i]
+        if ch in " \t\n":
+            i += 1
+            continue
+        if ch == "#" and (i == 0 or s[i - 1] in " \t\n"):
+            return True
+        if token_start:
+            if ch in "\"'":
+                status, end, _value = _scan_dq(s, i) if ch == '"' else _scan_sq(s, i)
+                token_start = False
+                if status == _SCAN_OK:
+                    i = end
+                else:
+                    i += 1  # 閉じない quote: 保守的に plain として続ける
+                continue
+            if ch in "[{":
+                depth += 1
+                i += 1
+                continue
+            if ch in "-?:" and (i + 1 >= n or s[i + 1] in " \t\n"):
+                i += 1  # block indicator: 次もトークンの先頭
+                continue
+            if ch in "&!":
+                i += 1
+                while i < n and s[i] not in " \t\n" and not (depth and s[i] in ",[]{}"):
+                    i += 1
+                continue
+            token_start = False
+        if depth:
+            if ch == ",":
+                token_start = True
+            elif ch in "]}":
+                depth -= 1
+            elif ch in "[{":
+                depth += 1  # plain の途中の括弧 (YAML としては不正): 保守的に数える
+                token_start = True
+            elif ch == ":" and (i + 1 >= n or s[i + 1] in " \t\n,[]{}"):
+                token_start = True
+        elif ch == ":" and (i + 1 >= n or s[i + 1] in " \t\n"):
+            token_start = True
+        i += 1
+    return False
+
+
+def _starts_plain_scalar(stripped: str) -> bool:
+    """値の無い key 行の後の最初の内容行 (字下げ除去済み) が plain scalar の始まりか.
+
+    block sequence (``- ``) / block mapping (``k: v``) / quoted / flow / anchor・tag・
+    alias / block scalar の始まりなら ``False``.
+    """
+    first = stripped[0]
+    if first in "-?:" and (len(stripped) == 1 or stripped[1] in " \t"):
+        return False
+    if first in "\"'[{&!*|>%@`":
+        return False
+    return _parse_key_line(stripped) is None
+
+
+def _block_entry_has_comment(
+    lines: "list[str]", entry: _Entry, close_idx: int, header: _BlockHeader,
+) -> bool:
+    """block scalar (``|`` / ``>``) の entry にコメントがあるか.
+
+    header のコメント (``|- # メモ``) と、内容インデントより浅い ``#`` 行 (= YAML では
+    コメント. 内容インデント以上の ``#`` 行は値の一部) を探す.
+    """
+    if _has_yaml_comment(entry.value_head):
+        return True
+    indent = _block_content_indent(lines, entry.start, close_idx, header)
+    for k in range(entry.start + 1, entry.end):
+        content = _content(lines[k])
+        if content.strip(" \t") == "":
+            continue
+        if indent is not None and content[0] == " " and _leading_spaces(content) >= indent:
+            continue  # 内容行 ('#' で始まっても値の一部)
+        if content.lstrip(" \t").startswith("#") or _has_yaml_comment(content, plain=True):
+            return True
+    return False
+
+
+def _entry_has_comment(lines: "list[str]", entry: _Entry, close_idx: int) -> bool:
+    """entry (key 行 + 継続行) のどこかに YAML コメントがあるか (迷ったら ``True``).
+
+    entry を 1 行に置き換えるとコメントが消えるので、``True`` の entry は書き換えない.
+    entry の後ろ (範囲外) の空行・コメント行は置換で消えないので対象外.
+    """
+    header = _block_header(entry.value_head)
+    if header is not None:
+        return _block_entry_has_comment(lines, entry, close_idx, header)
+    # key 行の値 (複数行の quoted / flow は閉じ行まで連結して quote・括弧の中を正しく飛ばす)
+    head = "\n".join(
+        [entry.value_head]
+        + [_content(lines[k]) for k in range(entry.start + 1, entry.value_end + 1)]
+    )
+    if _has_yaml_comment(head):
+        return True
+    # 値の後ろの継続行. key 行に値があれば、続く行は plain の継続 (か YAML として不正) なので
+    # plain として走査する. 値が次の行から始まるなら、最初の内容行で形を決める.
+    plain_from: "int | None" = None
+    if entry.value_head[_value_start(entry.value_head):].strip(" \t") != "":
+        plain_from = entry.value_end + 1
+    structured = False
+    for k in range(entry.value_end + 1, entry.end):
+        content = _content(lines[k])
+        stripped = content.strip(" \t")
+        if stripped == "":
+            continue
+        if stripped.startswith("#"):
+            return True  # entry の内側のコメント行
+        if plain_from is None and not structured:
+            if _starts_plain_scalar(stripped):
+                plain_from = k + 1  # 次の行からは plain scalar の継続行
+            else:
+                structured = True
+        plain = plain_from is not None and k >= plain_from
+        if _has_yaml_comment(content, plain=plain):
+            return True
+    return False
+
+
+# ---------------------------------------------------------------------------
 # upsert 本体
 # ---------------------------------------------------------------------------
 
@@ -1003,8 +1183,11 @@ def upsert_frontmatter(
     同じ値なら書き換えない (Obsidian が再シリアライズした表記を尊重し、
     無駄な書き込み・同期・バックアップを避ける).
 
-    同一キーの entry が複数ある場合は最初の entry だけを対象にし、
-    ``FieldChange.warning`` に記録する (他の entry には触れない).
+    同一キーの entry が複数ある、または entry にコメントがあるキーは書き換えず
+    ``action="kept"`` + ``FieldChange.warning`` (:data:`WARNING_DUPLICATE_KEY` /
+    :data:`WARNING_COMMENT_PRESENT` で始まる説明) にする. 他のキーは通常どおり書く.
+    コメントがあっても既存値が新しい値と同じなら ``unchanged``、``fill_only_empty``
+    で既存の非空値を保持する場合は (コメントの有無に関係なく) warning なしの ``kept``.
 
     Raises:
         FrontmatterError: 閉じ ``---`` 欠落 / Obsidian と境界の解釈が食い違う形
@@ -1063,15 +1246,18 @@ def upsert_frontmatter(
             changes.append(FieldChange(key, ACTION_INSERT, None, rendered))
             continue
         entry = matches[0]
-        warning = None
-        if len(matches) > 1:
-            warning = (
-                f"キー {key!r} の entry が frontmatter に {len(matches)} 個あります。"
-                "最初の entry だけを対象にし、他は変更していません"
-            )
-        existing = _existing_scalar(lines, entry, parsed.close_idx)
         old_raw = _raw_value(lines, entry)
+        if len(matches) > 1:
+            # どの entry が有効な値か Obsidian / YAML パーサで解釈が分かれる → 書き換えない
+            changes.append(FieldChange(key, ACTION_KEPT, old_raw, rendered, (
+                f"{WARNING_DUPLICATE_KEY}: キー {key!r} の entry が frontmatter に "
+                f"{len(matches)} 個あるため値を更新しません (どの値が有効か定まらないため。"
+                "1 つにまとめてください)"
+            )))
+            continue
+        existing = _existing_scalar(lines, entry, parsed.close_idx)
         norm = _norm_key(key)
+        warning = None
         if _semantically_equal(existing, value):
             action = ACTION_UNCHANGED
         elif (
@@ -1083,6 +1269,13 @@ def upsert_frontmatter(
             )
         ):
             action = ACTION_KEPT
+        elif _entry_has_comment(lines, entry, parsed.close_idx):
+            # 1 行に置き換えるとコメントが消える → 書き換えない
+            action = ACTION_KEPT
+            warning = (
+                f"{WARNING_COMMENT_PRESENT}: キー {key!r} の entry にコメントがあるため値を"
+                "更新しません (コメントを key 行の上の独立した行に移すと更新されます)"
+            )
         else:
             new_line = f"{entry.key_raw}: {rendered}{nl}"
             if new_line == "".join(lines[entry.start:entry.end]):
@@ -1111,3 +1304,68 @@ def upsert_frontmatter(
         out.append(lines[i])
         i += 1
     return bom + "".join(out), changes
+
+
+# ---------------------------------------------------------------------------
+# 既存値の読み取り (書き換えない. 未確定の値の台帳が「利用者が書いた値か」を判定する用)
+# ---------------------------------------------------------------------------
+
+#: :func:`classify_existing` の結果. key が無い / 値が空 (``key:`` / ``null`` / ``""`` / ``[]`` 等).
+EXISTING_EMPTY = "empty"
+#: 値が ``expected`` と YAML として同じ値.
+EXISTING_SAME = "same"
+#: 空でない、``expected`` と違う値 (``expected`` が ``None`` なら空でない値すべて).
+EXISTING_OTHER = "other"
+#: 判定できない (同じキーの entry が複数ある / 複数行の値など比較できない形).
+EXISTING_UNKNOWN = "unknown"
+
+
+def classify_existing(
+    text: str, expected: "Mapping[str, object | None]",
+) -> "dict[str, str]":
+    """ノートの各キーの既存値が「空 / ``expected`` と同じ / 別の値 / 判定不能」のどれかを返す.
+
+    テキストは一切変更しない. 突き合わせ・空判定・意味的同一の判定は
+    :func:`upsert_frontmatter` と同じ規則 (NFC 正規化したキー、``unchanged`` と同じ
+    YAML としての値の比較、``fill_only_empty`` と同じ空判定). 行末コメントは値に含めない
+    (``歩数 (歩): 1200  # メモ`` は ``1200``).
+
+    Args:
+        text: ノート全文.
+        expected: キー → 比べる値 (本ツールが以前に書いた暫定値). ``None`` なら
+            空かどうかだけを見る (空でなければ :data:`EXISTING_OTHER`).
+
+    Returns:
+        キー → :data:`EXISTING_EMPTY` / :data:`EXISTING_SAME` / :data:`EXISTING_OTHER` /
+        :data:`EXISTING_UNKNOWN`. frontmatter が無いノートは全キー空.
+
+    Raises:
+        FrontmatterError: frontmatter を解釈できない (:func:`upsert_frontmatter` と同じ条件).
+    """
+    bom = _BOM if text.startswith(_BOM) else ""
+    lines = _split_lines(text[len(bom):])
+    parsed = _parse(lines)
+    if parsed is None:
+        return {key: EXISTING_EMPTY for key in expected}
+    by_key: "dict[str, list[_Entry]]" = {}
+    for entry in parsed.entries:
+        by_key.setdefault(_norm_key(entry.key), []).append(entry)
+    result: "dict[str, str]" = {}
+    for key, value in expected.items():
+        matches = by_key.get(_norm_key(key), [])
+        if not matches:
+            result[key] = EXISTING_EMPTY
+            continue
+        if len(matches) > 1:
+            result[key] = EXISTING_UNKNOWN  # どの entry が有効な値か定まらない
+            continue
+        existing = _existing_scalar(lines, matches[0], parsed.close_idx)
+        if existing is None:
+            result[key] = EXISTING_UNKNOWN  # 比較できない形 (block collection 等)
+        elif _is_empty_value(existing):
+            result[key] = EXISTING_EMPTY
+        elif value is not None and _semantically_equal(existing, value):
+            result[key] = EXISTING_SAME
+        else:
+            result[key] = EXISTING_OTHER
+    return result

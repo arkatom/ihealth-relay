@@ -6,6 +6,13 @@
 
 - **担当キー以外は 1 byte も変えない**: 書き換えは :mod:`ihealth.frontmatter` の
   byte 保存 upsert に任せる (本文・担当外 entry・コメント・改行コード・BOM 不変).
+  コメントのある担当 entry と重複した担当キーは書き換えず ``kept`` + warning になる.
+- **書込前の独立チェック (防御の二重化)**: 書く直前 (バックアップ・tmp 作成より前、
+  dry-run でも) に、編集ロジックとは **別実装** の簡易分割 (:func:`verify_edit_invariants`)
+  で編集前後の bytes を比べる. 閉じ ``---`` より後ろの本文の byte 一致と、書き換えた
+  担当キー以外の frontmatter 行 (担当外 entry・``kept`` / ``unchanged`` の担当 entry・
+  コメント行 (行頭 / 字下げ付き)) の byte 一致・順序一致を確かめ、食い違えば **書かずに**
+  :class:`EditInvariantError` (:class:`ObsidianPublishError` の subclass) を raise する.
 - **書込前バックアップ**: 既存ノートを書き換える直前の内容を
   ``backup_dir/<取得日 UTC>/<ノート名>.<UTC タイムスタンプ>.md`` に保存 (0600).
   ``backup_retention_days`` (既定 30) より古い取得日のディレクトリは best-effort で
@@ -21,8 +28,15 @@
   書込前バックアップに入っているのは「本ツールが編集の基にした内容」であり、
   この窓で他のプログラムが書いた内容は含まれない. その場合は Obsidian の
   「ファイル復元」コアプラグインや Obsidian Sync のバージョン履歴から戻す.
-  置換直後に読み直して本ツールが書いた内容と違えば warning を出す
-  (= 置換の直後に誰かが保存した. こちらの値は次回実行で再適用される).
+- **書込後の確認**: 置換 (新規作成も) の直後に読み直し、本ツールが書いた bytes と
+  一致しなければ (= 直後に他のプログラムが保存・移動した) 成功扱いにせず、最新の内容を
+  読み直して upsert をやり直す (上の並行編集の再試行と同じ回数の上限を共有). 上限まで
+  確認できなければ :class:`ObsidianPublishError` を raise する (書いた回数と書込前
+  バックアップの場所をメッセージに含める). やり直しの試行で書けなかった (直後にノートを
+  空にされた / 日記フォルダの外へ移された等で ``skipped`` / ``missing``) 場合も、想定内の
+  「書かなかった」とは扱わず同じく :class:`ObsidianPublishError` にする. やり直しで
+  「最新の内容に既に同じ値がある」(unchanged) となったキーは、この実行で書いた値として
+  insert / update で報告する.
 - **空ノート / Templater 未処理ノート**: 0 byte (空白のみ) のノートは「作成直後で
   テンプレート適用待ち」か「他のプログラムの書込途中 (truncate 直後)」なので、
   待って読み直す. 最後まで空なら、ノート不在時と同じ規則 (下記) で作成を許される
@@ -66,6 +80,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import math
 import os
@@ -73,19 +88,22 @@ import re
 import stat
 import tempfile
 import time
+import unicodedata
 from dataclasses import dataclass, fields as dataclass_fields
 from datetime import date, datetime, timedelta, timezone, tzinfo
 from pathlib import Path
 from types import MappingProxyType
-from typing import Callable, Mapping
+from typing import Callable, Iterable, Mapping
 
 from ihealth.frontmatter import (
     ACTION_INSERT,
     ACTION_KEPT,
     ACTION_UNCHANGED,
     ACTION_UPDATE,
+    EXISTING_UNKNOWN,
     FieldChange,
     FrontmatterError,
+    classify_existing,
     render_key,
     split_frontmatter,
     upsert_frontmatter,
@@ -235,6 +253,9 @@ CREATE_TEMPLATE = "template"
 CREATE_MINIMAL = "minimal"
 _CREATE_MODES = frozenset({CREATE_NEVER, CREATE_TEMPLATE, CREATE_MINIMAL})
 
+#: 書込後の確認に失敗した試行の後でも「書けた」と言える最終試行の status.
+_VERIFIED_STATUSES = frozenset({STATUS_UPDATED, STATUS_CREATED, STATUS_UNCHANGED})
+
 #: 不在ノートの作成先を決めるときに探す近傍の日数 (対象日の前後).
 _NEIGHBOR_WINDOW_DAYS = 7
 
@@ -256,6 +277,15 @@ class ObsidianConfigError(ObsidianPublishError):
 
     :class:`ObsidianPublishError` の subclass. 統合層は本クラスを ``ConfigAppError``
     (設定不備), それ以外の :class:`ObsidianPublishError` を書込失敗系に振り分けられる.
+    """
+
+
+class EditInvariantError(ObsidianPublishError):
+    """書込前の独立チェック (:func:`verify_edit_invariants`) が担当キー以外の変更を検出した.
+
+    :mod:`ihealth.frontmatter` の編集結果と、別実装の簡易分割の見立てが食い違った
+    (= どちらかの不具合) ので、ノートには何も書かずに止める. 書込失敗系
+    (:class:`ObsidianPublishError`) として扱う (設定不正ではない).
     """
 
 
@@ -341,6 +371,214 @@ def expand_template(template_text: str, d: date) -> str:
 
 
 # ---------------------------------------------------------------------------
+# 書込前の独立した不変条件チェック
+# ---------------------------------------------------------------------------
+#
+# :mod:`ihealth.frontmatter` (編集ロジック) の tokenizer / 境界判定 / entry 範囲の計算を
+# **一切使わない** 別実装. 単純な規則だけで編集前後を比べるので、編集ロジックに不具合が
+# あっても (両者が同じ誤りをしない限り) 書き込む前に止められる. 規則が単純な分、
+# 編集ロジックが正しく扱える珍しい形 (インデント無しの継続行を持つ複数行 quoted 値、
+# YAML 独自の escape を使った quoted key など) では食い違って書き込みを拒否することがあるが、
+# それは「書かない」側の失敗なので許容する.
+
+_UTF8_BOM = b"\xef\xbb\xbf"
+
+#: 解釈できない quoted key の印 (どの担当キーとも一致しない = 担当外として保護される).
+_UNREADABLE_KEY = "\x00unreadable-key"
+
+
+@dataclass(frozen=True)
+class _PlainSplit:
+    """:func:`verify_edit_invariants` 用の簡易分割 (すべて bytes, 改行込みの行)."""
+
+    bom: bytes
+    opening: "bytes | None"     # 開始 '---' 行. frontmatter が無ければ None
+    fm: "tuple[bytes, ...]"     # 開始行と閉じ行の間の行
+    closing: "bytes | None"     # 閉じ '---' 行
+    body: bytes                 # 閉じ行より後ろ (frontmatter が無ければ BOM 以降の全体)
+
+
+def _plain_lines(data: bytes) -> "list[bytes]":
+    """``\\n`` で分割し、各行に改行を含めたまま返す (連結すると元に戻る)."""
+    parts = data.split(b"\n")
+    lines = [part + b"\n" for part in parts[:-1]]
+    if parts[-1]:
+        lines.append(parts[-1])
+    return lines
+
+
+def _without_eol(line: bytes) -> bytes:
+    if line.endswith(b"\r\n"):
+        return line[:-2]
+    if line.endswith(b"\n"):
+        return line[:-1]
+    return line
+
+
+def _plain_split(data: bytes) -> _PlainSplit:
+    """1 行目が ``---`` ちょうどなら、次に ``---`` ちょうどの行までを frontmatter とする."""
+    bom = _UTF8_BOM if data.startswith(_UTF8_BOM) else b""
+    rest = data[len(bom):]
+    lines = _plain_lines(rest)
+    if not lines or _without_eol(lines[0]) != b"---":
+        return _PlainSplit(bom, None, (), None, rest)
+    for i in range(1, len(lines)):
+        if _without_eol(lines[i]) == b"---":
+            return _PlainSplit(
+                bom, lines[0], tuple(lines[1:i]), lines[i], b"".join(lines[i + 1:]),
+            )
+    raise EditInvariantError("frontmatter の閉じ '---' が見つかりません")
+
+
+def _plain_key(line: bytes) -> "str | None":
+    """字下げの無い ``key: …`` 行なら key (NFC) を、そうでなければ ``None`` を返す.
+
+    key は ``"…"`` (JSON として復号. 失敗したら :data:`_UNREADABLE_KEY`) /
+    ``'…'`` (``''`` → ``'``) / plain (最初の「後ろが空白か行末の ``:``」まで) の 3 形式.
+    """
+    try:
+        text = _without_eol(line).decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise EditInvariantError("UTF-8 として読めない行があります") from exc
+    if not text or text[0] in " \t#":
+        return None
+    if text[0] == "-" and (len(text) == 1 or text[1] in " \t"):
+        return None  # 字下げ無しの block sequence 行
+    if text[0] in "\"'":
+        quote = text[0]
+        j = 1
+        while j < len(text):
+            if quote == '"' and text[j] == "\\":
+                j += 2
+                continue
+            if text[j] == quote:
+                if quote == "'" and text[j + 1:j + 2] == "'":
+                    j += 2
+                    continue
+                break
+            j += 1
+        if j >= len(text):
+            return None  # quote が閉じない: key 行ではない
+        after = text[j + 1:].lstrip(" \t")
+        if not after.startswith(":") or after[1:2] not in ("", " ", "\t"):
+            return None
+        if quote == "'":
+            key = text[1:j].replace("''", "'")
+        else:
+            try:
+                key = json.loads(text[:j + 1])
+            except ValueError:
+                return _UNREADABLE_KEY
+        return unicodedata.normalize("NFC", key)
+    for j, ch in enumerate(text):
+        if ch == ":" and text[j + 1:j + 2] in ("", " ", "\t"):
+            return unicodedata.normalize("NFC", text[:j].rstrip(" \t"))
+    return None
+
+
+def _is_blank_line(line: bytes) -> bool:
+    return _without_eol(line).strip(b" \t") == b""
+
+
+def _is_comment_line(line: bytes) -> bool:
+    """字下げを除いた先頭が ``#`` の行 (行頭のコメント行も、字下げ付きのコメント行も)."""
+    return _without_eol(line).lstrip(b" \t").startswith(b"#")
+
+
+def _owned_lines(
+    fm: "tuple[bytes, ...]", changed: "frozenset[str]",
+) -> "tuple[list[bool], dict[str, int]]":
+    """frontmatter の各行が「書き換えてよい担当 entry」に属するかと、担当キーごとの entry 数.
+
+    key 行から次の key 行の直前までをその key の entry とみなす. ただし
+    コメント行 (字下げを除いた先頭が ``#``。行頭でも字下げ付きでも) はどこにあっても
+    担当外、その直前に続く空行と entry の末尾に続く空行も担当外 (編集は書き換える entry を
+    1 行にし、その後ろの空行・コメント行を残す. コメントを含む entry は書き換えない) とする.
+    block scalar の内容行が ``#`` で始まる場合も担当外とみなすので、その entry を書き換えると
+    食い違って書き込みを拒否する (書かない側の誤検知なので許容する).
+    """
+    owned = [False] * len(fm)
+    counts: "dict[str, int]" = {}
+    members: "list[int]" = []
+
+    def _close() -> None:
+        while members and _is_blank_line(fm[members[-1]]):
+            members.pop()
+        for k in members:
+            owned[k] = True
+        members.clear()
+
+    in_changed = False
+    for idx, line in enumerate(fm):
+        key = _plain_key(line)
+        if key is not None:
+            _close()
+            in_changed = key in changed
+            if in_changed:
+                counts[key] = counts.get(key, 0) + 1
+                members.append(idx)
+        elif _is_comment_line(line):
+            # コメント行は常に担当外 (消えても書き換わってもいけない)。直前の空行も担当外
+            while members and _is_blank_line(fm[members[-1]]):
+                members.pop()
+            continue
+        elif in_changed:
+            members.append(idx)
+    _close()
+    return owned, counts
+
+
+def verify_edit_invariants(old: bytes, new: bytes, changed_keys: "Iterable[str]") -> None:
+    """編集前 ``old`` と編集後 ``new`` で、担当キー以外が変わっていないことを確かめる.
+
+    :mod:`ihealth.frontmatter` とは独立した簡易分割で、次をすべて確認する.
+
+    1. BOM の有無と、閉じ ``---`` より後ろの本文が byte 一致 (frontmatter が無かった
+       ノートなら、前置した frontmatter の後ろが元の全体と byte 一致).
+    2. frontmatter の開始・閉じ ``---`` 行が byte 一致 (前置した場合を除く).
+    3. ``changed_keys`` (insert / update したキー) の entry を除いた frontmatter の行
+       (担当外 entry・書き換えなかった担当 entry・コメント行 (行頭 / 字下げ付き)・entry の
+       後ろの空行) が byte 一致かつ同じ順序.
+    4. ``changed_keys`` の各キーは編集後にちょうど 1 entry (編集前は 1 個以下).
+
+    Raises:
+        EditInvariantError: どれかが成り立たない. メッセージは行番号だけで、ノートの
+            内容は含めない (通知・ログに日記の本文を出さないため).
+    """
+    changed = frozenset(unicodedata.normalize("NFC", key) for key in changed_keys)
+    before = _plain_split(old)
+    after = _plain_split(new)
+    if before.bom != after.bom:
+        raise EditInvariantError("BOM の有無が変わります")
+    if before.body != after.body:
+        raise EditInvariantError("本文 (frontmatter の閉じ '---' より後ろ) が変わります")
+    if before.opening is None:
+        if after.opening is None:
+            if changed:
+                raise EditInvariantError("書き込んだはずのキーの frontmatter がありません")
+            return
+    elif (after.opening, after.closing) != (before.opening, before.closing):
+        raise EditInvariantError("frontmatter の区切り行 '---' が変わります")
+    old_owned, old_counts = _owned_lines(before.fm, changed)
+    new_owned, new_counts = _owned_lines(after.fm, changed)
+    old_rest = [(i, line) for i, line in enumerate(before.fm) if not old_owned[i]]
+    new_rest = [line for i, line in enumerate(after.fm) if not new_owned[i]]
+    for pos, (i, line) in enumerate(old_rest):
+        if pos >= len(new_rest) or new_rest[pos] != line:
+            raise EditInvariantError(
+                f"担当キー以外の frontmatter 行が変わります (元のノートの {i + 2} 行目付近)"
+            )
+    if len(new_rest) != len(old_rest):
+        raise EditInvariantError("担当キー以外の frontmatter 行が増えます")
+    for key in sorted(changed):
+        if new_counts.get(key, 0) != 1 or old_counts.get(key, 0) > 1:
+            raise EditInvariantError(
+                f"キー {key!r} の entry 数が不正です "
+                f"(編集前 {old_counts.get(key, 0)} 個 / 編集後 {new_counts.get(key, 0)} 個)"
+            )
+
+
+# ---------------------------------------------------------------------------
 # ファイル操作の内部ヘルパー
 # ---------------------------------------------------------------------------
 
@@ -404,7 +642,8 @@ class ObsidianPublisher:
             vault 配下は不可 (バックアップが日記として同期・検索されてしまうため).
         create_missing: ``"never"`` / ``"template"`` (既定) / ``"minimal"``.
         backup_retention_days: バックアップ保持日数 (既定 30).
-        max_attempts: 並行編集を検知したときの最大試行回数 (既定 3).
+        max_attempts: 並行編集を検知したとき / 書込後の確認に失敗したときの最大試行回数
+            (既定 3. 両者で同じ上限を共有する).
         retry_interval_sec: 再試行の待ち時間 (既定 0.2 秒).
         clock: 現在時刻 (aware datetime) を返す関数. テスト用.
         sleep: 待機関数. テスト用.
@@ -511,6 +750,8 @@ class ObsidianPublisher:
         self._replaceable: "dict[str, object]" = {}
         #: 現在の publish_record で使う fill_only_empty
         self._active_fill_only_empty = fill_only_empty
+        #: 現在の publish_record で「書いたが書込後の確認に失敗した」試行の結果
+        self._unverified: "list[NotePublishOutcome]" = []
 
     # ------------------------------------------------------------------
     # 設定
@@ -721,7 +962,10 @@ class ObsidianPublisher:
 
         Raises:
             ObsidianPublishError: 書き込み失敗 / frontmatter が壊れている /
-                並行編集が続いた / target_date 不一致 など.
+                並行編集が続いた / 書込後の確認で反映を確認できなかった (やり直しの試行で
+                書けなかった skipped / missing を含む) / target_date 不一致 など.
+                書込前の独立チェックが担当キー以外の変更を検出した場合は subclass の
+                :class:`EditInvariantError` (何も書いていない).
         """
         d = record.date
         if self._target_date is not None and d != self._target_date:
@@ -733,6 +977,7 @@ class ObsidianPublisher:
             self._fill_only_empty if fill_only_empty is None else bool(fill_only_empty)
         )
         updates = self.build_updates(record)
+        self._unverified = []
         for attempt in range(1, self._max_attempts + 1):
             if attempt > 1:
                 self._sleep(self._retry_interval)
@@ -744,16 +989,103 @@ class ObsidianPublisher:
                 self._invalidate_index()
                 path = self.find_note(d)
             if path is None:
-                outcome = self._publish_new(d, updates)
+                outcome = self._publish_new(d, updates, attempt)
             else:
                 outcome = self._publish_existing(
                     d, path, updates, attempt, last=attempt == self._max_attempts,
                 )
             if outcome is not None:
-                return outcome
+                if self._unverified and outcome.status not in _VERIFIED_STATUSES:
+                    # 書いた直後に他のプログラムがノートを空にした / 日記フォルダの外へ移した 等で、
+                    # その後のノートには書けなかった (skipped / missing)。こちらの値が残っている
+                    # 保証も無く、元の内容は書込前バックアップにしか無いことがあるので、
+                    # 「書かなかった (想定内)」として扱わず失敗にする
+                    detail = f"その後のノートには書き込めませんでした: status={outcome.status}"
+                    if outcome.reason:
+                        detail += f", reason={outcome.reason}"
+                    raise self._unverified_error(d, detail)
+                return self._merge_unverified(outcome)
+        if self._unverified:
+            raise self._unverified_error(d, f"{self._max_attempts} 回試行")
         raise ObsidianPublishError(
             f"日記ノートへの並行編集が続いたため書き込みを見送りました "
             f"(date={d}, {self._max_attempts} 回試行)"
+        )
+
+    def _unverified_error(self, d: date, detail: str) -> ObsidianPublishError:
+        """書込後の確認で反映を確かめられなかった書き込みがある失敗 (書込前バックアップの場所付き)."""
+        written = ", ".join(
+            str(o.backup_path) if o.backup_path is not None else f"{o.path} (新規作成)"
+            for o in self._unverified
+        )
+        return ObsidianPublishError(
+            f"日記ノートへの書き込みを確認できませんでした: 書き込んだ直後に他のプログラムが"
+            f"ノートを保存・移動したため、こちらの値が反映されたことを確認できません "
+            f"(date={d}, {detail}, 書き込み {len(self._unverified)} 回). "
+            f"ノートの内容を確認してください (書込前バックアップ: {written})"
+        )
+
+    def existing_states(
+        self, path: "Path | None", expected: "Mapping[str, object | None]",
+    ) -> "dict[str, str]":
+        """読み取りのみ: ノートの各キーの現在値が空 / ``expected`` と同じ / 別の値 / 不明のどれか.
+
+        未確定の値の台帳 (:mod:`ihealth.diary`) が、書く値の無かったキーについて「利用者が
+        手で値を書いたか」「本ツールの暫定値のままか」を判定するのに使う
+        (:func:`ihealth.frontmatter.classify_existing`)。ノートを読めない・frontmatter を
+        解釈できない場合は全キー :data:`ihealth.frontmatter.EXISTING_UNKNOWN`。
+        """
+        unknown = {key: EXISTING_UNKNOWN for key in expected}
+        if path is None or not expected:
+            return unknown
+        try:
+            text = path.read_bytes().decode("utf-8")
+        except (OSError, UnicodeDecodeError) as exc:
+            self._logger.debug("日記ノートの現在値を読めません: %s (%s)", path, exc)
+            return unknown
+        try:
+            return classify_existing(text, expected)
+        except FrontmatterError as exc:
+            self._logger.debug("日記ノートの frontmatter を解釈できません: %s (%s)", path, exc)
+            return unknown
+
+    def _merge_unverified(self, final: NotePublishOutcome) -> NotePublishOutcome:
+        """この呼び出しで「書いたが書込後の確認に失敗した」試行があれば最終結果に反映する.
+
+        最終試行 (確認できた試行) で ``unchanged`` になったキーのうち、前の試行で
+        insert / update したキーは、その insert / update として報告する (値はこの実行で
+        書いたもので、最新の内容にもその値があることを最終試行で確かめている).
+        最終試行では何も書かず、そうしたキーがあった場合は、status と書込前バックアップを
+        最初に書いた試行のものにする (ノートの内容はこの実行の前から変わっているため).
+        前の試行で書いた値が最新の内容に残っていない (``kept`` 等) なら最終試行の結果のまま.
+        """
+        if not self._unverified or final.status not in (
+            STATUS_UPDATED, STATUS_CREATED, STATUS_UNCHANGED,
+        ):
+            return final
+        earlier: "dict[str, FieldChange]" = {}
+        for outcome in self._unverified:
+            for change in outcome.changes:
+                if change.action in (ACTION_INSERT, ACTION_UPDATE):
+                    earlier.setdefault(change.key, change)
+        merged = False
+        changes: "list[FieldChange]" = []
+        for change in final.changes:
+            if change.action == ACTION_UNCHANGED and change.key in earlier:
+                changes.append(earlier[change.key])
+                merged = True
+            else:
+                changes.append(change)
+        if final.status != STATUS_UNCHANGED:
+            return NotePublishOutcome(
+                final.date, final.path, final.status, tuple(changes), final.backup_path,
+                final.reason,
+            )
+        if not merged:
+            return final
+        first = self._unverified[0]
+        return NotePublishOutcome(
+            final.date, final.path, first.status, tuple(changes), first.backup_path, final.reason,
         )
 
     # ---- 既存ノートの更新 ----
@@ -800,11 +1132,12 @@ class ObsidianPublisher:
         if new_text == text:
             self._logger.debug("日記ノートは最新です: %s", path)
             return NotePublishOutcome(d, path, STATUS_UNCHANGED, tuple(changes))
+        new_data = self._checked_bytes(path, snap.data, new_text, changes)
         if self._dry_run:
             self._log_dry_run(path, changes)
             return NotePublishOutcome(d, path, STATUS_WOULD_UPDATE, tuple(changes))
         return self._commit_replace(
-            d, path, snap, new_text, changes, attempt, STATUS_UPDATED, "日記ノート更新",
+            d, path, snap, new_data, changes, attempt, STATUS_UPDATED, "日記ノート更新",
         )
 
     def _publish_uninitialized(
@@ -846,11 +1179,13 @@ class ObsidianPublisher:
             raise ObsidianPublishError(
                 f"空ノートの初期内容を組み立てられません: {path} ({exc})"
             ) from exc
+        # 編集の基は (空のファイルではなく) テンプレートの展開結果
+        new_data = self._checked_bytes(path, initial.encode("utf-8"), new_text, changes)
         if self._dry_run:
             self._log_dry_run(path, changes)
             return NotePublishOutcome(d, path, STATUS_WOULD_CREATE, tuple(changes))
         return self._commit_replace(
-            d, path, snap, new_text, changes, attempt, STATUS_CREATED, "空の日記ノートを初期化",
+            d, path, snap, new_data, changes, attempt, STATUS_CREATED, "空の日記ノートを初期化",
         )
 
     def _skip_unprocessed_template(
@@ -876,16 +1211,35 @@ class ObsidianPublisher:
             d, path, STATUS_SKIPPED, (), reason=REASON_UNPROCESSED_TEMPLATE,
         )
 
-    def _commit_replace(
-        self, d: date, path: Path, snap: _Snapshot, new_text: str,
-        changes: "list[FieldChange]", attempt: int, status: str, label: str,
-    ) -> "NotePublishOutcome | None":
-        """書込前バックアップ → 隠し tmp に書込 → 置換直前の再確認 → ``os.replace``.
+    def _checked_bytes(
+        self, path: Path, base_data: bytes, new_text: str, changes: "list[FieldChange]",
+    ) -> bytes:
+        """書き込む bytes を作り、編集の基 ``base_data`` との独立チェックを通す.
 
-        再確認で読込時 (``snap``) から stat か内容が変わっていれば tmp を捨てて ``None``
-        (= 読み直して再試行).
+        バックアップ・tmp の作成より前 (dry-run でも) に呼ぶ. 通らなければ何も書かずに
+        :class:`EditInvariantError`.
         """
         new_data = new_text.encode("utf-8")
+        changed = [c.key for c in changes if c.action in (ACTION_INSERT, ACTION_UPDATE)]
+        try:
+            verify_edit_invariants(base_data, new_data, changed)
+        except EditInvariantError as exc:
+            raise EditInvariantError(
+                f"書き込み前の検査で担当キー以外の変更を検出したため書き込みません: {path} ({exc})"
+            ) from exc
+        return new_data
+
+    def _commit_replace(
+        self, d: date, path: Path, snap: _Snapshot, new_data: bytes,
+        changes: "list[FieldChange]", attempt: int, status: str, label: str,
+    ) -> "NotePublishOutcome | None":
+        """書込前バックアップ → 隠し tmp に書込 → 置換直前の再確認 → ``os.replace`` → 書込後の確認.
+
+        ``new_data`` は :meth:`_checked_bytes` を通したもの. 再確認で読込時 (``snap``) から
+        stat か内容が変わっていれば tmp を捨てて ``None`` (= 読み直して再試行). 置換後の
+        読み直しが書いた内容と一致しなければ、その結果を ``self._unverified`` に残して
+        ``None`` (= 最新の内容に対して upsert をやり直す).
+        """
         backup_path = self._write_backup(path, snap.data)
         tmp = self._write_tmp(path, new_data, snap.mode)
         replaced = False
@@ -909,13 +1263,19 @@ class ObsidianPublisher:
             if not replaced:
                 self._unlink_quietly(tmp)
         self._fsync_dir(path.parent)
-        self._verify_written(path, new_data)
+        outcome = NotePublishOutcome(d, path, status, tuple(changes), backup_path)
+        if not self._verify_written(path, new_data, attempt):
+            self._unverified.append(outcome)
+            return None
         self._log_summary(label, path, changes, backup_path)
-        return NotePublishOutcome(d, path, status, tuple(changes), backup_path)
+        return outcome
 
     # ---- ノート新規作成 ----
 
-    def _publish_new(self, d: date, updates: "dict[str, object]") -> "NotePublishOutcome | None":
+    def _publish_new(
+        self, d: date, updates: "dict[str, object]", attempt: int,
+    ) -> "NotePublishOutcome | None":
+        """不在ノートを作る. ``None`` は「探し直して再試行」(並行作成 / 書込後の確認に失敗)."""
         if not updates:
             self._logger.info("書き込む値が無いため日記ノートは作成しません: date=%s", d)
             return NotePublishOutcome(d, None, STATUS_MISSING, (), reason=REASON_NOTHING_TO_WRITE)
@@ -943,14 +1303,21 @@ class ObsidianPublisher:
         except (FrontmatterError, TypeError, ValueError) as exc:
             raise ObsidianPublishError(f"新規ノートの frontmatter を組み立てられません: {d} ({exc})") from exc
         path = self._creation_dir(d) / f"{d.isoformat()}.md"
+        new_data = self._checked_bytes(path, initial.encode("utf-8"), new_text, changes)
         if self._dry_run:
             self._log_dry_run(path, changes)
             return NotePublishOutcome(d, path, STATUS_WOULD_CREATE, tuple(changes))
-        if not self._create_exclusive(path, new_text.encode("utf-8")):
+        if not self._create_exclusive(path, new_data):
             self._logger.warning("作成しようとした日記ノートが既に存在します (並行作成?): %s", path)
             return None
+        outcome = NotePublishOutcome(d, path, STATUS_CREATED, tuple(changes))
+        if not self._verify_written(path, new_data, attempt):
+            # 作った直後に他のプログラム (別端末の同名ノートを同期した Obsidian Sync など) が
+            # 書き換えた → 既存ノートとして読み直して upsert をやり直す
+            self._unverified.append(outcome)
+            return None
         self._log_summary("日記ノート作成", path, changes, None)
-        return NotePublishOutcome(d, path, STATUS_CREATED, tuple(changes))
+        return outcome
 
     def _today(self) -> date:
         """``tz`` (未指定ならシステムのローカルタイムゾーン) での今日."""
@@ -1115,23 +1482,35 @@ class ObsidianPublisher:
             except OSError:
                 pass
 
-    def _verify_written(self, path: Path, expected: bytes) -> None:
-        """置換直後の内容確認. 一致しなければ「置換の直後に誰かが保存した」として warning.
+    def _verify_written(self, path: Path, expected: bytes, attempt: int) -> bool:
+        """書き込み (置換 / 新規作成) の直後に読み直し、書いた bytes と一致するか確かめる.
 
-        その場合ノートにあるのは他のプログラムが保存した内容で、こちらの値が上書きされた
-        可能性がある (次回実行で再適用される). 逆に「再確認から置換までの窓で他のプログラムが
-        書いた内容」はここでは検出できない (置換後のファイルはこちらが書いた内容と一致する).
+        一致しない / 読めない = 書いた直後に他のプログラムがノートを保存・移動した.
+        ノートにこちらの値が残っている保証が無いので ``False`` (成功扱いにしない.
+        呼び出し側が最新の内容を読み直して upsert をやり直す). 逆に「置換直前の再確認から
+        置換までの窓で他のプログラムが書いた内容」はここでは検出できない (置換後の
+        ファイルはこちらが書いた内容と一致する).
         """
+        if attempt < self._max_attempts:
+            next_step = "最新の内容を読み直して書き込みをやり直します"
+        else:
+            next_step = "試行回数の上限に達したため反映を確認できません"
         try:
             actual = path.read_bytes()
         except OSError as exc:
-            self._logger.warning("書き込み後の確認読込に失敗: %s (%s)", path, exc)
-            return
+            self._logger.warning(
+                "書き込み後の確認読込に失敗しました。%s (attempt %d/%d): %s (%s)",
+                next_step, attempt, self._max_attempts, path, exc,
+            )
+            return False
         if actual != expected:
             self._logger.warning(
-                "書き込み直後に日記ノートが別の内容に変わっています (直後に他のプログラムが"
-                "保存した可能性。こちらの値は次回実行で再適用されます): %s", path,
+                "書き込み直後に日記ノートが別の内容に変わりました (直後に他のプログラムが"
+                "保存した可能性)。%s (attempt %d/%d): %s",
+                next_step, attempt, self._max_attempts, path,
             )
+            return False
+        return True
 
     @staticmethod
     def _unlink_quietly(path: Path) -> None:

@@ -15,8 +15,15 @@ from datetime import date, datetime
 from enum import IntEnum
 
 from ihealth.frontmatter import (
+    EXISTING_EMPTY,
+    EXISTING_OTHER,
+    EXISTING_SAME,
+    EXISTING_UNKNOWN,
+    WARNING_COMMENT_PRESENT,
+    WARNING_DUPLICATE_KEY,
     FieldChange,
     FrontmatterError,
+    classify_existing,
     render_key,
     render_scalar,
     split_frontmatter,
@@ -511,6 +518,9 @@ class TestUpsertEdgeCases(unittest.TestCase):
         self.assertEqual(out, '---\ntags: "x"\nnext: 1\n---\n')
 
     def test_block_value_with_interleaved_comment_and_blank(self):
+        # WAVE3 W3-3: 以前はこの entry を丸ごと 'tags: "x"' に置き換え、間の
+        # "# コメント" を消していた (CLAUDE.md の「コメントは不変」に反する).
+        # コメントを挟んだ entry は書き換えず kept + warning にする (他のキーは書く).
         text = (
             "---\n"
             "tags:\n"
@@ -523,7 +533,29 @@ class TestUpsertEdgeCases(unittest.TestCase):
             "next: 1\n"
             "---\n"
         )
-        out, _ = upsert_frontmatter(text, {"tags": "x"})
+        out, changes = upsert_frontmatter(text, {"tags": "x", "next": 2})
+        self.assertEqual(out, _replace_once(text, "next: 1\n", "next: 2\n"))
+        self.assertEqual([c.action for c in changes], ["kept", "update"])
+        self.assertTrue(changes[0].warning.startswith(WARNING_COMMENT_PRESENT))  # type: ignore[union-attr]
+        self.assertEqual(changes[0].old, "\n  - a\n# コメント\n\n  - b")
+        self.assertEqual(changes[0].new, '"x"')
+        self.assertIsNone(changes[1].warning)
+
+    def test_block_value_with_interleaved_blank_only_is_replaced(self):
+        # コメントが無ければ (空行を挟むだけなら) entry ごと置き換え、entry の後ろの
+        # コメント・空行は残す
+        text = (
+            "---\n"
+            "tags:\n"
+            "  - a\n"
+            "\n"
+            "  - b\n"
+            "# 末尾コメントは entry の外\n"
+            "\n"
+            "next: 1\n"
+            "---\n"
+        )
+        out, changes = upsert_frontmatter(text, {"tags": "x"})
         self.assertEqual(
             out,
             "---\n"
@@ -533,6 +565,7 @@ class TestUpsertEdgeCases(unittest.TestCase):
             "next: 1\n"
             "---\n",
         )
+        self.assertEqual(changes[0].action, "update")
 
     def test_block_scalar_and_multiline_continuation(self):
         text = (
@@ -561,13 +594,17 @@ class TestUpsertEdgeCases(unittest.TestCase):
         self.assertEqual(out2, text)
         self.assertEqual(changes2[0].action, "unchanged")
 
-    def test_duplicate_keys_only_first_updated_with_warning(self):
+    def test_duplicate_keys_are_kept_with_warning(self):
+        # WAVE3 W3-3: 以前は最初の entry だけを 9 に更新して "update" と報告していたが、
+        # YAML (後勝ち) で読み戻すと 3 のままで「書いたはずの値」が有効にならなかった.
+        # 重複キーは書き換えず kept + warning にする.
         text = "---\na: 1\nb: 2\na: 3\n---\n"
         out, changes = upsert_frontmatter(text, {"a": 9})
-        self.assertEqual(out, "---\na: 9\nb: 2\na: 3\n---\n")
-        self.assertEqual(changes[0].action, "update")
-        self.assertIsNotNone(changes[0].warning)
-        self.assertIn("2 個", changes[0].warning)
+        self.assertEqual(out, text)
+        self.assertEqual(changes[0].action, "kept")
+        self.assertEqual((changes[0].old, changes[0].new), ("1", "9"))
+        self.assertTrue(changes[0].warning.startswith(WARNING_DUPLICATE_KEY))  # type: ignore[union-attr]
+        self.assertIn("2 個", changes[0].warning)  # type: ignore[arg-type]
 
     def test_unicode_values_and_keys(self):
         text = "---\n天気:\n---\n"
@@ -614,11 +651,21 @@ class TestUpsertEdgeCases(unittest.TestCase):
 
 class TestFillOnlyEmpty(unittest.TestCase):
     def test_empty_variants_are_filled(self):
-        for raw in ("", " ", " null", " ~", ' ""', " ''", " []", " {}", " [ ]", " # comment"):
+        for raw in ("", " ", " null", " ~", ' ""', " ''", " []", " {}", " [ ]"):
             text = f"---\na:{raw}\n---\n"
             out, changes = upsert_frontmatter(text, {"a": 5}, fill_only_empty=True)
             self.assertEqual(out, "---\na: 5\n---\n", repr(raw))
             self.assertEqual(changes[0].action, "update")
+
+    def test_empty_value_with_comment_is_kept_with_warning(self):
+        # WAVE3 W3-3: 以前は ``a: # comment`` を空とみなして ``a: 5`` に置き換えていた
+        # (= コメントが消えていた). 空でもコメントのある entry は書き換えない.
+        for fill_only_empty in (True, False):
+            text = "---\na: # comment\n---\n"
+            out, changes = upsert_frontmatter(text, {"a": 5}, fill_only_empty=fill_only_empty)
+            self.assertEqual(out, text, fill_only_empty)
+            self.assertEqual(changes[0].action, "kept")
+            self.assertTrue(changes[0].warning.startswith(WARNING_COMMENT_PRESENT))  # type: ignore[union-attr]
 
     def test_non_empty_values_are_kept(self):
         for raw in (" 1", ' "x"', " -1", " false", " [a]"):
@@ -680,6 +727,202 @@ class TestFillOnlyEmpty(unittest.TestCase):
         expected = _replace_once(MIGRATED_SHAPE, "\n\n---\n", "\n\n昼寝時間: 20\n---\n")
         self.assertEqual(out, expected)
         self.assertEqual([c.action for c in changes], ["kept", "kept", "insert"])
+
+
+# ---------------------------------------------------------------------------
+# WAVE3 W3-3: コメントのある担当 entry / 重複した担当キーは書き換えない (kept + warning)
+# ---------------------------------------------------------------------------
+
+class TestCommentedEntriesAreKept(unittest.TestCase):
+    """entry を 1 行に置き換えるとコメントが消えるので、コメントのある entry は書き換えない.
+
+    「YAML としてコメントになる位置の ``#``」だけをコメントとみなす (quoted scalar・
+    block scalar の内容・``a#b`` の ``#`` は値の一部なので、通常どおり書き換える).
+    """
+
+    #: 値 "NEW" を書くと kept になる (= コメントがある) entry. ``z: 1`` は担当外.
+    COMMENTED = (
+        "a: 1  # 行末コメント",
+        'a: "x" # quoted の後ろ',
+        "a: 'it''s' # single quoted の後ろ",
+        "a: [1, 2] # flow の後ろ",
+        "a: [1,\n  # flow の中\n  2]",
+        'a: "x\n  y" # 複数行 quoted の後ろ',
+        "a: |- # header のコメント\n  q",
+        "a: |-\n    q\n  # 内容インデントより浅い行\n    r",
+        "a:\n  - q # 継続行の行末\n  - r",
+        "a:\n  k: v # 入れ子 mapping の行末",
+        "a: first\n  second # plain の継続行",
+        "a:\n  - q\n  # 字下げした独立コメント\n  - r",
+        "a:\n  - q\n# 行頭の独立コメント\n  - r",
+        "a: &x 1 # anchor 付き",
+        "a: !!str x # tag 付き",
+        "a: # 値なし",
+        'a:\n  first\n  - "plain の継続では quote の中に見えても # コメント"',
+    )
+
+    #: コメントに見えるが値の一部 (= 通常どおり置き換える) entry.
+    NOT_COMMENTED = (
+        'a: "x # y"',
+        "a: 'x # y'",
+        "a: x#y",
+        "a: http://example.com/x#frag",
+        'a: "[🔀 sample:PR #1: t](https://example.com/1#c)"',
+        'a: [1, "x # y"]',
+        "a: [1,\n  2]",
+        'a: "x\n  # 複数行 quoted の中\n  y"',
+        "a: |-\n  # block scalar の内容\n  t",
+        'a:\n  - "PR #1"\n  - r',
+        'a:\n  k: "v # x"',
+        'a:\n  - [x, {k: "v # w"}]',
+    )
+
+    def _upsert(self, body: str, **kwargs: object):
+        text = f"---\n{body}\nz: 1\n---\nbody # 本文の # は無関係\n"
+        out, changes = upsert_frontmatter(text, {"a": "NEW", "z": 2}, **kwargs)  # type: ignore[arg-type]
+        return text, out, changes
+
+    def test_commented_entries_are_kept_byte_for_byte(self):
+        for body in self.COMMENTED:
+            text, out, changes = self._upsert(body)
+            # 担当外の z は通常どおり書く (frontmatter 全体は拒否しない)
+            self.assertEqual(out, _replace_once(text, "z: 1\n", "z: 2\n"), body)
+            self.assertEqual(changes[0].action, "kept", body)
+            self.assertEqual(changes[0].new, '"NEW"', body)
+            self.assertTrue(changes[0].warning.startswith(WARNING_COMMENT_PRESENT), body)  # type: ignore[union-attr]
+            self.assertIn("'a'", changes[0].warning)  # type: ignore[arg-type]
+            self.assertEqual(changes[1].action, "update", body)
+
+    def test_hash_inside_values_is_not_a_comment(self):
+        for body in self.NOT_COMMENTED:
+            text, out, changes = self._upsert(body)
+            self.assertEqual(changes[0].action, "update", body)
+            self.assertIsNone(changes[0].warning, body)
+            self.assertIn('\na: "NEW"\nz: 2\n---\n', out, body)
+            self.assertTrue(out.endswith("---\nbody # 本文の # は無関係\n"), body)
+
+    def test_alias_with_comment_is_kept(self):
+        text = "---\nx: &x 0\na: *x # alias の後ろ\n---\n"
+        out, changes = upsert_frontmatter(text, {"a": 1})
+        self.assertEqual(out, text)
+        self.assertEqual(changes[0].action, "kept")
+
+    def test_equal_value_with_comment_is_unchanged_without_warning(self):
+        # 値が同じなら書く必要が無い (コメントも残る) ので kept ではなく unchanged
+        for text, value in (
+            ("---\na: 1  # 手動確認\n---\n", 1),
+            ('---\na: "x" # c\n---\n', "x"),
+            ("---\na: |- # memo\n  q\n---\n", "q"),
+        ):
+            out, changes = upsert_frontmatter(text, {"a": value})
+            self.assertEqual(out, text)
+            self.assertEqual(changes[0].action, "unchanged", text)
+            self.assertIsNone(changes[0].warning, text)
+
+    def test_fill_only_empty_keeps_non_empty_value_without_comment_warning(self):
+        # 既存の非空値は fill_only_empty の規則で保持する (コメントは理由ではない)
+        text = "---\na: 1  # 手動\n---\n"
+        out, changes = upsert_frontmatter(text, {"a": 2}, fill_only_empty=True)
+        self.assertEqual(out, text)
+        self.assertEqual((changes[0].action, changes[0].warning), ("kept", None))
+
+    def test_replaceable_provisional_value_with_comment_is_kept(self):
+        # 本ツールが書いた暫定値 (replaceable) でも、利用者がコメントを付けたら置き換えない
+        text = "---\na: 468  # 手動で確認済み\nb: 468\n---\n"
+        out, changes = upsert_frontmatter(
+            text, {"a": 9000, "b": 9000}, fill_only_empty=True,
+            replaceable={"a": 468, "b": 468},
+        )
+        self.assertEqual(out, "---\na: 468  # 手動で確認済み\nb: 9000\n---\n")
+        self.assertEqual([c.action for c in changes], ["kept", "update"])
+        self.assertTrue(changes[0].warning.startswith(WARNING_COMMENT_PRESENT))  # type: ignore[union-attr]
+
+    def test_comments_outside_the_entry_do_not_block_the_update(self):
+        # entry の前後 (範囲外) のコメント行は置換で消えないので書き換えてよい
+        text = "---\n# 前のコメント\na: 1\n# 後ろのコメント\n\nb: 2\n---\n"
+        out, changes = upsert_frontmatter(text, {"a": 5})
+        self.assertEqual(out, "---\n# 前のコメント\na: 5\n# 後ろのコメント\n\nb: 2\n---\n")
+        self.assertEqual(changes[0].action, "update")
+
+    def test_crlf_commented_entry_is_kept(self):
+        text = "---\r\na: 1 # c\r\nb:\r\n---\r\n"
+        out, changes = upsert_frontmatter(text, {"a": 2, "b": 3})
+        self.assertEqual(out, "---\r\na: 1 # c\r\nb: 3\r\n---\r\n")
+        self.assertEqual([c.action for c in changes], ["kept", "update"])
+
+    def test_every_comment_survives_any_update(self):
+        # 不変条件: どの担当キーをどう書いても、入力のコメント行・行末コメントは出力に残る
+        text = (
+            "---\n"
+            "# 先頭\n"
+            "a: 1  # A\n"
+            "b:\n"
+            "  - x  # B\n"
+            "c: |- # C\n"
+            "  v\n"
+            "d:\n"
+            "  - y\n"
+            "  # D\n"
+            "  - z\n"
+            "e: 5\n"
+            "# 末尾\n"
+            "---\n"
+        )
+        comments = ["# 先頭", "# A", "# B", "# C", "# D", "# 末尾"]
+        for keys in (("a",), ("b", "c"), ("a", "b", "c", "d", "e"), ("e", "new")):
+            out, _ = upsert_frontmatter(text, {k: "Q" for k in keys})
+            for comment in comments:
+                self.assertIn(comment, out, (keys, comment))
+
+
+class TestDuplicateKeysAreKept(unittest.TestCase):
+    """担当キーの entry が 2 個以上ある frontmatter は、そのキーを書き換えない."""
+
+    VARIANTS = (
+        # (frontmatter 本体, 書くキー) — plain / quoted / NFC・NFD の表記違いも重複として数える
+        ("a: 1\nb: 2\na: 3\n", "a"),
+        ('"a": 1\nb: 2\na: 3\n', "a"),
+        ("'a': 1\nb: 2\n\"a\": 3\n", "a"),
+        (f"{unicodedata.normalize('NFD', 'プ')}: 1\nb: 2\nプ: 3\n", "プ"),
+        ("a:\nb: 2\na:\n", "a"),                       # 両方空でも書かない
+        ("a: 9\nb: 2\na: 9\n", "a"),                   # 両方とも書く値と同じでも kept
+    )
+
+    def test_duplicates_are_kept_in_every_mode(self):
+        for body, key in self.VARIANTS:
+            text = f"---\n{body}---\nbody\n"
+            for kwargs in (
+                {},
+                {"fill_only_empty": True},
+                {"fill_only_empty": True, "replaceable": {key: 1}},
+            ):
+                out, changes = upsert_frontmatter(text, {key: 9, "b": 5}, **kwargs)  # type: ignore[arg-type]
+                label = (body, kwargs)
+                self.assertEqual(changes[0].action, "kept", label)
+                self.assertTrue(changes[0].warning.startswith(WARNING_DUPLICATE_KEY), label)  # type: ignore[union-attr]
+                self.assertIn("2 個", changes[0].warning, label)  # type: ignore[arg-type]
+                # 重複キーの entry はどれも 1 byte も変わらない (b だけ書く / kept)
+                expected_b = "b: 2\n" if kwargs else "b: 5\n"
+                self.assertEqual(out, _replace_once(text, "b: 2\n", expected_b), label)
+
+    def test_duplicates_of_other_keys_do_not_block(self):
+        text = "---\na: 1\nx: 2\nx: 3\n---\n"
+        out, changes = upsert_frontmatter(text, {"a": 7})
+        self.assertEqual(out, "---\na: 7\nx: 2\nx: 3\n---\n")
+        self.assertEqual((changes[0].action, changes[0].warning), ("update", None))
+
+    def test_three_entries_reported(self):
+        text = "---\na: 1\na: 2\na: 3\n---\n"
+        _, changes = upsert_frontmatter(text, {"a": 4})
+        self.assertIn("3 個", changes[0].warning)  # type: ignore[arg-type]
+
+    def test_kept_duplicate_is_never_reported_as_written(self):
+        # 以前の挙動 (最初の entry を update) は、YAML (後勝ち) で読み戻すと書いたはずの値に
+        # ならなかった. 今は書かないので「書いた値」と「読める値」の食い違いが起きない.
+        text = "---\na: 1\nb: 2\na: 3\n---\n"
+        out, changes = upsert_frontmatter(text, {"a": 9})
+        self.assertEqual(_mini_yaml_load(out)["a"], _mini_yaml_load(text)["a"])
+        self.assertNotIn(changes[0].action, ("insert", "update"))
 
 
 class TestBrokenFrontmatter(unittest.TestCase):
@@ -878,6 +1121,75 @@ class TestBlockScalarComparison(unittest.TestCase):
         out, changes = upsert_frontmatter(text, {"😀": 2})
         self.assertEqual(out, '---\n"\\ud83d\\ude00": 2\n---\n')
         self.assertEqual(changes[0].action, "update")
+
+
+class TestClassifyExisting(unittest.TestCase):
+    """:func:`classify_existing`: 既存値が空 / 暫定値と同じ / 別の値 / 判定不能 (読み取りのみ)."""
+
+    NOTE = (
+        "---\n"
+        "\"歩数 (歩)\": 1200  # 手入力メモ\n"
+        "睡眠時間 (分): 420\n"
+        "昼寝時間:\n"
+        "体重 (kg): ~\n"
+        "瞑想: []\n"
+        "天気: '晴れ'\n"
+        "Github: |-\n"
+        "  [a](https://example.com/1)\n"
+        "  [b](https://example.com/2)\n"
+        "朝散歩:\n"
+        "  - カーテンを開ける\n"
+        "気温: 1\n"
+        "気温: 2\n"
+        "---\n"
+        "本文\n"
+    )
+
+    def test_states(self):
+        states = classify_existing(self.NOTE, {
+            "歩数 (歩)": 1200,          # 行末コメントは値に含めない
+            "睡眠時間 (分)": 425,       # 本ツールの暫定値と違う = 利用者の値
+            "昼寝時間": None,
+            "体重 (kg)": 60.0,          # null は空
+            "瞑想": None,               # 空のリストは空
+            "天気": "晴れ",             # quoted でも YAML として同じ値
+            "Github": "[a](https://example.com/1)\n[b](https://example.com/2)",  # literal block
+            "朝散歩": None,             # block collection は比較できない
+            "気温": None,               # 重複キー
+            "降水量": None,             # キーが無い
+        })
+        self.assertEqual(states, {
+            "歩数 (歩)": EXISTING_SAME,
+            "睡眠時間 (分)": EXISTING_OTHER,
+            "昼寝時間": EXISTING_EMPTY,
+            "体重 (kg)": EXISTING_EMPTY,
+            "瞑想": EXISTING_EMPTY,
+            "天気": EXISTING_SAME,
+            "Github": EXISTING_SAME,
+            "朝散歩": EXISTING_UNKNOWN,
+            "気温": EXISTING_UNKNOWN,
+            "降水量": EXISTING_EMPTY,
+        })
+
+    def test_non_empty_value_without_expected_is_other(self):
+        self.assertEqual(
+            classify_existing(self.NOTE, {"睡眠時間 (分)": None}), {"睡眠時間 (分)": EXISTING_OTHER},
+        )
+
+    def test_nfd_key_matches(self):
+        nfd = unicodedata.normalize("NFD", "アクティビティ時間 (分)")
+        text = f"---\n{nfd}: 30\n---\n"
+        self.assertEqual(
+            classify_existing(text, {"アクティビティ時間 (分)": 30}),
+            {"アクティビティ時間 (分)": EXISTING_SAME},
+        )
+
+    def test_note_without_frontmatter_is_empty(self):
+        self.assertEqual(classify_existing("本文だけ\n", {"歩数 (歩)": 1}), {"歩数 (歩)": EXISTING_EMPTY})
+
+    def test_broken_frontmatter_raises(self):
+        with self.assertRaises(FrontmatterError):
+            classify_existing("---\n歩数 (歩): 1\n", {"歩数 (歩)": 1})
 
 
 if __name__ == "__main__":

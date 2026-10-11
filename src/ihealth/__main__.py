@@ -1,7 +1,7 @@
 """エントリポイント: ``python3 -m ihealth``
 
 起動確認 → 設定読込 → AutoSync 配下の ``.hae`` 解凍 →
-``data/health/YYYY-MM-DD/{metric}.json`` にアーカイブ → 14 フィールド集計 →
+``data/health/YYYY-MM-DD/{metric}.json`` にアーカイブ → 健康 15 フィールド集計 →
 ``--publisher`` で選択した sink (notion / markdown / stdout / sqlite / slack /
 dryrun) に転記 → 失敗時 Reminders.app 通知までを実行する。
 
@@ -37,7 +37,8 @@ publisher の決定順: ``--publisher`` → ``.env`` の ``IHEALTH_PUBLISHER`` �
     9: SQLite 書き込み失敗 (SQLiteAppError, Phase 1 A3-sqlite)
     10: Slack 通知失敗 (SlackAppError, Phase 1 A3-slack)
     11: Obsidian 日記の書き込み失敗 / 全 source の取得失敗 (ObsidianAppError)
-    12: Obsidian 日記の一部 source の取得失敗 (DiaryPartialFailureError)
+    12: Obsidian 日記の一部 source の取得失敗 / 確認が要るノート / 実行レポート・
+        未確定の値の台帳を保存できない (DiaryPartialFailureError)
 
 終了コード 3 以上の失敗はすべて Reminders.app にリマインダーを追加する
 (``--dry-run`` 指定時も通知ルートは同じ、ただし通常は dry-run でエラーは起こらない)。
@@ -47,7 +48,9 @@ obsidian の失敗通知は 1 run 1 通に集約し、同じ内容は 1 日 1 �
 1 日 1 回まで (``logs/.failure_notified``。launchd は 1 日 3 回起動するため)。
 
 launchd 経由 (標準エラーが端末でない) では、標準エラーに出すログを WARNING 以上に絞る
-(launchd.log はローテーションされない。全ログは ``logs/run.log``)。``--verbose`` 時は絞らない。
+(launchd.log はローテーションされない。全ログは ``logs/run.log``)。``--verbose`` 時と
+dry-run (``--dry-run`` / ``--publisher dryrun``) 時は絞らない (dry-run はログが出力そのもの
+なので、リダイレクト・パイプ先にも起動行と差分を出す)。
 
 **Issue #16 リファクタ後**: 本モジュールは **引数処理 + 設定読込 +
 AppError → 終了コード + Reminders 通知 のマッピング** だけに責務を絞る。
@@ -347,15 +350,22 @@ def _notify_config_failure(
     )
 
 
-def _quiet_stderr_when_not_tty(logger: logging.Logger, *, verbose: bool) -> None:
+def _quiet_stderr_when_not_tty(
+    logger: logging.Logger, *, verbose: bool, dry_run: bool = False,
+) -> None:
     """標準エラーが端末でない (launchd) とき、標準エラーへのログを WARNING 以上に絞る。
 
     launchd は標準エラーを ``~/Library/Logs/ihealth-relay/launchd.log`` に追記し、
     このファイルはローテーションされない。INFO まで出すと 1 日 3 回の実行で
     ``logs/run.log`` (日次ローテーション) と同じ内容が際限なく溜まるので、
     launchd.log は「起動失敗・警告・エラー」だけにする。``--verbose`` 指定時は絞らない。
+
+    dry-run (``--dry-run`` / ``--publisher dryrun``) も絞らない: 起動行と ``[dry-run]`` の
+    差分行 (dryrun publisher では組み立てた properties) のログが出力そのものなので、
+    ``> out.txt 2>&1`` やパイプ (less / grep) の先でも見えないと意味がない。launchd は
+    ``--dry-run`` を付けずに起動するので、定時実行の launchd.log は絞られたまま。
     """
-    if verbose:
+    if verbose or dry_run:
         return
     for handler in logger.handlers:
         if not isinstance(handler, logging.StreamHandler) or isinstance(handler, logging.FileHandler):
@@ -377,7 +387,8 @@ def _run_obsidian(args: argparse.Namespace, config: Config, log: logging.Logger)
     ``--date`` / ``--from`` / ``--to`` / ``--sources`` の不正は exit 2。source の失敗は
     :func:`run_diary` が 1 通の通知と終了コード (11 / 12) に集約する。設定不備 (exit 3) と
     想定外エラー (exit 1) の通知は同じ内容なら 1 日 1 回 (``--dry-run`` は送らずログだけ)。
-    日付の指定が無い (launchd の) 実行では、暫定値がまだ確定していない日も処理し直す
+    日付の指定が無い (launchd の) 実行では、値がまだ確定していない日 (暫定値・保留・
+    天気の公開待ち / 未完成・GitHub の取得不完全。``data/diary-state.json``) も処理し直す
     (``DiaryOptions.revisit_unresolved``)。
     """
     today = diary_today(_utc_now, config.diary_tz)
@@ -413,7 +424,7 @@ def _run_obsidian(args: argparse.Namespace, config: Config, log: logging.Logger)
         sources=tuple(sources),
         dry_run=args.dry_run,
         fill_empty_only=args.fill_empty_only,
-        # 引数なし (launchd) の実行では、暫定値がまだ確定していない日も処理し直す
+        # 引数なし (launchd) の実行では、値がまだ確定していない日も処理し直す
         revisit_unresolved=default_window,
     )
 
@@ -501,7 +512,9 @@ def main(argv: "list[str] | None" = None) -> int:
 
     log_level = "debug" if args.verbose else config.log_level
     logger = configure_logger(log_level)
-    _quiet_stderr_when_not_tty(logger, verbose=args.verbose)
+    _quiet_stderr_when_not_tty(
+        logger, verbose=args.verbose, dry_run=args.dry_run or publisher == "dryrun",
+    )
 
     if publisher == "obsidian":
         return _run_obsidian(args, config, logger)

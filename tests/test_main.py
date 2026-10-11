@@ -218,7 +218,37 @@ class TestMainEndToEnd(unittest.TestCase):
 
     fetcher / parser / publisher を具体的にモックして、 main() の終了コード /
     Reminders 経路までを 1 関数呼び出しで検証する.
+
+    ログはこのテストの StringIO にだけ出す (``configure_logger`` をそのまま呼ぶと
+    リポジトリの実 ``logs/run.log`` に WARNING 行を追記してしまうため).
     """
+
+    def setUp(self) -> None:
+        import io
+        import logging
+        from ihealth.logger import configure as _configure
+
+        self.log_stream = io.StringIO()
+
+        def _configure_to_stream(level: str) -> logging.Logger:
+            return _configure(level, enable_file_handler=False, stream=self.log_stream)
+
+        logger = logging.getLogger("ihealth")
+        saved = (list(logger.handlers), logger.level, logger.propagate)
+
+        def _restore_logger() -> None:
+            for handler in list(logger.handlers):
+                logger.removeHandler(handler)
+                handler.close()
+            for handler in saved[0]:
+                logger.addHandler(handler)
+            logger.setLevel(saved[1])
+            logger.propagate = saved[2]
+
+        self.addCleanup(_restore_logger)
+        patcher = patch("ihealth.__main__.configure_logger", side_effect=_configure_to_stream)
+        self.configure_logger = patcher.start()
+        self.addCleanup(patcher.stop)
 
     def _setup_env(self, tmp: Path, *, with_notion: bool = True) -> Path:
         """テスト用の .env と HEALTH_EXPORT_DIR を作って返す.
@@ -260,6 +290,14 @@ class TestMainEndToEnd(unittest.TestCase):
                 )
                 rc = main(["--dry-run", "--date", "2026-04-22"])
             self.assertEqual(rc, 0)
+            # ログはテストの StringIO にだけ出る (実 logs/run.log の FileHandler を付けない)
+            import logging
+            self.configure_logger.assert_called_once()
+            handlers = logging.getLogger("ihealth").handlers
+            self.assertTrue(handlers)
+            self.assertFalse(any(isinstance(h, logging.FileHandler) for h in handlers))
+            # 以前は実 logs/run.log に追記されていた WARNING 行が、テストの stream に出ている
+            self.assertIn("[WARNING] ihealth", self.log_stream.getvalue())
 
     def test_markdown_without_notion_secret_writes_file(self):
         """``--publisher markdown`` は NOTION_SECRET 不在でも書き込み完了."""
@@ -492,11 +530,18 @@ class TestPublisherSelection(unittest.TestCase):
 
 
 class ObsidianMainTestBase(unittest.TestCase):
-    """``main()`` の obsidian 経路の土台 (合成 vault / 実ネットワーク・Reminders なし)."""
+    """``main()`` の obsidian 経路の土台 (合成 vault / 実ネットワーク・Reminders なし).
+
+    パッチは tearDown ではなく ``addCleanup`` で外す。unittest は tearDown → cleanup の順に
+    走るので、基底が tearDown で外すと、サブクラスが同じ対象に重ねたパッチ
+    (``TestObsidianMainWiring`` の ``fetch_weather``) が後から外れて基底のモックを書き戻し、
+    後続のテストまで残っていた。cleanup に揃えれば登録の逆順 (LIFO) で外れる。
+    """
 
     def setUp(self) -> None:
         import logging as _logging
         self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
         self.root = Path(self._tmp.name)
         (self.root / "AutoSync").mkdir()
         self.vault = self.root / "vault"
@@ -523,15 +568,24 @@ class ObsidianMainTestBase(unittest.TestCase):
             patch("sys.stderr", new_callable=__import__("io").StringIO),
             patch("ihealth.diary.time.sleep"),  # 気象庁の 1 req/s 間隔を実時間で待たない
         ]
-        self.mocks = [p.start() for p in self.patches]
+        # パッチより先に登録した cleanup は、サブクラスのものも含めて全パッチが外れた後に走る
+        self.addCleanup(self._assert_fetch_weather_unpatched)
+        self.mocks = []
+        for p in self.patches:
+            self.mocks.append(p.start())
+            self.addCleanup(p.stop)
         self.stderr = self.mocks[-2]
         self.main_notify = self.mocks[3]
         self.diary_notify = self.mocks[4]
 
-    def tearDown(self) -> None:
-        for p in reversed(self.patches):
-            p.stop()
-        self._tmp.cleanup()
+    def _assert_fetch_weather_unpatched(self) -> None:
+        """パッチの外し漏れ (停止順の誤り) を、漏らしたテスト自身の失敗にする。"""
+        import ihealth.diary as _diary
+        import ihealth.weather as _weather
+        self.assertIs(
+            _diary.fetch_weather, _weather.fetch_weather,
+            "ihealth.diary.fetch_weather がモックのまま残っている (パッチの停止順を確認)",
+        )
 
     def write_env(self, *extra: str) -> None:
         lines = [
@@ -696,6 +750,24 @@ class TestObsidianMainWiring(ObsidianMainTestBase):
         self.assertEqual(rc, 0)
         self.assertIn('気温: "朝:平均5.0℃', self.note.read_text(encoding="utf-8"))
 
+    def test_unwritable_run_report_exit_12_without_touching_notes(self):
+        # 実行レポート (全数台帳) を作れない → 書けるはずの天気も書かずに exit 12 + 通知 (W3-5)
+        self.write_env("IHEALTH_SOURCES=weather", "IHEALTH_PUBLISHER=obsidian")
+        (self.root / "logs").write_text("logs がファイルになっている", encoding="utf-8")
+        rc = main(["--date", "2025-01-14"])
+        self.assertEqual(rc, 12)
+        self.assertEqual(self.note.read_text(encoding="utf-8"), self.note_text)
+        self.assertFalse((self.root / "data" / "obsidian-backup").exists())
+        self.diary_notify.assert_called_once()
+        self.main_notify.assert_not_called()
+        title, body = self.diary_notify.call_args[0]
+        self.assertIn("実行レポート", title)
+        self.assertIn("日記を更新しませんでした", body)
+        # 同じ設定で logs が直れば、同じ日付が書かれる (中断で何も失われていない)
+        (self.root / "logs").unlink()
+        self.assertEqual(main(["--date", "2025-01-14"]), 0)
+        self.assertIn('気温: "朝:平均5.0℃', self.note.read_text(encoding="utf-8"))
+
 
 class TestObsidianMainDefaultWindow(ObsidianMainTestBase):
     """引数なし (launchd) の window: IHEALTH_LOOKBACK_DAYS / INCLUDE_TODAY / TZ_OFFSET."""
@@ -742,8 +814,15 @@ class TestObsidianMainDefaultWindow(ObsidianMainTestBase):
         data = self._report(env=("IHEALTH_LOOKBACK_DAYS=2",))
         self.assertEqual(data["window"]["from"], "2025-01-05")
         self.assertIn("2025-01-05", [day["date"] for day in data["dates"]])
+        # 実行レポートは予定の日付一覧 (window + 台帳から加えた日) を持つ (W3-5)
+        self.assertEqual(
+            data["planned_dates"], ["2025-01-05", "2025-01-14", "2025-01-15", "2025-01-16"],
+        )
+        self.assertEqual(data["revisit_dates"], ["2025-01-05"])
+        self.assertEqual((data["status"], data["processed"]), ("finished", 4))
         explicit = self._report("--date", "2025-01-14")
         self.assertEqual([day["date"] for day in explicit["dates"]], ["2025-01-14"])
+        self.assertEqual(explicit["revisit_dates"], [])
 
 
 class TestObsidianMainNotifications(ObsidianMainTestBase):
@@ -804,12 +883,56 @@ class TestLaunchdStderr(ObsidianMainTestBase):
         self.addCleanup(restore.stop)
 
     def test_info_is_not_written_to_non_tty_stderr(self):
+        # 定時実行 (--dry-run なし) は launchd.log に INFO を出さない
         self.enable_info_logs()
         self.write_env("IHEALTH_SOURCES=health")
-        self.assertEqual(main(["--publisher", "obsidian", "--dry-run", "--date", "2025-01-14"]), 0)
+        self.assertEqual(main(["--publisher", "obsidian", "--date", "2025-01-14"]), 0)
         output = self.stderr.getvalue()
         self.assertNotIn("ihealth-relay 起動", output)
         self.assertIn("[WARNING]", output, "警告は launchd.log にも出る")
+
+    def test_dry_run_keeps_info_on_non_tty_stderr(self):
+        # --dry-run は差分のログが出力そのもの: `> out.txt 2>&1` やパイプ (less / grep) の先にも
+        # 起動行と [dry-run] 行を出す
+        self.enable_info_logs()
+        self.write_env("IHEALTH_SOURCES=weather")
+        note_text = '---\n日付: 2025-01-14\n天気: "既存"\n気温:\n---\n本文\n'
+        self.note.write_text(note_text, encoding="utf-8")
+        with patch("ihealth.diary.fetch_weather", side_effect=_complete_weather):
+            rc = main(["--publisher", "obsidian", "--dry-run", "--date", "2025-01-14"])
+        self.assertEqual(rc, 0)
+        lines = self.stderr.getvalue().splitlines()
+        startup = [line for line in lines if "ihealth-relay 起動" in line]
+        self.assertEqual(len(startup), 1, lines)
+        self.assertIn("dry_run=True, publisher=obsidian", startup[0])
+        planned = [line for line in lines if "[dry-run] " in line]
+        self.assertTrue(any("気温" in line for line in planned), lines)
+        self.assertEqual(self.note.read_text(encoding="utf-8"), note_text)
+
+    def test_dryrun_publisher_keeps_info_on_non_tty_stderr(self):
+        # obsidian 以外の --dry-run / --publisher dryrun も、組み立てた properties のログが出力
+        from datetime import date as _date
+        from ihealth.models import DailyHealthData
+        from ihealth.source import FetchResult
+        self.enable_info_logs()
+        self.write_env()
+        fetched = FetchResult(
+            target_date=_date(2026, 4, 22), archive_dir=self.root / "archive" / "2026-04-22",
+            archived={}, missing=[],
+        )
+        parsed = DailyHealthData(date=_date(2026, 4, 22), step_count=12345)
+        for argv, summary in (
+            (["--dry-run"], "dry_run=True, publisher=notion"),
+            (["--publisher", "dryrun"], "dry_run=False, publisher=dryrun"),
+        ):
+            with self.subTest(argv=argv):
+                start = len(self.stderr.getvalue())
+                with patch("ihealth.workflow.fetch_all_metrics", return_value=fetched), \
+                     patch("ihealth.workflow.parse_all", return_value=parsed):
+                    self.assertEqual(main([*argv, "--date", "2026-04-22"]), 0)
+                output = self.stderr.getvalue()[start:]
+                self.assertIn(f"ihealth-relay 起動 (target=2026-04-22, {summary})", output)
+                self.assertIn("--dry-run: Notion に送らず", output)
 
     def test_warnings_still_reach_stderr(self):
         from ihealth.weather import WeatherError

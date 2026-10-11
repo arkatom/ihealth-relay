@@ -8,7 +8,7 @@ AutoSync は 1 メトリクス / 1 日単位にファイルを分割して吐き
 
     <HEALTH_EXPORT_DIR>/HealthMetrics/{metric_snake}/{YYYYMMDD}.hae
 
-本モジュールは 13 メトリクス分を順に解凍し、
+本モジュールは 11 メトリクス分 (:data:`METRIC_DIRS`) を順に解凍し、
 ``./data/health/YYYY-MM-DD/{metric_snake}.json`` にアーカイブして、
 アーカイブ先パスの辞書 (``FetchResult.archived``) を返す。以降のパース処理は
 アーカイブ先を正として進める（再実行時の冪等性・デバッグ容易化）。
@@ -102,7 +102,8 @@ _RETRY_WAIT_UPPER_BOUND_SEC = 3600.0
 _RETRY_MAX_UPPER_BOUND = 100
 
 
-#: 内部ロジック上の 13 メトリクスキー → AutoSync 配下の HealthMetrics/ サブディレクトリ名。
+#: 内部ロジック上の 11 メトリクスキー → AutoSync 配下の HealthMetrics/ サブディレクトリ名
+#: (健康 15 フィールドは :data:`ihealth.parser.FIELD_SOURCES` でここから派生させる)。
 #:
 #: * ``heart_rate`` 1 つから ``heart_rate_avg`` と ``heart_rate_max`` を取り出す
 #: * ``mindful_minutes`` 1 つから ``mindful_sessions`` と ``mindful_minutes`` を取り出す
@@ -449,7 +450,7 @@ def fetch_all_metrics(
     logger: "logging.Logger | None" = None,
     retry_on_critical_missing: bool = True,
 ) -> FetchResult:
-    """``target_date`` の 13 メトリクス分の .hae を解凍してアーカイブする。
+    """``target_date`` の 11 メトリクス分 (:data:`METRIC_DIRS`) の .hae を解凍してアーカイブする。
 
     主要メトリクス (``_CRITICAL_METRICS``) が 1 件でも欠落していれば
     ``_RETRY_WAIT_SEC`` 秒待って最大 ``_RETRY_MAX`` 回リトライする
@@ -540,7 +541,7 @@ def fetch_metric_for_date(
 ) -> "Path | None":
     """指定 1 メトリクスの当日 ``.hae`` を解凍してアーカイブ先の Path を返す。
 
-    全 13 メトリクス走査の ``fetch_all_metrics`` と違い、1 メトリクスだけを
+    全 11 メトリクス走査の ``fetch_all_metrics`` と違い、1 メトリクスだけを
     ad-hoc に取りたいとき (例: Issue #14 の前日 ``sleep_analysis`` 併読) に使う。
 
     Args:

@@ -14,27 +14,47 @@
   JSON で ``None`` のフィールドだけを同日の AutoSync .hae で補う (フィールド単位補完)。
   特に JSON の睡眠が aggregateSleep (昼寝を分離できない) の日は ``nap_hours`` を
   .hae から採る。``sleep_hours`` は JSON の totalSleep (= 昼寝込みの総睡眠) のまま
-* JSON が無い日は AutoSync .hae だけで集計する (旧パイプラインと同じ集計関数)。
-  アクティビティ詳細はワークアウトを読まないので書かない (``None``)
+* JSON が無い日は AutoSync .hae だけで集計する (旧パイプラインと同じ集計関数)
 * どちらも無ければ ``nodata``、読めなければ ``failed``
 
 を返す。各結果には完全性ステータス (``complete`` / ``partial`` / ``failed`` /
 ``nodata``) を付け、統合側 (diary) が「書く / 既存値を保持する / 通知する」を
 判断できるようにする。
 
-**途中までの出力は確定値として返さない** (「確定」ルール): HAE はファイルを
-書き出した時点までのデータしか含めない。ファイルの最終更新 (mtime) が対象日の
-終了 (ローカル時刻の翌日 0:00) より前なら、そのファイルは対象日の途中までしか
-含まない。
+**暫定値と保留** (WAVE3 W3-2h): HAE はファイルを書き出した時点までのデータしか
+含めない。ファイルの最終更新 (mtime) が対象日の終わりより前なら、そのファイルは
+対象日の途中までしか含まない。
 
-* 対象日が **まだ終わっていない** (今日) → 値を返し ``provisional=True`` (後の実行で
-  上書きされる暫定値。§4.6)
-* 対象日が **もう終わっている** → そのファイル由来の値は返さず ``withheld_fields``
-  に載せる (既存値を保持)。オートメーションは後で再出力されれば次回以降の実行で
-  確定値が入る。AutoSync (停止済み) は二度と更新されないので恒久的に保留
-* 最良候補を読めず古い候補へ fallback するときは、その候補が対象日の終了後に
-  書かれたもの (確定) である場合に限る (読めなかった新しい候補より古い値で既存値を
-  上書きしないため。今日の分は fallback しない)
+* オートメーション JSON (主ソース) が対象日の途中までの出力 → 値は **返し**
+  ``provisional=True`` (暫定値)。対象日が既に終わっていても同じ: HAE の
+  オートメーションは直近の日のファイルを毎回書き直すので、再出力されれば後の実行で
+  確定値に置き換わる (統合側が暫定値の台帳で確定まで追跡する)。対象日がまだ
+  終わっていない (今日) も ``provisional=True`` (§4.6)
+* segment 形式の夜主睡眠で、前日ファイルが無い / 読めない / 夜が明ける前の古い
+  出力 / 集計形式のため 0 時前の segment を結合できない → 過少の恐れがある値を
+  返し ``provisional=True`` (前日ファイルが再出力されれば確定値に置き換わる)。
+  暫定なのは夜主睡眠だけなので ``provisional_fields=("sleep_hours",)`` (統合側は
+  他のフィールドを確定値として扱う)
+* AutoSync .hae (補完 / 旧経路) が対象日の途中までの出力で、対象日が既に終わって
+  いる → そのファイル由来の値は返さず ``withheld_fields`` に載せる (AutoSync は
+  停止済みで二度と書き直されない = 確定しない過少値を書かない)。``withheld_fields``
+  に載るのはこの場合だけ。今日の分なら暫定値として返す
+* 最良候補を読めず古い候補へ fallback するときは、その候補が対象日の終わり以降に
+  書かれたもの (確定) である場合に限る (読めなかった新しい候補より古い途中経過で
+  既存値を上書きしないため。今日の分は fallback しない)
+
+**日の終わり** = 対象日の翌日 0:00。オートメーション JSON はその日の **record 自身の
+offset** の暦日 (:func:`ihealth.automation_parser.record_day_end`。offset が混在すれば
+最も遅い終わり)、offset が無い / AutoSync .hae は日記の基準 tz (``IHEALTH_TZ_OFFSET``,
+:attr:`Config.diary_tz`) で求める。mtime (epoch 秒) と現在時刻はどちらも絶対時刻で
+比べるので Mac のローカル tz に依存しない。
+
+**アクティビティ詳細** (WAVE3 W3-7 改訂): 両経路とも
+:func:`ihealth.automation_parser.compose_activity_detail` の規則 (瞑想 → ワークアウト /
+エクササイズ時間。何も無い日は、補完後の最終的な値に心拍 (平均 / 最大心拍数・運動強度
+スコア) がある = Watch を着けていた日なら ``"なし"``、無ければ書かない)。AutoSync
+経路はワークアウトを読まないので「ワークアウトを出力しない設定」と同じく
+``mindful_minutes`` / ``apple_exercise_time`` / ``heart_rate`` の .hae から組む。
 
 ``HEALTH_EXPORT_DIR`` は HAE の Documents root でも AutoSync ディレクトリでも動く:
 
@@ -53,7 +73,7 @@ import logging
 import os
 from collections.abc import Mapping
 from dataclasses import dataclass
-from datetime import date, datetime, time, timedelta
+from datetime import date, datetime, time, timedelta, timezone, tzinfo
 from pathlib import Path
 from typing import Callable, Iterable
 
@@ -67,13 +87,16 @@ from ihealth.automation import (
 from ihealth.automation_parser import (
     HAE_AGGREGATED_SLEEP_DAY_END_HOUR,
     HEALTH_FIELDS,
+    MINDFUL_FIELDS,
     SLEEP_MODE_SEGMENTS,
-    build_activity_detail,
+    compose_activity_detail,
     has_data_for,
+    has_heart_rate,
     needs_prev_payload,
     parse_automation_day_detailed,
+    record_day_end,
 )
-from ihealth.config import Config
+from ihealth.config import JST, Config
 from ihealth.models import DailyHealthData
 from ihealth.parser import (
     FIELD_SOURCES,
@@ -96,7 +119,8 @@ STATUS_COMPLETE = "complete"
 STATUS_PARTIAL = "partial"
 #: 取得不能 (ファイルはあるが読めない / 想定外エラー / 設定不備)
 STATUS_FAILED = "failed"
-#: 正常に探したが対象日の確定データが存在しない (HAE 未出力・出力が途中までなど。通知不要)
+#: 正常に探したが対象日のデータが存在しない (HAE 未出力 / 停止済み AutoSync の途中までの
+#: 出力しか無く全部保留した。保留したフィールドは ``withheld_fields`` に載る)
 STATUS_NODATA = "nodata"
 
 _SLEEP_DIR = "sleep_analysis"
@@ -115,29 +139,38 @@ class HealthLoadResult:
     統合側の使い方:
 
     * ``health`` の **非 None フィールドだけを書く** (None = 書かない = 既存値を保持)。
-      非 None の値は status が partial でも「確実に取れた値」: 失敗した / 過少の恐れが
-      ある / 対象日の途中までの出力に由来するフィールドは None に落としてある
-    * ``provisional=True`` は対象日がまだ終わっていない (今日) ことを表す。値は
-      その時点までの暫定値で、後の実行で確定値に上書きされる前提 (§4.6)
+      非 None の値は status が partial でも「取れた値」: 失敗した / 停止済み AutoSync の
+      途中までの出力に由来するフィールドは None に落としてある
+    * ``provisional=True`` の値は暫定値 (後で増えうる / 確定値に置き換わる前提。§4.6):
+      対象日がまだ終わっていない (今日)、主ソースのオートメーション JSON が対象日の
+      終わりより前に書き出された途中経過 (日が既に終わっていても)、segment 形式の
+      夜主睡眠が前日ファイルの不足で過少の恐れがある、のいずれか。統合側は暫定値の
+      台帳で確定するまで追跡する
     * ``failed`` は通知対象 (``errors`` に理由)。``partial`` は取れた値を書いたうえで
-      ``errors`` を報告する。``nodata`` (ファイル未出力 / 出力が途中まで) は通知不要
+      ``errors`` を報告する。``nodata`` (ファイル未出力 / 停止済み AutoSync の途中までの
+      出力しか無い) はエラーではない
 
     Attributes:
         health: 集計結果。1 フィールドも取れなかった日は ``None``
-        activity_detail: ``"瞑想3分"`` / ``"なし"`` 等。判断できない日は ``None`` (書かない)
+        activity_detail: ``"瞑想3分、エクササイズ21分"`` / ``"なし"`` 等
+            (:func:`ihealth.automation_parser.compose_activity_detail` の規則)。
+            瞑想も運動も心拍も無い (Watch を着けていない) / 判断できない日は ``None`` (書かない)
         source: ``"automation"`` / ``"autosync"`` / ``"none"`` (主に使ったデータ源)
-        detail: ログ用の説明 (採用 path / 補完 / 保留 / 失敗理由)
+        detail: ログ用の説明 (採用 path / 補完 / 暫定 / 保留 / 失敗理由)
         status: ``complete`` / ``partial`` / ``failed`` / ``nodata``
         missing_fields: ``None`` のまま (= 書かない) のフィールド名 (定義順)
         errors: 失敗の説明 (partial / failed の根拠。通知本文用)
         supplemented_fields: オートメーション JSON の欠落を AutoSync .hae で補ったフィールド
-        provisional: 対象日がまだ終わっていない (= 値は暫定、後で増えうる)
-        withheld_fields: データ源が **確定していない** ため返さなかったフィールド
-            (``missing_fields`` の部分集合)。対象日の終了前に書かれた出力
-            (オートメーション JSON は値があったフィールド、AutoSync は解凍せずに
-            保留したファイルが担うフィールド)、segment 形式で前日ファイルを結合できず
-            過少の恐れがある夜主睡眠など。エラーではない (status に影響しない) が、
-            run レポートで欠落理由を示すのに使う
+        provisional: 値が暫定 (上記のいずれか)。値が 1 つも無い (``health=None``) なら False
+        withheld_fields: 返さなかった (保留した) フィールド (``missing_fields`` の部分集合)。
+            **停止済み AutoSync の .hae が対象日の途中までの出力** (再出力されないので
+            確定しない) だったフィールドだけ。エラーではない (status に影響しない) が、
+            run レポートの欠落理由・未解決キーの追跡に使う
+        provisional_fields: ``provisional=True`` のうち、暫定なのが特定のフィールドだけの
+            場合のその一覧 (segment 形式の夜主睡眠が前日ファイルの不足で過少の恐れがある →
+            ``("sleep_hours",)``。他のフィールドとアクティビティ詳細は確定値)。``None`` は
+            日全体が暫定 (今日 / 途中経過の出力: アクティビティ詳細を含む全部の値)。
+            ``provisional=False`` なら空
     """
 
     health: "DailyHealthData | None"
@@ -150,6 +183,7 @@ class HealthLoadResult:
     supplemented_fields: "tuple[str, ...]" = ()
     provisional: bool = False
     withheld_fields: "tuple[str, ...]" = ()
+    provisional_fields: "tuple[str, ...] | None" = None
 
 
 def _is_dir(path: Path) -> bool:
@@ -190,9 +224,33 @@ def resolve_automation_root(health_export_dir: Path) -> Path:
     return health_export_dir
 
 
-def _day_end(d: date) -> datetime:
-    """``d`` の終了時刻 (ローカルの翌日 0:00、naive)。"""
-    return datetime.combine(d + timedelta(days=1), time.min)
+def _day_end(d: date, tz: tzinfo) -> datetime:
+    """``d`` の終わり (``tz`` の暦日の翌日 0:00、aware)。"""
+    return datetime.combine(d + timedelta(days=1), time.min, tzinfo=tz)
+
+
+def _system_now() -> datetime:
+    """既定の現在時刻 (aware, UTC)。"""
+    return datetime.now(timezone.utc)
+
+
+def _as_aware(value: datetime) -> datetime:
+    """naive な日時をシステムのローカル時刻とみなして aware にする。
+
+    ``now`` の注入関数は aware を返すこと (統合側 :mod:`ihealth.diary` は aware な時計を
+    渡す)。naive (``datetime.now()`` 等) はシステムのローカル時刻として解釈する。ただし
+    夏時間の切り替わりで同じ壁時計の時刻が 2 回ある 1 時間は、1 回目の瞬間とみなされる
+    (naive では区別できない) ので、正確に判定したい呼び出し側は aware を渡すこと。
+    """
+    if value.tzinfo is not None and value.utcoffset() is not None:
+        return value
+    return value.astimezone()
+
+
+def _config_tz(config: Config) -> tzinfo:
+    """日記の基準 tz (``IHEALTH_TZ_OFFSET``)。属性が無い古い設定オブジェクトは JST。"""
+    tz = getattr(config, "diary_tz", None)
+    return tz if isinstance(tz, tzinfo) else JST
 
 
 def _mtime(path: Path) -> "float | None":
@@ -202,15 +260,26 @@ def _mtime(path: Path) -> "float | None":
         return None
 
 
-def _is_final(mtime: "float | None", d: date) -> bool:
-    """最終更新が ``d`` の終了後 = ``d`` の全データを含みうる出力か。不明なら False。"""
-    return mtime is not None and datetime.fromtimestamp(mtime) >= _day_end(d)
+def _is_final(mtime: "float | None", day_end: datetime) -> bool:
+    """最終更新が ``day_end`` 以降 = 対象日の全データを含みうる出力か。不明なら False。
+
+    mtime (epoch 秒) と aware な日の終わりを絶対時刻で比べる (ローカル tz 非依存)。
+    """
+    return mtime is not None and mtime >= day_end.timestamp()
 
 
-def _format_mtime(mtime: "float | None") -> str:
-    if mtime is None:
+def _format_instant(stamp: "float | None", tz: "tzinfo | None") -> str:
+    """epoch 秒を ``tz`` の ``YYYY-MM-DD HH:MM +HHMM`` で表す (ログ / detail 用)。"""
+    if stamp is None:
         return "不明"
-    return datetime.fromtimestamp(mtime).strftime("%Y-%m-%d %H:%M")
+    try:
+        return datetime.fromtimestamp(stamp, tz or timezone.utc).strftime("%Y-%m-%d %H:%M %z")
+    except (OverflowError, OSError, ValueError):
+        return "不明"
+
+
+def _format_time(value: datetime) -> str:
+    return value.strftime("%Y-%m-%d %H:%M %z")
 
 
 def _missing(health: "DailyHealthData | None") -> "tuple[str, ...]":
@@ -230,6 +299,8 @@ class _Chosen:
     path: Path
     payload: dict
     mtime: "float | None"
+    #: 対象日の終わり (record 自身の offset の暦日の翌日 0:00、aware)
+    day_end: datetime
 
 
 @dataclass(frozen=True)
@@ -251,6 +322,32 @@ class _AutoSyncFields:
     used_dirs: "frozenset[str]"
     withheld: "tuple[str, ...]"
     notes: "tuple[str, ...]"
+    #: 値を決められなかったフィールド (読込 / 解凍 / 集計の失敗、保留)。
+    #: 「その日のデータが無い」(None) と区別する (アクティビティ詳細で「なし」と断定しない)
+    unknown: "frozenset[str]" = frozenset()
+
+
+def _activity_detail(
+    health: DailyHealthData,
+    workouts: "Iterable[tuple[str, float]] | None",
+    unknown: "Iterable[str]",
+    *,
+    workouts_known: bool = True,
+) -> "str | None":
+    """最終的なフィールド値からアクティビティ詳細を組む (W3-7 改訂の規則、両経路共通)。
+
+    「なし」の根拠の心拍も最終的な値 (補完・妥当性検証の後) で判定する。
+    """
+    unknown_set = set(unknown)
+    return compose_activity_detail(
+        health.mindful_minutes,
+        None if workouts is None else tuple(workouts),
+        health.exercise_minutes,
+        heart_rate_present=has_heart_rate(health),
+        mindful_known=not (unknown_set & MINDFUL_FIELDS),
+        workouts_known=workouts_known,
+        exercise_known="exercise_minutes" not in unknown_set,
+    )
 
 
 class HealthLoader:
@@ -260,7 +357,8 @@ class HealthLoader:
     ``failed`` として返す)。
 
     Args:
-        config: ``health_export_dir`` / ``archive_root`` / ``max_heart_rate`` を使う
+        config: ``health_export_dir`` / ``archive_root`` / ``max_heart_rate`` /
+            ``diary_tz`` (日の終わりの既定 tz) を使う
         logger: ロガー
         index: 事前に作った :class:`AutomationIndex` (テスト / 再利用)。None なら
             初回 :meth:`index` で探索する
@@ -269,7 +367,8 @@ class HealthLoader:
         metric_fetcher: AutoSync 1 メトリクス解凍関数 (DI)。既定
             :func:`ihealth.source.fetch_metric_for_date`
         max_depth: オートメーション探索の深さ上限
-        now: 現在時刻 (ローカル naive) を返す関数 (DI)。「対象日が終わったか」の判定に使う
+        now: 現在時刻を返す関数 (DI)。「対象日が終わったか」の判定に使う。aware を
+            返すのが望ましい (naive はシステムのローカル時刻とみなす)。既定は UTC の現在時刻
     """
 
     def __init__(
@@ -282,7 +381,7 @@ class HealthLoader:
         json_loader: "Callable[[Path, logging.Logger], dict]" = load_automation_json,
         metric_fetcher: MetricFetcher = fetch_metric_for_date,
         max_depth: int = DEFAULT_MAX_DEPTH,
-        now: "Callable[[], datetime]" = datetime.now,
+        now: "Callable[[], datetime]" = _system_now,
     ) -> None:
         self._config = config
         self._logger = logger
@@ -292,6 +391,7 @@ class HealthLoader:
         self._metric_fetcher = metric_fetcher
         self._max_depth = max_depth
         self._now = now
+        self._tz = _config_tz(config)
         self._resolved: "tuple[Path, Path | None] | None" = None
         #: 「ワークアウト未出力」の案内を 1 回だけ出したか
         self._noted_no_workouts = False
@@ -384,15 +484,15 @@ class HealthLoader:
         ctx = ParseContext(
             target_date=d, max_heart_rate=self._config.max_heart_rate(as_of=d),
         )
-        day_ended = self._now() >= _day_end(d)
+        now = _as_aware(self._now())
         # 探索で読めなかったディレクトリがある → 候補を取りこぼしている可能性がある。
         # 「無い」を nodata と言い切れないので全日付の結果に失敗として載せる
         errors: "list[str]" = [f"探索: {message}" for message in self.index().errors]
         notes: "list[str]" = []
         chosen = self._select_automation(d, errors, notes)
         if chosen is not None:
-            return self._from_automation(d, ctx, chosen, errors, notes, day_ended)
-        return self._from_autosync_only(d, ctx, errors, notes, day_ended)
+            return self._from_automation(d, ctx, chosen, errors, notes, now)
+        return self._from_autosync_only(d, ctx, errors, notes, now)
 
     def _select_automation(
         self, d: date, errors: "list[str]", notes: "list[str]"
@@ -400,21 +500,14 @@ class HealthLoader:
         """``d`` の候補を最良 (mtime 降順) から順に読み、対象日のデータを含む最初の 1 つを返す。
 
         * 壊れた候補 (materialize 失敗 / JSON 不正) は errors に記録して次へ
-        * 壊れた候補より後ろ (= 古い) の候補は、対象日の終了後に書かれた **確定** の
-          ものだけを使う (読めなかった新しい候補より古い途中経過で既存値を上書きしない)
+        * 壊れた候補より後ろ (= 古い) の候補は、対象日の終わり以降に書かれた **確定** の
+          ものだけを使う (読めなかった新しい候補より古い途中経過で既存値を上書きしない)。
+          日の終わりはその候補の record 自身の offset で決める (読んでから判定する)
         * 対象日の record を含まない候補 (他の日のデータだけ等) は skip
         """
         load_failed = False
         for path in self.index().candidates(d):
             mtime = _mtime(path)
-            if load_failed and not _is_final(mtime, d):
-                note = (
-                    f"{path} (最終更新 {_format_mtime(mtime)}) は対象日の終了前に書かれた"
-                    "古い候補のため不採用 (より新しい候補を読めなかった)"
-                )
-                self._logger.warning("オートメーション JSON: %s", note)
-                notes.append(note)
-                continue
             try:
                 payload = self._json_loader(path, self._logger)
             except AutomationError as exc:
@@ -429,7 +522,17 @@ class HealthLoader:
                 self._logger.info("オートメーション JSON を skip: %s", note)
                 notes.append(note)
                 continue
-            return _Chosen(path=path, payload=payload, mtime=mtime)
+            day_end = record_day_end(payload, d, self._tz)
+            if load_failed and not _is_final(mtime, day_end):
+                note = (
+                    f"{path} (最終更新 {_format_instant(mtime, day_end.tzinfo)}) は"
+                    f"対象日の終わり ({_format_time(day_end)}) より前に書かれた"
+                    "古い候補のため不採用 (より新しい候補を読めなかった)"
+                )
+                self._logger.warning("オートメーション JSON: %s", note)
+                notes.append(note)
+                continue
+            return _Chosen(path=path, payload=payload, mtime=mtime, day_end=day_end)
         return None
 
     def _from_automation(
@@ -439,66 +542,70 @@ class HealthLoader:
         chosen: _Chosen,
         errors: "list[str]",
         notes: "list[str]",
-        day_ended: bool,
+        now: datetime,
     ) -> HealthLoadResult:
-        withheld: "list[str]" = []
-        prev_note = "不要"
-        json_withheld = day_ended and not _is_final(chosen.mtime, d)
-        if json_withheld:
-            # 対象日が終わったのに、ファイルは終わる前の書き出しのまま → 全フィールド保留
-            parsed = parse_automation_day_detailed(
-                chosen.payload, d, ctx, logger=self._logger,
-            )
-            values: "dict[str, object]" = {name: None for name in HEALTH_FIELDS}
-            withheld.extend(
-                name for name in HEALTH_FIELDS if getattr(parsed.health, name) is not None
-            )
-            activity_detail: "str | None" = None
+        day_end = chosen.day_end
+        day_ended = now >= day_end
+        # 対象日がまだ終わっていない (今日) なら値は途中経過 = 暫定
+        provisional = not day_ended
+        if day_ended and not _is_final(chosen.mtime, day_end):
+            # 日は終わったが、ファイルは終わる前に書き出された途中経過のまま (HAE が未再出力)。
+            # 値は暫定値として返す (全保留しない)。オートメーションが直近の日を再出力すれば
+            # 後の実行で確定値に置き換わる (統合側が台帳で追跡する)
+            provisional = True
             notes.append(
-                f"{chosen.path.name} は対象日の終了前 (最終更新 "
-                f"{_format_mtime(chosen.mtime)}) の途中までの出力のため保留"
+                f"{chosen.path.name} は対象日の終わり ({_format_time(day_end)}) より前 "
+                f"(最終更新 {_format_instant(chosen.mtime, day_end.tzinfo)}) の途中経過の"
+                "出力のため暫定値 (再出力されたら確定値に置き換わる)"
             )
-        else:
-            prev: "_Chosen | None" = None
-            prev_errors: "list[str]" = []
-            if needs_prev_payload(chosen.payload):
-                prev_notes: "list[str]" = []
-                prev = self._select_automation(d - timedelta(days=1), prev_errors, prev_notes)
-                prev_note = prev.path.name if prev is not None else "なし"
-                notes.extend(f"前日 {note}" for note in prev_notes)
-            parsed = parse_automation_day_detailed(
-                chosen.payload, d, ctx,
-                prev_payload=prev.payload if prev is not None else None,
-                logger=self._logger,
-            )
-            errors.extend(f"前日 {message}" for message in prev_errors)
-            values = {name: getattr(parsed.health, name) for name in HEALTH_FIELDS}
-            activity_detail = parsed.activity_detail
-            if (
-                parsed.sleep_mode == SLEEP_MODE_SEGMENTS
-                and parsed.main_sleep_needs_prev
-                and values["sleep_hours"] is not None
-            ):
-                problem = self._prev_problem(prev, parsed.main_sleep_end, prev_errors)
-                if problem is not None:
-                    # 0 時前の segment を取りこぼした過少値かもしれない → 書かない (§4.1)
-                    values["sleep_hours"] = None
-                    withheld.append("sleep_hours")
-                    notes.append(f"夜主睡眠を保留: {problem}")
+
+        #: 値のうち特定のフィールドだけが暫定のもの (日全体が暫定なら使わない)
+        provisional_fields: "list[str]" = []
+        prev: "_Chosen | None" = None
+        prev_errors: "list[str]" = []
+        prev_note = "不要"
+        if needs_prev_payload(chosen.payload):
+            prev_notes: "list[str]" = []
+            prev = self._select_automation(d - timedelta(days=1), prev_errors, prev_notes)
+            prev_note = prev.path.name if prev is not None else "なし"
+            notes.extend(f"前日 {note}" for note in prev_notes)
+        parsed = parse_automation_day_detailed(
+            chosen.payload, d, ctx,
+            prev_payload=prev.payload if prev is not None else None,
+            logger=self._logger,
+        )
+        errors.extend(f"前日 {message}" for message in prev_errors)
+        values: "dict[str, object]" = {name: getattr(parsed.health, name) for name in HEALTH_FIELDS}
+        if (
+            parsed.sleep_mode == SLEEP_MODE_SEGMENTS
+            and parsed.main_sleep_needs_prev
+            and values["sleep_hours"] is not None
+        ):
+            problem = self._prev_problem(prev, parsed.main_sleep_end, prev_errors)
+            if problem is not None:
+                # 0 時前の segment (前日ファイルにしか無い) を取りこぼした過少値かもしれない。
+                # 前日ファイルが再出力されれば確定するので、保留せず暫定値として返す。
+                # 暫定なのは夜主睡眠だけ (昼寝・歩数などは前日ファイルに依存しない)
+                provisional_fields.append("sleep_hours")
+                notes.append(f"夜主睡眠は過少の恐れがある暫定値: {problem}")
         errors.extend(f"automation {message}" for message in parsed.errors)
-        if not json_withheld and not parsed.workouts_included:
-            # ワークアウトを出力しない設定 → アクティビティ詳細は判断できない (書かない)
-            notes.append("ワークアウト未出力のためアクティビティ詳細は書かない")
+        if not parsed.workouts_included:
+            # ワークアウトを出力しない設定 → アクティビティ詳細はエクササイズ時間から組む
+            notes.append("ワークアウト未出力のためアクティビティ詳細はエクササイズ時間から組む")
             if not self._noted_no_workouts:
                 self._noted_no_workouts = True
                 self._logger.info(
                     "オートメーション JSON にワークアウト (data.workouts) が含まれていないため、"
-                    "アクティビティ詳細は書きません (Health Auto Export のオートメーションで"
-                    "ワークアウトも書き出す設定にすると書けます): %s", chosen.path.name,
+                    "アクティビティ詳細は瞑想とエクササイズ時間 (apple_exercise_time) から"
+                    "組みます (Health Auto Export のオートメーションでワークアウトも書き出す"
+                    "設定にすると種目別に書けます): %s", chosen.path.name,
                 )
 
         # フィールド単位補完: JSON で None のものを同日の AutoSync .hae で埋める
         supplemented: "list[str]" = []
+        withheld: "list[str]" = []
+        #: 補完元の .hae があるのに値を決められなかった (読込失敗 / 保留) フィールド
+        supplement_unknown: "set[str]" = set()
         missing_now = [name for name in HEALTH_FIELDS if values[name] is None]
         if missing_now and self._autosync_has_date(d):
             # aggregateSleep の totalSleep は 18 時前に終わる昼寝を含み、18 時以降に
@@ -509,11 +616,13 @@ class HealthLoader:
                 else HAE_AGGREGATED_SLEEP_DAY_END_HOUR
             )
             filled = self._load_autosync_fields(
-                d, ctx, missing_now, day_ended=day_ended, nap_end_hour=nap_end_hour,
+                d, ctx, missing_now, day_ended=day_ended, tz=day_end.tzinfo or self._tz,
+                nap_end_hour=nap_end_hour,
             )
             errors.extend(filled.errors)
             notes.extend(filled.notes)
             withheld.extend(name for name in filled.withheld if name not in withheld)
+            supplement_unknown = set(filled.unknown)
             for name in missing_now:
                 value = filled.values.get(name)
                 if value is not None:
@@ -531,14 +640,22 @@ class HealthLoader:
             values = cleaned
         health = _rebuild_with_validation_drop(d, values)
 
-        if any(name in supplemented for name in ("mindful_minutes", "mindful_sessions")):
-            # JSON に瞑想が無かった (or 解釈できなかった) 日を AutoSync の瞑想で補った。
-            # ワークアウトは JSON 由来なので、JSON を採用していて解釈できたときだけ組み直す
-            activity_detail = (
-                build_activity_detail(health.mindful_minutes, parsed.workouts)
-                if not json_withheld and parsed.workouts is not None
-                else None
+        # アクティビティ詳細 (W3-7 改訂): JSON で決められなかった (集計失敗 / 妥当性違反) 入力と、
+        # JSON に無く補完元の AutoSync .hae があるのに値を決められなかった (読込失敗 /
+        # 途中までの出力で保留) 入力は、AutoSync で補えた場合を除き「不明」(瞑想やエクササイズを
+        # 取りこぼした一覧や誤った「なし」を確定値として書かない。AutoSync だけの経路と同じ規則)。
+        # JSON にも .hae にも無い (= その日のデータが無い) 入力は不明ではない。「なし」の根拠の
+        # 心拍は補完後の値で見る (JSON に無く .hae で補えた心拍も Watch を着けていた根拠になる)
+        unknown = (
+            set(parsed.unknown_fields) | set(dropped) | supplement_unknown
+        ) - set(supplemented)
+        activity_detail = (
+            _activity_detail(
+                health, parsed.workouts, unknown, workouts_known=parsed.workouts_known,
             )
+            if parsed.has_metrics
+            else None
+        )
 
         detail = f"automation={chosen.path} 前日={prev_note}"
         if supplemented:
@@ -555,11 +672,12 @@ class HealthLoader:
             errors=errors,
             supplemented=supplemented,
             withheld=withheld,
-            day_ended=day_ended,
+            provisional=provisional,
+            provisional_fields=provisional_fields,
         )
 
-    @staticmethod
     def _prev_problem(
+        self,
         prev: "_Chosen | None",
         main_sleep_end: "datetime | None",
         prev_errors: "Iterable[str]",
@@ -569,14 +687,16 @@ class HealthLoader:
             return "前日ファイルを読めませんでした" if list(prev_errors) else "前日ファイルがありません"
         if not needs_prev_payload(prev.payload):
             return f"前日ファイル {prev.path.name} の睡眠が集計形式で segment を結合できません"
-        if (
-            main_sleep_end is None
-            or prev.mtime is None
-            or prev.mtime < main_sleep_end.timestamp()
-        ):
+        end = main_sleep_end
+        if end is not None and (end.tzinfo is None or end.utcoffset() is None):
+            # offset の無い日時は日記の基準 tz とみなす (Mac のローカル tz に依存させない)
+            end = end.replace(tzinfo=self._tz)
+        if end is None or prev.mtime is None or prev.mtime < end.timestamp():
+            tz = end.tzinfo if end is not None else prev.day_end.tzinfo
             return (
-                f"前日ファイル {prev.path.name} (最終更新 {_format_mtime(prev.mtime)}) は"
-                f"夜主睡眠の終了 ({main_sleep_end}) より前に書かれています"
+                f"前日ファイル {prev.path.name} (最終更新 {_format_instant(prev.mtime, tz)}) は"
+                f"夜主睡眠の終了 ({_format_time(end) if end is not None else '不明'}) より前に"
+                "書かれています"
             )
         return None
 
@@ -586,8 +706,11 @@ class HealthLoader:
         ctx: ParseContext,
         errors: "list[str]",
         notes: "list[str]",
-        day_ended: bool,
+        now: datetime,
     ) -> HealthLoadResult:
+        # .hae の日時 (Mac absolute time) は offset を持たないので、日の終わりは日記の
+        # 基準 tz (IHEALTH_TZ_OFFSET) の暦日で判定する
+        day_ended = now >= _day_end(d, self._tz)
         if not self._autosync_has_date(d):
             if notes:
                 detail = "; ".join(notes)
@@ -599,11 +722,12 @@ class HealthLoader:
             return self._finish(
                 health=None, activity_detail=None, source=SOURCE_AUTOMATION,
                 detail=detail, errors=errors, supplemented=(), withheld=(),
-                day_ended=day_ended,
+                provisional=False,
             )
 
         filled = self._load_autosync_fields(
-            d, ctx, HEALTH_FIELDS, day_ended=day_ended, nap_end_hour=_LEGACY_NAP_END_HOUR,
+            d, ctx, HEALTH_FIELDS, day_ended=day_ended, tz=self._tz,
+            nap_end_hour=_LEGACY_NAP_END_HOUR,
         )
         errors.extend(filled.errors)
         notes.extend(filled.notes)
@@ -612,10 +736,12 @@ class HealthLoader:
             name for name in HEALTH_FIELDS
             if filled.values.get(name) is not None and getattr(health, name) is None
         ]
-        # アクティビティ詳細は書かない: AutoSync のワークアウト (``AutoSync/Workouts/``)
-        # は読んでいないので、瞑想だけで「瞑想N分 / なし」と断定すると、その日に実際に
-        # あったワークアウトを含む既存の値 (旧 Notion 時代の値など) を消してしまう
-        activity_detail: "str | None" = None
+        # アクティビティ詳細 (W3-7 改訂): AutoSync のワークアウト (AutoSync/Workouts/) は読まないので
+        # 「ワークアウトを出力しない設定」と同じ規則 (瞑想 + エクササイズ時間) で組む。何も無い日の
+        # 「なし」は heart_rate の .hae に当日の心拍がある (保留・読込失敗でない) 日だけ
+        activity_detail = _activity_detail(
+            health, None, set(filled.unknown) | set(dropped),
+        )
         detail = (
             f"autosync={self.autosync_dir} "
             f"dirs={len(filled.used_dirs)}/{len(set(METRIC_DIRS.values()))}"
@@ -627,7 +753,7 @@ class HealthLoader:
         return self._finish(
             health=health, activity_detail=activity_detail, source=SOURCE_AUTOSYNC,
             detail=detail, errors=errors, supplemented=(), withheld=filled.withheld,
-            day_ended=day_ended,
+            provisional=not day_ended,
         )
 
     def _finish(
@@ -640,14 +766,19 @@ class HealthLoader:
         errors: "Iterable[str]",
         supplemented: "Iterable[str]",
         withheld: "Iterable[str]",
-        day_ended: bool,
+        provisional: bool,
+        provisional_fields: "Iterable[str]" = (),
     ) -> HealthLoadResult:
         """完全性ステータスを決めて結果を組む。
 
         * 1 フィールドも取れず活動詳細も無い → health=None、エラーがあれば failed / 無ければ nodata
-          (確定していないデータを保留しただけなら nodata)
+          (停止済み AutoSync の途中までの出力を保留しただけなら nodata)
         * 取れたがエラーもある → partial
         * それ以外 → complete
+
+        ``provisional`` は日全体の値が暫定 (今日 / 途中経過の出力)、``provisional_fields`` は
+        特定のフィールドだけが暫定 (segment 形式の夜主睡眠)。日全体が暫定なら
+        ``HealthLoadResult.provisional_fields`` は None (全フィールドが暫定)。
         """
         error_tuple = tuple(errors)
         if health is not None and activity_detail is None and _populated(
@@ -658,6 +789,11 @@ class HealthLoader:
         withheld_tuple = tuple(
             name for name in HEALTH_FIELDS
             if name in withheld_set and (health is None or getattr(health, name) is None)
+        )
+        field_set = set(provisional_fields)
+        field_tuple = tuple(
+            name for name in HEALTH_FIELDS
+            if name in field_set and health is not None and getattr(health, name) is not None
         )
         if health is None:
             status = STATUS_FAILED if error_tuple else STATUS_NODATA
@@ -680,8 +816,9 @@ class HealthLoader:
             missing_fields=_missing(health),
             errors=error_tuple,
             supplemented_fields=tuple(supplemented),
-            provisional=not day_ended,
+            provisional=provisional or bool(field_tuple),
             withheld_fields=withheld_tuple,
+            provisional_fields=None if provisional else field_tuple,
         )
 
     # ---------- AutoSync (.hae) ----------
@@ -714,12 +851,13 @@ class HealthLoader:
         return False
 
     def _read_autosync_metric(
-        self, dir_name: str, d: date, *, require_final: bool
+        self, dir_name: str, d: date, *, require_final: bool, day_end: datetime
     ) -> _HaeRead:
         """1 メトリクスの .hae を解凍して payload を返す。
 
         * .hae が存在しない → 空の結果 (データなし)
-        * ``require_final`` で、最終更新が ``d`` の終了前 → 解凍せず ``withheld``
+        * ``require_final`` で、最終更新が ``day_end`` (``d`` の終わり) より前 → 解凍せず
+          ``withheld`` (停止済み AutoSync は再出力されないので確定しない過少値)
         * 存在するのに stat / 解凍 / 読込に失敗 → ``error`` (例外は投げない。
           補完は best-effort で、失敗してもオートメーション JSON の値は残す)
         """
@@ -733,12 +871,13 @@ class HealthLoader:
             return _HaeRead()
         except OSError as exc:
             return _HaeRead(error=f"{label}: stat に失敗: {type(exc).__name__}: {exc}")
-        if require_final and not _is_final(mtime, d):
+        if require_final and not _is_final(mtime, day_end):
             return _HaeRead(
                 withheld=True,
                 note=(
-                    f"{label} は対象日の終了前 (最終更新 {_format_mtime(mtime)}) の"
-                    "途中までの出力のため保留"
+                    f"{label} は対象日の終わり ({_format_time(day_end)}) より前 (最終更新 "
+                    f"{_format_instant(mtime, day_end.tzinfo)}) の途中までの出力 "
+                    "(AutoSync は停止済みで再出力されない) のため保留"
                 ),
             )
         try:
@@ -769,18 +908,21 @@ class HealthLoader:
         fields: "Iterable[str]",
         *,
         day_ended: bool,
+        tz: tzinfo,
         nap_end_hour: int,
     ) -> _AutoSyncFields:
         """必要なフィールドの .hae だけを解凍し、:data:`ihealth.parser.FIELD_SOURCES` の
         集計関数 (旧パイプラインと同一) で値を求める。
 
-        * 対象日が終わっているのに終了前に書かれた .hae は使わない (``withheld``)
+        * 対象日が終わっているのに終わりより前に書かれた .hae は使わない (``withheld``)。
+          日の終わりは ``tz`` の暦日 (.hae の日時は offset を持たない)
         * sleep は Issue #14 と同じく当日 + 前日の ``sleep_analysis`` を結合して渡す。
           ただし当日の .hae を使えない (無い / 失敗 / 保留) ときは前日分だけで
           集計しない (日付をまたぐセッションしか入っていない過少値になる)。
           当日の .hae は「その日に重なる全 record」を含むので、前日の .hae は
           確定版だけを補助的に結合し、その読込失敗はエラーとして報告するが当日の値は残す
         * 昼寝は終了時刻 [14, ``nap_end_hour``) の asleep
+        * 読込 / 解凍 / 集計に失敗した、または保留したフィールドは ``unknown`` に載せる
         """
         wanted = [name for name in fields if name in FIELD_SOURCES]
         dirs: "list[str]" = []
@@ -789,14 +931,20 @@ class HealthLoader:
             if dir_name not in dirs:
                 dirs.append(dir_name)
 
+        day_end = _day_end(d, tz)
         errors: "list[str]" = []
         notes: "list[str]" = []
         payloads: "dict[str, dict]" = {}
         withheld_dirs: "set[str]" = set()
+        failed_dirs: "set[str]" = set()
+        failed_fields: "set[str]" = set()
         for dir_name in dirs:
-            read = self._read_autosync_metric(dir_name, d, require_final=day_ended)
+            read = self._read_autosync_metric(
+                dir_name, d, require_final=day_ended, day_end=day_end,
+            )
             if read.error is not None:
                 errors.append(read.error)
+                failed_dirs.add(dir_name)
                 continue
             if read.withheld:
                 withheld_dirs.add(dir_name)
@@ -820,6 +968,7 @@ class HealthLoader:
         if _SLEEP_DIR in payloads:
             prev_read = self._read_autosync_metric(
                 _SLEEP_DIR, d - timedelta(days=1), require_final=True,
+                day_end=_day_end(d - timedelta(days=1), tz),
             )
             if prev_read.error is not None:
                 errors.append(f"前日 {prev_read.error}")
@@ -848,14 +997,22 @@ class HealthLoader:
                 )
                 errors.append(f"autosync {name}: {type(exc).__name__}: {exc}")
                 values[name] = None
+                failed_fields.add(name)
         withheld = tuple(
             name for name in wanted if FIELD_SOURCES[name][0] in withheld_dirs
+        )
+        unknown = frozenset(
+            name for name in wanted
+            if name in failed_fields
+            or FIELD_SOURCES[name][0] in failed_dirs
+            or FIELD_SOURCES[name][0] in withheld_dirs
         )
         return _AutoSyncFields(
             values=values,
             errors=tuple(errors),
             used_dirs=frozenset(payloads),
             withheld=withheld,
+            unknown=unknown,
             notes=tuple(notes),
         )
 

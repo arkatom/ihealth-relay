@@ -15,11 +15,13 @@ from unittest.mock import patch
 
 from ihealth import automation_parser
 from ihealth.automation_parser import (
+    ACTIVITY_NONE,
     HEALTH_FIELDS,
+    METRIC_FIELDS,
     SLEEP_MODE_AGGREGATED,
     SLEEP_MODE_SEGMENTS,
     WORKOUTS_LABEL,
-    build_activity_detail,
+    compose_activity_detail,
     extract_workouts,
     has_data_for,
     has_metrics,
@@ -27,6 +29,7 @@ from ihealth.automation_parser import (
     parse_automation_day,
     parse_automation_day_detailed,
     parse_hae_datetime,
+    record_day_end,
     workout_name_ja,
 )
 from ihealth.models import DailyHealthData
@@ -126,33 +129,47 @@ class TestAggregatedFixture(unittest.TestCase):
         self.assertAlmostEqual(h.body_fat_percentage, 18.5)
 
     def test_metadata(self):
-        # 現役設定はワークアウトを出力しない (data.workouts が無い) → ワークアウトの有無を
-        # 判断できないので「瞑想6分」と断定せず書かない (None)
-        self.assertIsNone(self.result.activity_detail)
+        # 現役設定はワークアウトを出力しない (data.workouts が無い) → W3-7: アクティビティ詳細は
+        # 瞑想 (2.6 + 3.0 = 5.6 → 6 分) + Apple のエクササイズ時間 (3 分) から組む
+        # (旧: ワークアウトの有無を判断できないとして None。WAVE3 W3-7 で意図的に変更)
+        self.assertEqual(self.result.activity_detail, "瞑想6分、エクササイズ3分")
         self.assertFalse(self.result.workouts_included)
         self.assertIsNone(self.result.workouts)
+        self.assertTrue(self.result.workouts_known)
         self.assertNotIn(WORKOUTS_LABEL, self.result.failed_metrics)
         self.assertTrue(self.result.has_metrics)
         self.assertEqual(self.result.sleep_mode, SLEEP_MODE_AGGREGATED)
         self.assertEqual(self.result.errors, ())
         self.assertEqual(self.result.dropped_fields, ())
+        self.assertEqual(self.result.unknown_fields, ())
         self.assertFalse(needs_prev_payload(self.payload))
         self.assertTrue(has_metrics(self.payload))
 
     def test_tuple_api(self):
         health, activity = parse_automation_day(self.payload, D, _ctx(D, 180.0))
         self.assertEqual(health, self.result.health)
-        self.assertIsNone(activity)
+        self.assertEqual(activity, "瞑想6分、エクササイズ3分")
 
     def test_activity_detail_when_workouts_are_exported(self):
-        # ワークアウトも書き出す設定 (data.workouts あり、その日は 0 件) なら瞑想だけで確定できる
+        # ワークアウトも書き出す設定 (data.workouts あり) でその日は 0 件 → W3-7 改訂: 出力しない
+        # 設定と同じくエクササイズ時間で組む (旧: ワークアウトの欄はワークアウトだけで "瞑想6分"。
+        # ワークアウトを記録せずに運動した日のエクササイズ時間を取りこぼしていた。
+        # WAVE3 W3-7 改訂で意図的に変更)
         payload = json.loads(json.dumps(self.payload))
         payload["data"]["workouts"] = []
         result = parse_automation_day_detailed(payload, D, _ctx(D, 180.0), logger=_LOGGER)
         self.assertTrue(result.workouts_included)
         self.assertEqual(result.workouts, ())
-        self.assertEqual(result.activity_detail, "瞑想6分")
-        self.assertEqual(parse_automation_day(payload, D, _ctx(D, 180.0))[1], "瞑想6分")
+        self.assertEqual(result.activity_detail, "瞑想6分、エクササイズ3分")
+        self.assertEqual(
+            parse_automation_day(payload, D, _ctx(D, 180.0))[1], "瞑想6分、エクササイズ3分",
+        )
+        # その日のワークアウトがあればワークアウトの一覧 (エクササイズ時間は足さない)
+        payload["data"]["workouts"] = [
+            {"name": "Yoga", "start": "2030-01-15 07:00:00 +0900", "duration": 1200},
+        ]
+        result = parse_automation_day_detailed(payload, D, _ctx(D, 180.0), logger=_LOGGER)
+        self.assertEqual(result.activity_detail, "瞑想6分、ヨガ20分")
 
     def test_other_date_gives_nothing(self):
         # ファイルの中身と違う日付を指定 → 対象日の record が無いので全 None
@@ -504,33 +521,55 @@ class TestMindful(unittest.TestCase):
         self.assertAlmostEqual(result.health.mindful_minutes, 12.5)
 
     def test_under_one_minute_is_not_in_activity_detail(self):
+        # 0.4 分の瞑想は「瞑想0分」と書かない。心拍のデータが無い (Watch を着けていない) 日は
+        # 「なし」と断定せず書かない (旧: "なし"。WAVE3 W3-7 で意図的に変更)
         payload = _payload(_metric("mindful_minutes", "min",
                                    _rec("2030-01-15 06:00:00 +0900", qty=0.4)),
                            workouts=[])
         result = _parse(payload)
         self.assertEqual(result.health.mindful_sessions, 1)
         self.assertAlmostEqual(result.health.mindful_minutes, 0.4)
-        self.assertEqual(result.activity_detail, "なし")
+        self.assertIsNone(result.activity_detail)
+        # 心拍がある (Watch を着けていた) 日なら「なし」(W3-7 改訂。旧: エクササイズ時間 0 分の
+        # record がある日だけ「なし」。実際の HAE は 0 分の record を出さない)
+        payload["data"]["metrics"].append(
+            _metric("heart_rate", "count/min", _rec("2030-01-15 09:00:00 +0900", Avg=70, Max=80)),
+        )
+        self.assertEqual(_parse(payload).activity_detail, ACTIVITY_NONE)
 
     def test_no_mindful_but_other_metrics(self):
+        # 瞑想もワークアウトも無い日: 心拍が無ければ None (旧: "なし")。W3-7 改訂: 「なし」の根拠は
+        # エクササイズ時間 0 分の record ではなく心拍 (旧: 0 分の record があれば「なし」。
+        # WAVE3 W3-7 改訂で意図的に変更)
         payload = _payload(_metric("step_count", "count", _rec("2030-01-15 06:00:00 +0900", qty=5)),
                            workouts=[])
         result = _parse(payload)
         self.assertIsNone(result.health.mindful_sessions)
         self.assertIsNone(result.health.mindful_minutes)
-        self.assertEqual(result.activity_detail, "なし")
+        self.assertIsNone(result.activity_detail)
+        payload["data"]["metrics"].append(
+            _metric("apple_exercise_time", "min", _rec("2030-01-15 09:00:00 +0900", qty=0)),
+        )
+        self.assertIsNone(_parse(payload).activity_detail)   # 0 分の record だけでは書かない
+        payload["data"]["metrics"].append(
+            _metric("heart_rate", "count/min", _rec("2030-01-15 09:00:00 +0900", Avg=70, Max=80)),
+        )
+        self.assertEqual(_parse(payload).activity_detail, ACTIVITY_NONE)
 
-    def test_without_workouts_key_activity_is_unknown_not_nashi(self):
-        # ワークアウトを出力しない設定 (data.workouts が無い) では、その日の運動を
-        # 「なし」とも「瞑想N分」だけとも言えない → 書かない (既存の値を保持する)
-        for metrics in (
-            (_metric("step_count", "count", _rec("2030-01-15 06:00:00 +0900", qty=5)),),
-            (_metric("mindful_minutes", "min", _rec("2030-01-15 06:00:00 +0900", qty=24.0)),
-             _metric("apple_exercise_time", "min", _rec("2030-01-15 07:00:00 +0900", qty=21.0))),
-        ):
+    def test_without_workouts_key_uses_exercise_time(self):
+        # ワークアウトを出力しない設定 (data.workouts が無い): W3-7 でアクティビティ詳細は
+        # 瞑想 + エクササイズ時間から組む (旧: 一律 None。WAVE3 W3-7 で意図的に変更)。
+        # 瞑想も運動も心拍も無い日は従来どおり書かない (None)
+        cases = (
+            ((_metric("step_count", "count", _rec("2030-01-15 06:00:00 +0900", qty=5)),), None),
+            ((_metric("mindful_minutes", "min", _rec("2030-01-15 06:00:00 +0900", qty=24.0)),
+              _metric("apple_exercise_time", "min", _rec("2030-01-15 07:00:00 +0900", qty=21.0))),
+             "瞑想24分、エクササイズ21分"),
+        )
+        for metrics, expected in cases:
             with self.subTest(metrics=[m["name"] for m in metrics]):
                 result = _parse(_payload(*metrics))
-                self.assertIsNone(result.activity_detail)
+                self.assertEqual(result.activity_detail, expected)
                 self.assertIsNone(result.workouts)
                 self.assertFalse(result.workouts_included)
                 self.assertEqual(result.errors, ())
@@ -701,24 +740,269 @@ class TestWorkouts(unittest.TestCase):
         self.assertEqual(_parse(payload).activity_detail, "ヨガ20分")
 
     def test_malformed_workouts_are_ignored(self):
+        # 壊れたワークアウト (dict でない / 日時なし / 時間を求められない) は数えない。
+        # 何も残らない日は、心拍がある (Watch を着けていた) なら「なし」、無ければ None
+        # (旧: 常に "なし" → W3-7: エクササイズ時間 0 分の record があれば「なし」→
+        # W3-7 改訂: 心拍があれば「なし」。いずれも意図的に変更)
+        workouts = ["x", {"name": "Yoga"}, {"name": "Yoga", "start": "2030-01-15 07:00:00 +0900"}]
         payload = _payload(
             _metric("step_count", "count", _rec("2030-01-15 10:00:00 +0900", qty=1)),
-            workouts=["x", {"name": "Yoga"},
-                      {"name": "Yoga", "start": "2030-01-15 07:00:00 +0900"}],
+            workouts=workouts,
         )
-        self.assertEqual(_parse(payload).activity_detail, "なし")
+        result = _parse(payload)
+        self.assertEqual(result.workouts, ())
+        self.assertEqual(result.errors, ())
+        self.assertIsNone(result.activity_detail)
+        worn = _payload(
+            _metric("step_count", "count", _rec("2030-01-15 10:00:00 +0900", qty=1)),
+            _metric("heart_rate", "count/min", _rec("2030-01-15 10:00:00 +0900", Avg=70, Max=80)),
+            workouts=workouts,
+        )
+        self.assertEqual(_parse(worn).activity_detail, ACTIVITY_NONE)
+
+    def test_exported_workouts_take_the_slot_of_exercise_time(self):
+        # ワークアウトを出力する設定では、ワークアウトの欄はワークアウトだけ
+        # (エクササイズ時間 35 分は「エクササイズ35分」として足さない)
+        payload = _payload(
+            _metric("apple_exercise_time", "min", _rec("2030-01-15 08:00:00 +0900", qty=35)),
+            workouts=[{"name": "Outdoor Walk", "start": "2030-01-15 08:00:00 +0900",
+                       "duration": 1200}],
+        )
+        self.assertEqual(_parse(payload).activity_detail, "ウォーキング20分")
 
 
-class TestBuildActivityDetail(unittest.TestCase):
-    def test_formats(self):
-        self.assertEqual(build_activity_detail(None), "なし")
-        self.assertEqual(build_activity_detail(0.4), "なし")
-        self.assertEqual(build_activity_detail(3.4), "瞑想3分")
-        self.assertEqual(build_activity_detail(None, [("ヨガ", 20.2)]), "ヨガ20分")
+class TestComposeActivityDetail(unittest.TestCase):
+    """W3-7 改訂の規則 (純関数)。旧 build_activity_detail (何も無ければ常に "なし") の置き換え。
+
+    1. 瞑想 (round ≥ 1) → 2. 当日のワークアウトがあればその一覧、無ければ (出力しない設定 /
+    当日 0 件) エクササイズ時間 (round ≥ 1) → 何も無い日は心拍があれば「なし」、無ければ None。
+    結果が依存する入力が不明なら None。
+    """
+
+    def test_mindful_and_exercise_without_workouts(self):
+        # 瞑想と運動の両方 / 運動だけ / 瞑想だけ (ワークアウトを出力しない設定)
+        self.assertEqual(compose_activity_detail(3.4, None, 21.0), "瞑想3分、エクササイズ21分")
+        self.assertEqual(compose_activity_detail(None, None, 1.0), "エクササイズ1分")
+        # 運動のデータが無くても瞑想はある → 瞑想だけ書く
+        self.assertEqual(compose_activity_detail(3.4, None, None), "瞑想3分")
+        # 書く項目がある日は、心拍があっても「なし」にしない
         self.assertEqual(
-            build_activity_detail(6.0, [("ウォーキング", 35.0), ("ヨガ", 0.2)]),
+            compose_activity_detail(3.4, None, None, heart_rate_present=True), "瞑想3分",
+        )
+        self.assertEqual(
+            compose_activity_detail(None, None, 21.0, heart_rate_present=True), "エクササイズ21分",
+        )
+
+    def test_workouts_are_listed_when_exported(self):
+        # 当日のワークアウトがある → その一覧 (エクササイズ時間 50 分は足さない)
+        self.assertEqual(compose_activity_detail(None, [("ヨガ", 20.2)], None), "ヨガ20分")
+        self.assertEqual(
+            compose_activity_detail(6.0, [("ウォーキング", 35.0), ("ヨガ", 0.2)], 50.0),
             "瞑想6分、ウォーキング35分",
         )
+
+    def test_exported_without_workouts_that_day_uses_exercise_time(self):
+        # 出力していて当日 0 件 → 出力しない設定と同じくエクササイズ時間で組む
+        # (旧: ワークアウトの欄は空のまま "瞑想6分" / None。WAVE3 W3-7 改訂で意図的に変更)
+        self.assertEqual(compose_activity_detail(6.0, [], 50.0), "瞑想6分、エクササイズ50分")
+        self.assertEqual(compose_activity_detail(None, [], 15.0), "エクササイズ15分")
+        # 1 分未満 (round で 0 分) のワークアウトしか無い日も当日 0 件と同じ
+        self.assertEqual(compose_activity_detail(None, [("ヨガ", 0.3)], 15.0), "エクササイズ15分")
+
+    def test_nashi_only_with_heart_rate(self):
+        # 何も無い日: 心拍がある (Watch を着けていた) なら「なし」、無ければ書かない。
+        # エクササイズ時間 0 分の record があっても心拍が無ければ書かない
+        # (旧: 0 分の record がある日だけ「なし」。WAVE3 W3-7 改訂で意図的に変更)
+        for args in ((None, None, None), (None, None, 0.0), (0.4, None, 0.4), (None, [], None),
+                     (None, [], 0.0), (None, [("ヨガ", 0.3)], 0.2)):
+            with self.subTest(args=args):
+                self.assertEqual(
+                    compose_activity_detail(*args, heart_rate_present=True), ACTIVITY_NONE,
+                )
+                self.assertIsNone(compose_activity_detail(*args, heart_rate_present=False))
+                self.assertIsNone(compose_activity_detail(*args))   # 既定は「なし」を書かない側
+
+    def test_rounding_matches_written_minutes(self):
+        # 日記の 瞑想時間 (分) / アクティビティ時間 (分) と同じ int(round(x))
+        # (Python の round は偶数丸め: 2.5 → 2, 1.5 → 2, 0.5 → 0)
+        self.assertEqual(compose_activity_detail(2.5, None, 2.5), "瞑想2分、エクササイズ2分")
+        self.assertEqual(compose_activity_detail(1.5, None, 0.5), "瞑想2分")
+        self.assertEqual(compose_activity_detail(None, [("ヨガ", 0.5)], 1.5), "エクササイズ2分")
+        self.assertEqual(
+            compose_activity_detail(None, None, 0.5, heart_rate_present=True), ACTIVITY_NONE,
+        )
+
+    def test_unknown_inputs(self):
+        # 結果が依存する入力が不明なら、心拍があっても書かない (誤った「なし」も書かない)
+        for hr in (False, True):
+            with self.subTest(heart_rate_present=hr):
+                for kwargs in ({"mindful_known": False}, {"workouts_known": False}):
+                    self.assertIsNone(compose_activity_detail(
+                        3.0, None, 21.0, heart_rate_present=hr, **kwargs))
+                    self.assertIsNone(compose_activity_detail(
+                        None, None, None, heart_rate_present=hr, **kwargs))
+                # ワークアウトを出力しない設定でエクササイズ時間が不明 → 欄そのものが不明
+                self.assertIsNone(compose_activity_detail(
+                    3.0, None, None, heart_rate_present=hr, exercise_known=False))
+                self.assertIsNone(compose_activity_detail(
+                    None, None, None, heart_rate_present=hr, exercise_known=False))
+                # 出力していて当日 0 件 (1 分未満だけを含む) → エクササイズ時間で組むので書かない
+                self.assertIsNone(compose_activity_detail(
+                    None, [], 0.0, heart_rate_present=hr, exercise_known=False))
+                self.assertIsNone(compose_activity_detail(
+                    6.0, [("ヨガ", 0.3)], None, heart_rate_present=hr, exercise_known=False))
+                # ワークアウトの一覧が取れていればエクササイズ時間は不要
+                self.assertEqual(
+                    compose_activity_detail(
+                        3.0, [("ヨガ", 20.0)], None, heart_rate_present=hr, exercise_known=False,
+                    ),
+                    "瞑想3分、ヨガ20分",
+                )
+
+
+class TestActivityDetailFromPayload(unittest.TestCase):
+    """W3-7: payload 経由の規則 (エクササイズ時間 / 解釈できない入力)。"""
+
+    def test_exercise_only(self):
+        payload = _payload(_metric(
+            "apple_exercise_time", "min",
+            *(_rec(f"2030-01-15 08:{m:02d}:00 +0900", qty=1) for m in range(21)),
+        ))
+        result = _parse(payload)
+        self.assertAlmostEqual(result.health.exercise_minutes, 21.0)
+        self.assertEqual(result.activity_detail, "エクササイズ21分")
+
+    def test_exercise_of_other_days_is_not_counted(self):
+        payload = _payload(_metric(
+            "apple_exercise_time", "min",
+            _rec("2030-01-14 23:59:00 +0900", qty=30),
+            _rec("2030-01-15 21:42:00 +0900", qty=1),
+        ))
+        self.assertEqual(_parse(payload).activity_detail, "エクササイズ1分")
+
+    def test_unknown_exercise_unit_is_not_claimed(self):
+        payload = _payload(
+            _metric("mindful_minutes", "min", _rec("2030-01-15 06:00:00 +0900", qty=5)),
+            _metric("apple_exercise_time", "fortnight", _rec("2030-01-15 08:00:00 +0900", qty=1)),
+        )
+        with self.assertLogs(_LOGGER, level="WARNING"):
+            result = _parse(payload)
+        self.assertEqual(result.failed_metrics, ("apple_exercise_time",))
+        self.assertEqual(result.unknown_fields, ("exercise_minutes",))
+        # 「瞑想5分」だけ書くとエクササイズを取りこぼした一覧になる → 書かない
+        self.assertIsNone(result.activity_detail)
+
+    def test_exercise_dropped_by_validation_is_not_claimed(self):
+        # 1 日 1440 分を超える (壊れた) エクササイズ時間は妥当性違反で落とす → 心拍がある
+        # (Watch を着けていた) 日でも「なし」にしない
+        payload = _payload(
+            _metric("apple_exercise_time", "min", _rec("2030-01-15 08:00:00 +0900", qty=2000)),
+            _metric("heart_rate", "count/min", _rec("2030-01-15 08:00:00 +0900", Avg=70, Max=80)),
+        )
+        with self.assertLogs("ihealth.automation_parser", level="WARNING"):
+            result = parse_automation_day_detailed(payload, D, _ctx(D))
+        self.assertIsNone(result.health.exercise_minutes)
+        self.assertEqual(result.dropped_fields, ("exercise_minutes",))
+        self.assertAlmostEqual(result.health.heart_rate_avg, 70.0)
+        self.assertIsNone(result.activity_detail)
+
+    def test_workouts_listed_even_if_exercise_unknown(self):
+        payload = _payload(
+            _metric("apple_exercise_time", "fortnight", _rec("2030-01-15 08:00:00 +0900", qty=1)),
+            workouts=[{"name": "Yoga", "start": "2030-01-15 07:00:00 +0900", "duration": 1200}],
+        )
+        with self.assertLogs(_LOGGER, level="WARNING"):
+            self.assertEqual(_parse(payload).activity_detail, "ヨガ20分")
+
+    # --- W3-7 改訂: ワークアウト 0 件の日はエクササイズ時間、「なし」は心拍 (Watch を着けていた) ---
+
+    def test_exported_workouts_without_one_that_day_use_exercise_time(self):
+        # ワークアウトを書き出す設定でも、当日のワークアウトが無ければ (前日の分だけ)
+        # エクササイズ時間で組む (旧: "瞑想4分"。WAVE3 W3-7 改訂で意図的に変更)
+        payload = _payload(
+            _metric("mindful_minutes", "min", _rec("2030-01-15 06:00:00 +0900", qty=4)),
+            _metric("apple_exercise_time", "min", _rec("2030-01-15 08:00:00 +0900", qty=21)),
+            workouts=[{"name": "Yoga", "start": "2030-01-14 07:00:00 +0900", "duration": 1200}],
+        )
+        result = _parse(payload)
+        self.assertTrue(result.workouts_included)
+        self.assertEqual(result.workouts, ())
+        self.assertEqual(result.activity_detail, "瞑想4分、エクササイズ21分")
+
+    def test_heart_rate_without_exercise_records_is_nashi(self):
+        # 実際の HAE の運動 0 分の日: apple_exercise_time 自体が出力されず、心拍はある
+        # → Watch を着けていて運動 0 分 = 「なし」(旧: 運動のデータが無いので None。
+        # WAVE3 W3-7 改訂で意図的に変更)
+        payload = _payload(
+            _metric("step_count", "count", _rec("2030-01-15 10:00:00 +0900", qty=3000)),
+            _metric("heart_rate", "count/min",
+                    _rec("2030-01-15 03:00:00 +0900", Avg=55, Max=60),
+                    _rec("2030-01-15 10:00:00 +0900", Avg=80, Max=95)),
+        )
+        result = _parse(payload)
+        self.assertIsNone(result.health.exercise_minutes)
+        self.assertEqual(result.health.exercise_intensity_score, 0.0)
+        self.assertEqual(result.activity_detail, ACTIVITY_NONE)
+        # 心拍の record が別の日のものだけ → 対象日は心拍が無い (Watch を着けていない) → 書かない
+        other_day = _payload(
+            _metric("step_count", "count", _rec("2030-01-15 10:00:00 +0900", qty=3000)),
+            _metric("heart_rate", "count/min", _rec("2030-01-14 22:00:00 +0900", Avg=70, Max=80)),
+        )
+        self.assertIsNone(_parse(other_day).activity_detail)
+
+    def test_unknown_inputs_do_not_claim_nashi_even_with_heart_rate(self):
+        heart_rate = _metric(
+            "heart_rate", "count/min", _rec("2030-01-15 10:00:00 +0900", Avg=70, Max=80),
+        )
+        cases = {
+            "mindful_minutes": _payload(
+                heart_rate,
+                _metric("mindful_minutes", "minutes", _rec("2030-01-15 06:00:00 +0900", qty=5)),
+            ),
+            "apple_exercise_time": _payload(
+                heart_rate,
+                _metric("apple_exercise_time", "fortnight",
+                        _rec("2030-01-15 08:00:00 +0900", qty=1)),
+            ),
+            WORKOUTS_LABEL: _payload(heart_rate, workouts=[{"name": "Yoga", "duration": 1200}]),
+        }
+        for failed, payload in cases.items():
+            with self.subTest(failed=failed):
+                with self.assertLogs(_LOGGER, level="WARNING"):
+                    result = _parse(payload)
+                self.assertEqual(result.failed_metrics, (failed,))
+                self.assertAlmostEqual(result.health.heart_rate_avg, 70.0)
+                self.assertIsNone(result.activity_detail)
+
+    def test_uninterpretable_heart_rate_does_not_claim_nashi(self):
+        # 心拍を解釈できない (書式変更) 日は Watch を着けていたか分からない → 「なし」と断定しない
+        payload = _payload(
+            _metric("step_count", "count", _rec("2030-01-15 10:00:00 +0900", qty=3000)),
+            {"name": "heart_rate", "units": "count/min", "data": "oops"},
+        )
+        with self.assertLogs(_LOGGER, level="WARNING"):
+            result = _parse(payload)
+        self.assertEqual(result.failed_metrics, ("heart_rate",))
+        self.assertIsNone(result.activity_detail)
+
+
+class TestUnknownFields(unittest.TestCase):
+    def test_failed_metric_maps_to_its_fields(self):
+        payload = _payload(
+            {"name": "heart_rate", "units": "count/min", "data": "oops"},
+            _metric("mindful_minutes", "minutes", _rec("2030-01-15 06:00:00 +0900", qty=10.0)),
+        )
+        with self.assertLogs(_LOGGER, level="WARNING"):
+            result = _parse(payload)
+        self.assertEqual(
+            result.unknown_fields,
+            ("exercise_intensity_score", "heart_rate_avg", "heart_rate_max",
+             "mindful_sessions", "mindful_minutes"),
+        )
+
+    def test_metric_fields_cover_every_health_field(self):
+        covered = [name for fields in METRIC_FIELDS.values() for name in fields]
+        self.assertEqual(sorted(covered), sorted(HEALTH_FIELDS))
 
 
 class TestValidationDrop(unittest.TestCase):
@@ -877,17 +1161,28 @@ class TestEdgeRules(unittest.TestCase):
         result = _parse(payload)
         self.assertEqual(result.health.mindful_sessions, 1)
         self.assertIsNone(result.health.mindful_minutes)
-        self.assertEqual(result.activity_detail, "なし")
+        # 心拍のデータが無い (Watch を着けていない) ので「なし」と断定しない
+        # (旧: "なし"。WAVE3 W3-7 で意図的に変更)
+        self.assertIsNone(result.activity_detail)
 
     def test_workout_belongs_to_its_start_date(self):
+        # 前日 23:30 開始のヨガは前日の分。当日はワークアウト 0 件 → エクササイズ時間で組むが
+        # 当日分は 0 分 (前日 23:30 の 30 分は前日の暦日) → 何も無く、心拍がある (Watch を
+        # 着けていた) ので「なし」(W3-7 改訂: 「なし」の根拠は心拍。旧: 0 分の record)
         payload = _payload(
             _metric("step_count", "count",
                     _rec("2030-01-14 10:00:00 +0900", qty=1),
                     _rec("2030-01-15 10:00:00 +0900", qty=1)),
+            _metric("apple_exercise_time", "min",
+                    _rec("2030-01-14 23:30:00 +0900", qty=30),
+                    _rec("2030-01-15 10:00:00 +0900", qty=0)),
+            _metric("heart_rate", "count/min",
+                    _rec("2030-01-14 23:40:00 +0900", Avg=110, Max=130),
+                    _rec("2030-01-15 10:00:00 +0900", Avg=70, Max=80)),
             workouts=[{"name": "Yoga", "start": "2030-01-14 23:30:00 +0900",
                        "end": "2030-01-15 00:30:00 +0900", "duration": 3600}],
         )
-        self.assertEqual(_parse(payload).activity_detail, "なし")
+        self.assertEqual(_parse(payload).activity_detail, ACTIVITY_NONE)
         prev_day = date(2030, 1, 14)
         self.assertEqual(_parse(payload, prev_day).activity_detail, "ヨガ60分")
 
@@ -1095,6 +1390,65 @@ class TestCandidateHelpers(unittest.TestCase):
         self.assertTrue(has_data_for(
             _payload({"name": "step_count", "units": "count", "data": "oops"}), D,
         ))
+
+
+_TZ_JST = timezone(timedelta(hours=9))
+_TZ_EST = timezone(timedelta(hours=-5))
+
+
+class TestRecordDayEnd(unittest.TestCase):
+    """日の終わり = 対象日の record 自身の offset の暦日の翌日 0:00 (W3-2h)。"""
+
+    def test_uses_record_offset(self):
+        payload = _payload(_metric("step_count", "count", _rec("2030-01-15 10:00:00 +0900", qty=1)))
+        end = record_day_end(payload, D, _TZ_EST)   # 既定 tz より record の offset が優先
+        self.assertEqual(end, datetime(2030, 1, 16, 0, 0, tzinfo=_TZ_JST))
+        self.assertEqual(end.utcoffset(), timedelta(hours=9))
+
+    def test_western_offset(self):
+        payload = _payload(_metric("step_count", "count", _rec("2030-01-15 22:00:00 -0500", qty=1)))
+        end = record_day_end(payload, D, _TZ_JST)
+        self.assertEqual(end, datetime(2030, 1, 16, 0, 0, tzinfo=_TZ_EST))
+        # 絶対時刻では JST の 1/16 14:00
+        self.assertEqual(end.timestamp(), datetime(2030, 1, 16, 14, 0, tzinfo=_TZ_JST).timestamp())
+
+    def test_mixed_offsets_take_the_latest_end(self):
+        # 旅行で offset が混在 → どの offset の暦日でも終わった時点 (最も遅い終わり)
+        payload = _payload(
+            _metric("step_count", "count",
+                    _rec("2030-01-15 08:00:00 +0900", qty=1),
+                    _rec("2030-01-15 20:00:00 -0500", qty=1)),
+        )
+        self.assertEqual(record_day_end(payload, D, _TZ_JST),
+                         datetime(2030, 1, 16, 0, 0, tzinfo=_TZ_EST))
+
+    def test_records_of_other_days_are_ignored(self):
+        payload = _payload(_metric(
+            "step_count", "count",
+            _rec("2030-01-14 23:59:00 -1000", qty=1),   # 前日の record (offset は使わない)
+            _rec("2030-01-15 10:00:00 +0900", qty=1),
+        ))
+        self.assertEqual(record_day_end(payload, D, _TZ_EST),
+                         datetime(2030, 1, 16, 0, 0, tzinfo=_TZ_JST))
+
+    def test_sleep_and_workout_keys_are_considered(self):
+        sleep = _payload(_metric("sleep_analysis", "hr", {
+            "totalSleep": 7.0, "sleepStart": "2030-01-14 23:00:00 -0300",
+            "sleepEnd": "2030-01-15 06:00:00 -0300", "source": "Sample Watch",
+        }))
+        self.assertEqual(record_day_end(sleep, D, _TZ_JST),
+                         datetime(2030, 1, 16, 0, 0, tzinfo=timezone(timedelta(hours=-3))))
+        workouts_only = _payload(workouts=[{"name": "Yoga", "start": "2030-01-15 07:00:00 -0800"}])
+        self.assertEqual(record_day_end(workouts_only, D, _TZ_JST),
+                         datetime(2030, 1, 16, 0, 0, tzinfo=timezone(timedelta(hours=-8))))
+
+    def test_falls_back_to_default_tz(self):
+        naive = _payload(_metric("step_count", "count", {"date": "2030-01-15 10:00:00", "qty": 1}))
+        for payload in (naive, {"data": {"metrics": []}}, {}, None, {"data": "x"}):
+            with self.subTest(payload=payload):
+                end = record_day_end(payload, D, _TZ_EST)
+                self.assertEqual(end, datetime(2030, 1, 16, 0, 0, tzinfo=_TZ_EST))
+                self.assertIsNotNone(end.tzinfo)
 
 
 if __name__ == "__main__":

@@ -9,6 +9,7 @@ from __future__ import annotations
 import logging
 import tempfile
 import unittest
+from dataclasses import fields as dataclass_fields
 from datetime import date
 from pathlib import Path
 from unittest.mock import MagicMock
@@ -134,6 +135,15 @@ class TestRunPipeline(unittest.TestCase):
         self.assertIsInstance(result, DailyHealthData)
         self.assertEqual(len(pub.published), 1)
         self.assertEqual(pub.published[0].step_count, 100)
+
+    def test_populated_count_is_out_of_all_15_health_fields(self):
+        # 健康フィールドは date を除いて 15 個 (旧ログは /14 固定で exercise_minutes を数えていなかった)
+        self.assertEqual(len(dataclass_fields(DailyHealthData)) - 1, 15)
+        logging.disable(logging.NOTSET)   # tests/__init__.py が止めている INFO を通す
+        self.addCleanup(logging.disable, logging.INFO)
+        with self.assertLogs("test-workflow", level="INFO") as logs:
+            run_pipeline(self.config, self.target_date, self._deps(), _logger())
+        self.assertIn("populated=1/15", "\n".join(logs.output))
 
     def test_sleep_payload_builder_is_called_with_fetch_result(self):
         captured_args: "list[tuple]" = []

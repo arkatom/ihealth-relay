@@ -7,7 +7,7 @@
 
 設計方針:
 - **テーブルスキーマは ``daily_health`` 1 つ**. 列は ``date`` (PRIMARY KEY) +
-  :data:`ihealth.publishers._payload.FIELD_SPECS` の 13 フィールド.
+  :data:`ihealth.publishers._payload.FIELD_SPECS` の 15 フィールド.
   ``int`` フィールドは ``INTEGER``, ``float`` は ``REAL``.
 - **CREATE TABLE IF NOT EXISTS で初回起動可**. 既存 DB は無修正で動く.
 - **UPSERT (``INSERT ... ON CONFLICT(date) DO UPDATE``)** で同じ日付の再実行が

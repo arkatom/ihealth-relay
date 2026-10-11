@@ -37,10 +37,12 @@ sections marked *Obsidian* or *Notion* only apply to that publisher.
      grouped by **minutes** (the exercise intensity score counts minutes),
      sleep aggregation on, and **one file per day**.
      Leave the export period at its default (recent days are re-written on
-     every run, which is how yesterday's values become final). To fill
-     `アクティビティ詳細`, also export **workouts** in the same automation
-     (without workouts the tool cannot tell whether you exercised and leaves
-     that key alone). Labels differ
+     every run, which is how yesterday's values become final).
+     `アクティビティ詳細` is built from mindfulness and Apple Exercise Time
+     (`瞑想10分、エクササイズ21分`); turn on **Include Workouts** in the same
+     automation to list the day's workouts by name instead
+     (`瞑想10分、ウォーキング31分`; days without a workout keep
+     `エクササイズN分`). Labels differ
      slightly between app versions. Files appear under
      `iCloud Drive › Health Auto Export › <automation name> ›
      HealthAutoExport-YYYY-MM-DD.json`; the folder name is up to you.
@@ -160,8 +162,11 @@ This reads `.env` and `config.toml`, collects health / weather / GitHub for
 the default window (yesterday back `IHEALTH_LOOKBACK_DAYS` days, plus
 today), and **logs each planned change as
 `[dry-run] <note path>: <key>: <old> -> <new>` without touching the vault**.
-It also writes a run report to `logs/diary-report-<UTC>.json`. Reminders are
-only logged in a dry run (none is created, nothing is marked as notified).
+It also writes a run report to `logs/diary-report-<UTC>.json` (created at the
+start; while the run is in progress, each date's result is appended to the
+`.jsonl` journal next to it). Reminders are only logged in a dry run (none is
+created, nothing is marked as notified) and `data/diary-state.json` is not
+changed.
 Check a few notes, then run without `--dry-run`. To fill older days once:
 
 ```bash
@@ -171,7 +176,9 @@ Check a few notes, then run without `--dry-run`. To fill older days once:
 `--fill-empty-only` keeps every value that is already filled in, except
 provisional values the tool wrote itself that are still unchanged (they are
 replaced by the final values). Weather is fetched at most once per second
-per day, so long ranges take a while.
+per day, so long ranges take a while. Values that cannot be settled yet on
+dates older than 30 days are not tracked for re-processing; they are listed
+once in a reminder and in the run report (`provisional.untracked`).
 
 *Single-day sinks*:
 
@@ -221,9 +228,10 @@ without arguments, so the publisher comes from `IHEALTH_PUBLISHER`
 (default `notion`), and the installer picks the times from the same key:
 
 - `obsidian`: **07:00, 12:00 and 21:00**. Each run writes yesterday back 7
-  days (final values) plus today (provisional), so late data is filled in by
-  a later run; days that still hold provisional values are re-processed for
-  up to 30 days.
+  days plus today (provisional), so late data is filled in by a later run;
+  days whose values have not settled yet (provisional values, pending or
+  incomplete weather, an incomplete GitHub collection, …) are re-processed
+  for up to 30 days.
 - any other publisher: **07:00 only** (as before). Each run processes
   yesterday; Slack posts once a day.
 
@@ -256,17 +264,30 @@ launchctl bootout "gui/$(id -u)/com.ihealthrelay.daemon" 2>/dev/null \
   which auto-dismiss). The Obsidian pipeline sends at most one per run and
   repeats an identical reminder (including configuration errors) at most
   once per day; a reminder that could not be created is retried by the next
-  run.
+  run. Values that have not settled more than 3 days after they were first
+  seen are added to that reminder as 要確認.
 - **Logs**: rotating daily under `logs/run.log` in the project root,
   30-day retention. launchd's own stdout/stderr go to
   `~/Library/Logs/ihealth-relay/launchd.log` (start-up failures, warnings and
   errors only; look there if a run never started).
-- **Provisional values**: `data/diary-state.json` lists the days and keys
-  written as provisional (today's values) until their final values are
-  written. Delete it only if you want the tool to stop re-processing them.
-- **Obsidian run reports**: `logs/diary-report-<UTC>.json` after every run
-  (30 days) — per date and key what was inserted, updated, kept or skipped
-  and why. Useful as a ledger after a backfill.
+- **Unsettled values**: `data/diary-state.json` (the ledger) lists, per day
+  and key, values that have not settled yet — provisional values the tool
+  wrote (with the value), withheld health values, pending or incomplete
+  weather, an incomplete GitHub collection, provisional values it cannot
+  rewrite because of a comment or a duplicate key — with the reason and when
+  they were first seen. Scheduled runs re-process those days for up to 30
+  days (see
+  [README ▸ Values that have not settled yet](../README.md#values-that-have-not-settled-yet)).
+  Deleting the file only stops the re-processing and the 要確認 reminders
+  for what it lists.
+- **Obsidian run reports**: `logs/diary-report-<UTC>.json` for every run
+  (30 days) — created at the start with the planned dates, per-date results
+  appended to `logs/diary-report-<UTC>.jsonl` as each date finishes, and
+  completed at the end (`status` `finished` / `interrupted`,
+  `remaining_dates`; the journal is then deleted). Per date and key it shows
+  what was inserted, updated, kept or skipped and why, and which keys are
+  still unsettled. Useful as a ledger after a backfill; if a run stopped
+  half-way, the `.jsonl` journal still holds the dates it finished.
 - **Obsidian backups**: every overwritten note is copied first to
   `data/obsidian-backup/<UTC date>/<note>.<UTC time>.md` (0600, 30 days).
 - **Re-run a specific date**: `python3 -m ihealth --date 2026-04-22`
@@ -290,12 +311,17 @@ launchctl bootout "gui/$(id -u)/com.ihealthrelay.daemon" 2>/dev/null \
 | `ConfigAppError` (exit 3) — "Obsidian vault 未設定" / "Obsidian 設定不備" | `OBSIDIAN_VAULT_DIR` unset, vault or diary folder missing, or two fields mapped to one key in `config.toml` | fix `.env` / `config.toml` |
 | Exit 12 — "日記の一部取得失敗" | a source failed (GitHub token, JMA unreachable, unreadable health file); its keys were left untouched | see [README ▸ Failures and recovery](../README.md#failures-and-recovery) |
 | Exit 12 — "日記ノートの確認が必要" | a note without frontmatter still contains Templater `<% … %>`, or `OBSIDIAN_TEMPLATE` cannot be used | apply the template in Obsidian / fix the template path, then re-run that date |
-| Exit 11 — "日記の書き込み失敗" | a note could not be written (permissions, broken frontmatter, edited continuously during the write) | fix the note and re-run that date |
+| Exit 11 — "日記の書き込み失敗" | a note could not be written (permissions, broken frontmatter, edited continuously during the write), the read-back after writing kept showing other content (another program saved the note right after; the reminder lists the backups), or the pre-write check found a change outside the tool's keys (nothing was written; please report it as a bug) | check the note (restore from the backup if needed) and re-run that date |
+| Exit 12 — "日記の実行レポートを保存できません" / "日記の未確定の値の台帳を保存できません" | `logs/` or `data/` cannot be written (disk full, permissions); if the report could not be created, no note was touched | free up space / fix permissions, then re-run |
 | Reminder "HAE オートメーション停止の疑い" | newest automation file is more than 3 days old | check the automation on the iPhone, then run with `--from <first missing day> --sources health` |
 | Reminder "HAE オートメーション出力が見つかりません" | no `HealthAutoExport-YYYY-MM-DD.json` under `HEALTH_EXPORT_DIR` (or its parent when it points at `AutoSync`), and no day got health data | point `HEALTH_EXPORT_DIR` at the Health Auto Export `Documents` folder; check the automation on the iPhone |
-| Reminder "日記の暫定値が確定していません" | a day written with provisional values has not been re-exported after it ended (3+ days) | open Health Auto Export on the iPhone, run the automation and check its export range covers recent days; the day is re-processed automatically for 30 days |
-| Obsidian: health keys of yesterday not written | yesterday's automation file was written before midnight (`not_final` in the run report) | wait for the next export, or open Health Auto Export on the iPhone; scheduled runs re-process the day |
-| Obsidian: `アクティビティ詳細` never written | the automation does not export workouts | enable workouts in the Health Auto Export automation |
+| Reminder "日記の暫定値が確定していません (要確認)" / "日記の値が確定していません (要確認)" | values have not settled more than 3 days after they were first seen; the reminder lists the keys, reasons and what to check | for provisional values, open Health Auto Export on the iPhone, run the automation and check its export range covers recent days; for the other reasons follow the hint in the reminder ([README ▸ Failures and recovery](../README.md#failures-and-recovery)). Days are re-processed automatically for 30 days |
+| Obsidian: yesterday's health values still provisional (`provisional` in the run report) | yesterday's latest automation file was written before midnight | usually nothing: scheduled runs replace the values once Health Auto Export re-exports the day (open the app to speed it up); if not, the 要確認 reminder arrives after 3 days |
+| Obsidian: a health key not written, `not_final` in the run report | the value would come from an AutoSync `.hae` written before the day ended, which a stopped AutoSync never re-exports | fill the value in by hand if you need it (that also ends its tracking) |
+| Obsidian: a key reported as `kept` with `comment present …` / `duplicate key …` | the key's entry in the note has a comment, or the key appears twice; the tool does not rewrite it | move the comment to its own line above the key, or merge the duplicates |
+| Obsidian: `アクティビティ詳細` not written | no mindfulness, workout or Apple Exercise Time that day and no heart-rate data either (Watch not worn; a 0-minute Apple Exercise Time alone does not count), or an input could not be read (then it is not written even with heart-rate data) | nothing to do; check that the automation exports Mindful Minutes, Apple Exercise Time and Heart Rate |
+| Obsidian: `アクティビティ詳細` shows `エクササイズN分` instead of workout names | the automation does not export workouts (with workouts exported, a day without any workout of at least 1 minute also shows `エクササイズN分`) | turn on **Include Workouts** in the Health Auto Export automation |
+| Obsidian: an `アクティビティ詳細` you typed was replaced (e.g. by `なし` or `エクササイズN分`) | within the default window (yesterday back 7 days plus today) the tool writes this key like its other keys; `なし` means heart-rate data but no mindfulness, workout or exercise record that day | to keep your value, add a comment to its line (`アクティビティ詳細: "ヨガ30分" # 手入力`; the entry is then `kept`); for workout names, turn on **Include Workouts** |
 | Works by hand, `Operation not permitted` only under launchd | the vault or export folder sits in a privacy-protected location (e.g. `~/Documents`, `~/Desktop`) | grant Full Disk Access to `/usr/bin/python3` (System Settings › Privacy & Security), or keep the vault elsewhere |
 | Reminder shows `想定外エラー` ("Unexpected error", exit 1) | unhandled exception | check `logs/run.log`, file an issue |
 
@@ -308,5 +334,6 @@ rm ~/Library/LaunchAgents/com.ihealthrelay.daemon.plist
 rm -rf ~/src/ihealth-relay   # or wherever you cloned it
 ```
 
-`data/` (health archives, Obsidian backups) and `logs/` (logs, run reports)
-inside the clone hold personal data; deleting the clone removes them too.
+`data/` (health archives, Obsidian backups, the ledger `diary-state.json`)
+and `logs/` (logs, run reports) inside the clone hold personal data; deleting
+the clone removes them too.

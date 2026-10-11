@@ -558,7 +558,7 @@ class TestParseAllWithFixtures(unittest.TestCase):
         ctx = ParseContext(target_date=date(2026, 4, 22), max_heart_rate=178.0)
         result = parse_all(FIXTURE_ROOT / "2026-04-22", date(2026, 4, 22), ctx)
         self.assertIsInstance(result, DailyHealthData)
-        # 4/22 は 12/13 populated (瞑想のみなし)
+        # 4/22 は 13/15 populated (瞑想の 2 フィールドのみなし)
         self.assertIsNotNone(result.step_count)
         self.assertIsNotNone(result.distance_km)
         self.assertIsNotNone(result.active_energy_kcal)

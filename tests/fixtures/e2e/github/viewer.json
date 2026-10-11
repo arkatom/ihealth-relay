@@ -1,0 +1,12 @@
+{
+  "data": {
+    "rateLimit": {"cost": 1, "remaining": 4999, "resetAt": "2030-06-01T00:00:00Z"},
+    "viewer": {
+      "login": "e2e-sample-user",
+      "organizations": {
+        "pageInfo": {"hasNextPage": false, "endCursor": null},
+        "nodes": [{"login": "e2e-sample-org"}]
+      }
+    }
+  }
+}

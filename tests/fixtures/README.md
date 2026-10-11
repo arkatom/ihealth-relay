@@ -1,6 +1,6 @@
 # tests/fixtures/
 
-テストが読み込む fixture の置き場。3 種類あり、どれもテスト以外 (実 iCloud /
+テストが読み込む fixture の置き場。4 種類あり、どれもテスト以外 (実 iCloud /
 実 vault / ネットワーク) には触れずに使える。
 
 | ディレクトリ | 中身 | 作り方 | 主に使うテスト |
@@ -8,10 +8,11 @@
 | `sample_health_export/` | AutoSync `.hae` を解凍した後のメトリクス別 JSON (`YYYY-MM-DD/{metric}.json`) | 実データを間引いて anonymize (下記) | `test_parser.py` ほか単日パイプライン |
 | `automation/` | Health Auto Export **オートメーション** の日次 JSON (`HealthAutoExport-YYYY-MM-DD.json`) | **完全な合成** (手書き) | `test_automation_parser.py`, `test_health_loader.py` |
 | `jma/` | 気象庁「1時間ごとの値」(`hourly_s1.php`) ページの HTML | **完全な合成** (手書き) | `test_weather.py` |
+| `e2e/` | 日記パイプライン一気通貫テストの入力一式: 合成の HAE オートメーション JSON、気象庁 `hourly_s1` の HTML、GitHub GraphQL の応答、日記ノートと Templater テンプレート。条件ごとの狙いと期待値の手計算は [`e2e/README.md`](e2e/README.md) | **完全な合成** (手書き) | `test_e2e_diary.py` |
 
-`automation/` と `jma/` は Obsidian 日記対応 (v0.2.0) で追加した。実在の健康値・
-日記本文・観測値は含まない。fixture を変えたら、期待値を手計算で書いている
-テスト側も合わせて更新すること。
+`automation/`・`jma/`・`e2e/` は Obsidian 日記対応 (v0.2.0) で追加した。実在の健康値・
+日記本文・観測値・GitHub アカウントは含まない。fixture を変えたら、期待値を手計算で
+書いているテスト側も合わせて更新すること。
 
 ## automation/ (オートメーション JSON, 合成)
 
@@ -74,7 +75,7 @@ parser 集計ルールの回帰検証に必要なため意味のある値を保�
 
 ```
 sample_health_export/
-├── 2026-04-22/   # フル populate (13 メトリクスのうち 12 フィールドに値、瞑想のみなし)
+├── 2026-04-22/   # フル populate (健康 15 フィールドのうち 13 フィールドに値、瞑想の 2 フィールドのみなし)
 └── 2026-04-23/   # 部分欠落 (昼寝・体重・体脂肪なし、瞑想あり)
 ```
 
@@ -82,7 +83,7 @@ sample_health_export/
 
 | 日付 | なぜ fixture に選んだか |
 | --- | --- |
-| 2026-04-22 | 13 フィールドのうち **12** フィールドが populated (瞑想のみなし)。`sleep_hours` (夜主睡眠) と `nap_hours` (昼寝) の両方が同時に取れる構成で、sleep_analysis の JST end.hour 分岐を検証できる。`body_mass_kg` / `body_fat_percentage` 値も含まれる。 |
+| 2026-04-22 | 健康 15 フィールドのうち **13** フィールドが populated (瞑想の `mindful_sessions` / `mindful_minutes` のみなし)。`sleep_hours` (夜主睡眠) と `nap_hours` (昼寝) の両方が同時に取れる構成で、sleep_analysis の JST end.hour 分岐を検証できる。`body_mass_kg` / `body_fat_percentage` 値も含まれる。 |
 | 2026-04-23 | 部分欠落ケースのカバレッジ。昼寝なし (`nap_hours=None`)・体重計測なし (`body_mass_kg=None`) ・瞑想あり (`mindful_minutes`/`mindful_sessions` not None)。「データが無い日」の parser 挙動 (None フィールド) を検証する。 |
 
 ### 再生成方法

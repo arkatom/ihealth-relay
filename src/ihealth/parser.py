@@ -1,7 +1,7 @@
 """AutoSync の解凍済み JSON からメトリクス別の日次集計値を取り出す。
 
 source.py が ``data/health/YYYY-MM-DD/{metric_dir}.json`` にアーカイブした
-11 ファイルを入力とし、14 フィールド (date + 13) の :class:`DailyHealthData` を返す。
+11 ファイルを入力とし、16 フィールド (date + 健康 15) の :class:`DailyHealthData` を返す。
 
 各集計関数は次の規約で統一:
     def parse_<field>(payload: dict, ctx: ParseContext) -> int | float | None
@@ -137,7 +137,7 @@ def _sum_asleep_by_source(
     return max(by_source.values())
 
 
-# ---------- メトリクス別集計関数 (13 個) ----------
+# ---------- メトリクス別集計関数 (15 個 = 健康 15 フィールドに 1 つずつ) ----------
 # 各関数は `(payload, ctx)` を受け取る規約で統一 (ctx は不要な関数でも受け取る)。
 
 
@@ -357,10 +357,10 @@ def parse_body_fat_percentage(payload: dict, ctx: ParseContext) -> "float | None
 #
 # 注意: ディレクトリ数は 11 だが、heart_rate は 1 ファイルから 3 フィールド、
 # mindful_minutes は 1 ファイルから 2 フィールド、sleep_analysis も 2 フィールド
-# 派生するので、このテーブルは 13 行になる。
-# apple_exercise_time はアーカイブはされるが、現時点では DailyHealthData 側の
-# フィールドに使っていない (運動強度スコアは heart_rate ベースの Heart Points 算出に
-# 一本化した。旧 GoogleFitNotionIntegration の「運動強度スコア」の意味論に合わせるため)。
+# 派生するので、このテーブルは 15 行 (= 健康 15 フィールド) になる。
+# apple_exercise_time は exercise_minutes (アクティビティ時間) の集計にだけ使う
+# (運動強度スコアは heart_rate ベースの Heart Points 算出に一本化している。
+# 旧 GoogleFitNotionIntegration の「運動強度スコア」の意味論に合わせるため)。
 
 #: パース関数の共通シグネチャ。``payload`` と ``ctx`` を取って int / float / None を返す。
 ParserFn = Callable[[dict, "ParseContext"], Optional[Union[int, float]]]
@@ -390,7 +390,7 @@ def parse_all(
     ctx: ParseContext,
     payload_overrides: "dict[str, dict] | None" = None,
 ) -> DailyHealthData:
-    """``archive_dir`` 配下のアーカイブ JSON を読み込み、13 フィールドに集計して返す。
+    """``archive_dir`` 配下のアーカイブ JSON を読み込み、健康 15 フィールドに集計して返す。
 
     ファイルが存在しない / パース関数が例外を吐いた場合は該当フィールドを ``None``
     にして続行する（1 メトリクスの欠落で全滅しない設計）。

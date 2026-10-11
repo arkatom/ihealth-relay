@@ -198,11 +198,13 @@ def run_pipeline(
         payload_overrides=sleep_overrides,
     )
 
-    populated = sum(
-        1 for key, value in health_data.as_dict().items()
-        if key != "date" and value is not None
+    # 健康フィールド (date を除く 15 個) のうち値があるもの。分母はフィールド定義から数える
+    values = health_data.as_dict()
+    health_fields = [key for key in values if key != "date"]
+    populated = sum(1 for key in health_fields if values[key] is not None)
+    logger.info(
+        "集計完了: target=%s populated=%d/%d", target_date, populated, len(health_fields),
     )
-    logger.info("集計完了: target=%s populated=%d/14", target_date, populated)
     logger.debug("集計値:")
     for key, value in health_data.as_dict().items():
         logger.debug("  %s = %s", key, value)

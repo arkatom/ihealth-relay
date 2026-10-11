@@ -1,0 +1,99 @@
+{
+  "data": {
+    "metrics": [
+      {
+        "name": "step_count",
+        "units": "count",
+        "data": [
+          {"date": "2030-05-14 23:59:00 +0900", "qty": 77, "source": "Sample Watch"},
+          {"date": "2030-05-15 00:00:00 +0900", "qty": 15, "source": "Sample Watch"},
+          {"date": "2030-05-15 09:15:00 +0900", "qty": 3000, "source": "Sample Watch|Sample Phone"},
+          {"date": "2030-05-15 23:59:00 +0900", "qty": 33, "source": "Sample Watch"},
+          {"date": "2030-05-16 00:05:00 +0900", "qty": 41, "source": "Sample Watch"}
+        ]
+      },
+      {
+        "name": "walking_running_distance",
+        "units": "km",
+        "data": [
+          {"date": "2030-05-14 23:59:00 +0900", "qty": 0.05, "source": "Sample Watch"},
+          {"date": "2030-05-15 09:15:00 +0900", "qty": 2.4, "source": "Sample Watch|Sample Phone"},
+          {"date": "2030-05-15 23:59:00 +0900", "qty": 0.02, "source": "Sample Watch"},
+          {"date": "2030-05-16 00:05:00 +0900", "qty": 0.03, "source": "Sample Watch"}
+        ]
+      },
+      {
+        "name": "active_energy",
+        "units": "kJ",
+        "data": [
+          {"date": "2030-05-14 23:59:00 +0900", "qty": 418.4, "source": "Sample Watch"},
+          {"date": "2030-05-15 09:15:00 +0900", "qty": 836.8, "source": "Sample Watch"},
+          {"date": "2030-05-15 23:59:00 +0900", "qty": 41.84, "source": "Sample Watch"},
+          {"date": "2030-05-16 00:05:00 +0900", "qty": 20.92, "source": "Sample Watch"}
+        ]
+      },
+      {
+        "name": "heart_rate",
+        "units": "count/min",
+        "data": [
+          {"date": "2030-05-14 23:59:00 +0900", "Avg": 150, "Min": 140, "Max": 160, "source": "Sample Watch"},
+          {"date": "2030-05-15 00:00:00 +0900", "Avg": 58, "Min": 55, "Max": 61, "source": "Sample Watch"},
+          {"date": "2030-05-15 12:00:00 +0900", "Avg": 90, "Min": 85, "Max": 96, "source": "Sample Watch"},
+          {"date": "2030-05-15 23:59:00 +0900", "Avg": 62, "Min": 60, "Max": 64, "source": "Sample Watch"},
+          {"date": "2030-05-16 00:05:00 +0900", "Avg": 66, "Min": 64, "Max": 69, "source": "Sample Watch"}
+        ]
+      },
+      {
+        "name": "resting_heart_rate",
+        "units": "count/min",
+        "data": [
+          {"date": "2030-05-15 00:01:00 +0900", "qty": 57, "source": "Sample Watch"}
+        ]
+      },
+      {
+        "name": "blood_oxygen_saturation",
+        "units": "%",
+        "data": [
+          {"date": "2030-05-15 02:00:00 +0900", "qty": 0.96, "source": "Sample Watch"},
+          {"date": "2030-05-15 04:00:00 +0900", "qty": 0.98, "source": "Sample Watch"}
+        ]
+      },
+      {
+        "name": "sleep_analysis",
+        "units": "hr",
+        "data": [
+          {
+            "date": "2030-05-15 00:00:00 +0900",
+            "totalSleep": 7.1,
+            "asleep": 0,
+            "core": 4.6,
+            "deep": 1.0,
+            "rem": 1.5,
+            "awake": 0.2,
+            "inBed": 0,
+            "sleepStart": "2030-05-14 23:35:00 +0900",
+            "sleepEnd": "2030-05-15 06:50:00 +0900",
+            "inBedStart": "2030-05-14 23:35:00 +0900",
+            "inBedEnd": "2030-05-15 06:50:00 +0900",
+            "source": "Sample Watch"
+          },
+          {
+            "date": "2030-05-16 00:00:00 +0900",
+            "totalSleep": 0.1,
+            "asleep": 0,
+            "core": 0.1,
+            "deep": 0,
+            "rem": 0,
+            "awake": 0,
+            "inBed": 0,
+            "sleepStart": "2030-05-15 23:58:00 +0900",
+            "sleepEnd": "2030-05-16 00:04:00 +0900",
+            "inBedStart": "2030-05-15 23:58:00 +0900",
+            "inBedEnd": "2030-05-16 00:04:00 +0900",
+            "source": "Sample Watch"
+          }
+        ]
+      }
+    ]
+  }
+}

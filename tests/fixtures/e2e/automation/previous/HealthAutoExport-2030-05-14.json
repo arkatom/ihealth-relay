@@ -1,0 +1,20 @@
+{
+  "data": {
+    "metrics": [
+      {
+        "name": "step_count",
+        "units": "count",
+        "data": [
+          {"date": "2030-05-14 07:00:00 +0900", "qty": 1200, "source": "Sample Watch"}
+        ]
+      },
+      {
+        "name": "weight_body_mass",
+        "units": "kg",
+        "data": [
+          {"date": "2030-05-14 07:30:00 +0900", "qty": 64.3, "source": "Sample Scale"}
+        ]
+      }
+    ]
+  }
+}
