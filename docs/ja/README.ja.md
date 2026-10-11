@@ -100,6 +100,9 @@ Apple Health のデータを、日々の記録先へ転記する macOS バッチ
    ```bash
    ./bin/install-launchd.sh
    ```
+   登録したら `/bin/bash` に **フルディスクアクセス** を与え (与えないと定期実行が
+   Health Auto Export の iCloud フォルダを読めない)、bash に **リマインダー** の操作を
+   許可するダイアログを許可する ([定期実行 (launchd)](#定期実行-launchd))。
 
 ## Obsidian 日記 (`--publisher obsidian`)
 
@@ -216,7 +219,8 @@ Github: "[🔀 my-app:PR #12: Add login form](https://github.com/your-name/my-ap
    ./bin/ihealth-run --publisher obsidian --dry-run   # "[dry-run] <ノート>: <キー>: 旧値 -> 新値" をログに出す
    ./bin/ihealth-run --publisher obsidian
    ```
-5. **定期実行**: `./bin/install-launchd.sh` ([定期実行 (launchd)](#定期実行-launchd))。
+5. **定期実行**: `./bin/install-launchd.sh` を実行し、`/bin/bash` にフルディスクアクセスを
+   与えて、リマインダーの許可ダイアログを許可する ([定期実行 (launchd)](#定期実行-launchd))。
 
 #### Obsidian 用の `.env` キー
 
@@ -286,6 +290,27 @@ property = "GitHub"          # GitHub 活動を "Github" ではなく "GitHub" �
 再実行する。`./bin/install-launchd.sh --print-plist` で、何も変更せずに登録する plist を
 確認できる。スリープ中に過ぎた起動は復帰後に 1 回だけ実行され、その直後は最大
 `IHEALTH_NETWORK_GRACE_SEC` 秒 Wi-Fi の接続を待つ。
+
+登録したら、定期実行に必要な macOS の許可を一度だけ与える:
+
+- **`/bin/bash` にフルディスクアクセス**: launchd は bash スクリプト `bin/ihealth-run` を
+  起動するので、macOS のプライバシー保護 (TCC) は定期実行のファイルアクセスを
+  `/bin/bash` によるものとみなす。許可が無いと Health Auto Export の iCloud フォルダ
+  (`~/Library/Mobile Documents/iCloud~com~ifunography~HealthExport/Documents`) の
+  読み込みが `[Errno 1] Operation not permitted` で失敗し、健康データの source だけが
+  失敗する (天気と GitHub は動き、終了コードは 12)。`/bin/bash` についてはダイアログが
+  出ないので、自分で追加する: システム設定 › プライバシーとセキュリティ ›
+  フルディスクアクセス › 「+」→ Cmd+Shift+G で `/bin/bash` を入力して追加し、オンにする。
+  vault を `~/Documents` や `~/Desktop` に置いている場合も、この許可で足りる。
+  この許可は、launchd がこのユーザーで起動するすべての bash スクリプトに及ぶ。
+- **リマインダー**: 定期実行が初めてリマインダーを作るとき、bash にリマインダーの操作を
+  許可するか macOS が尋ねるので、許可する (後から
+  システム設定 › プライバシーとセキュリティ › オートメーション › bash › リマインダー
+  でも許可できる)。許可するまでは通知がタイムアウトし、未送信のまま残って次の実行で
+  再送される。
+
+許可したら `launchctl kickstart -k gui/$(id -u)/com.ihealthrelay.daemon` で試し、
+`logs/run.log` を確認する。
 
 - アプリのログ: `logs/run.log` (日次ローテーション, 30 日保持)
 - launchd の stdout / stderr: `~/Library/Logs/ihealth-relay/launchd.log`。起動失敗・

@@ -239,6 +239,26 @@ Re-run the installer after changing `IHEALTH_PUBLISHER`.
 `./bin/install-launchd.sh --print-plist` prints the plist it would install
 without changing anything.
 
+After installing, give the scheduled run its macOS permissions (once):
+
+- **Full Disk Access for `/bin/bash`**: launchd starts `bin/ihealth-run`, a
+  bash script, so macOS privacy protection (TCC) attributes the run's file
+  access to `/bin/bash`. Without the grant, reading the Health Auto Export
+  iCloud folder fails with `[Errno 1] Operation not permitted` (the health
+  source fails, exit 12; weather and GitHub still work), and macOS shows no
+  dialog for it. Open System Settings › Privacy & Security › Full Disk
+  Access, click "+", press Cmd+Shift+G, enter `/bin/bash`, add it and turn
+  it on. The grant applies to every bash script launchd starts for your
+  user.
+- **Reminders**: the first time a scheduled run creates a reminder, macOS
+  asks whether bash may control Reminders. Allow it (or later under System
+  Settings › Privacy & Security › Automation › bash › Reminders); until
+  then the reminder times out, is kept as undelivered and is retried on the
+  next run.
+
+Then test the job with `launchctl kickstart -k gui/$(id -u)/com.ihealthrelay.daemon`
+and check `logs/run.log`.
+
 Runs missed while the Mac sleeps are run once after wake; the Obsidian
 pipeline then waits up to `IHEALTH_NETWORK_GRACE_SEC` (60) seconds for the
 network.
@@ -322,7 +342,8 @@ launchctl bootout "gui/$(id -u)/com.ihealthrelay.daemon" 2>/dev/null \
 | Obsidian: `アクティビティ詳細` not written | no mindfulness, workout or Apple Exercise Time that day and no heart-rate data either (Watch not worn; a 0-minute Apple Exercise Time alone does not count), or an input could not be read (then it is not written even with heart-rate data) | nothing to do; check that the automation exports Mindful Minutes, Apple Exercise Time and Heart Rate |
 | Obsidian: `アクティビティ詳細` shows `エクササイズN分` instead of workout names | the automation does not export workouts (with workouts exported, a day without any workout of at least 1 minute also shows `エクササイズN分`) | turn on **Include Workouts** in the Health Auto Export automation |
 | Obsidian: an `アクティビティ詳細` you typed was replaced (e.g. by `なし` or `エクササイズN分`) | within the default window (yesterday back 7 days plus today) the tool writes this key like its other keys; `なし` means heart-rate data but no mindfulness, workout or exercise record that day | to keep your value, add a comment to its line (`アクティビティ詳細: "ヨガ30分" # 手入力`; the entry is then `kept`); for workout names, turn on **Include Workouts** |
-| Works by hand, `Operation not permitted` only under launchd | the vault or export folder sits in a privacy-protected location (e.g. `~/Documents`, `~/Desktop`) | grant Full Disk Access to `/usr/bin/python3` (System Settings › Privacy & Security), or keep the vault elsewhere |
+| Works by hand, but under launchd reading fails with `[Errno 1] Operation not permitted` (typically the health source fails, exit 12, while weather and GitHub still work) | macOS privacy protection (TCC) attributes the scheduled run's file access to `/bin/bash`, because launchd starts the bash script `bin/ihealth-run`, and `/bin/bash` may not read the Health Auto Export iCloud folder (`~/Library/Mobile Documents/iCloud~com~ifunography~HealthExport/Documents`). macOS shows no dialog for it (`/bin/bash` is a platform binary) | System Settings › Privacy & Security › Full Disk Access › "+", press Cmd+Shift+G, enter `/bin/bash`, add it and turn it on; then run `launchctl kickstart -k gui/$(id -u)/com.ihealthrelay.daemon` and check `logs/run.log`. If the vault itself is in `~/Documents` or `~/Desktop`, the same grant covers it. The grant applies to every bash script launchd starts for your user |
+| Under launchd no reminder appears and `logs/run.log` shows `Reminders 通知がタイムアウト` | the scheduled run needs Automation permission for bash to control Reminders; macOS asks for it with a dialog | allow it on the dialog, or later under System Settings › Privacy & Security › Automation › bash › Reminders. Until then the reminder is kept as undelivered and retried on the next run |
 | Reminder shows `想定外エラー` ("Unexpected error", exit 1) | unhandled exception | check `logs/run.log`, file an issue |
 
 ## Uninstalling

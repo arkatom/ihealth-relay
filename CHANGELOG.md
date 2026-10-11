@@ -211,6 +211,18 @@ days per run. The single-day sinks keep working as before.
   previous-day and the current-day `sleep_analysis` file is counted once
   (was double-counted when the two files were merged).
 
+### Notes
+
+- **Scheduled runs need Full Disk Access for `/bin/bash`**: launchd starts
+  the bash script `bin/ihealth-run`, so macOS attributes the run's file
+  access to `/bin/bash`; without the grant, reading the Health Auto Export
+  iCloud folder fails with `Operation not permitted` (the health source
+  fails, exit 12) and macOS shows no dialog. Add `/bin/bash` under System
+  Settings › Privacy & Security › Full Disk Access (the grant applies to
+  every bash script launchd starts for your user), and allow the dialog
+  that lets bash control Reminders, or reminders time out and are retried
+  on the next run.
+
 ### Notes for diaries migrated from the predecessor
 
 Values written by the predecessor (GoogleFitNotionIntegration, via Notion)
