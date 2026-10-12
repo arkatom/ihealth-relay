@@ -2560,7 +2560,8 @@ class LaunchAgentScheduleTest(unittest.TestCase):
             plist["StartCalendarInterval"],
             [{"Hour": 7, "Minute": 0}, {"Hour": 12, "Minute": 0}, {"Hour": 21, "Minute": 0}],
         )
-        self.assertEqual(plist["ProgramArguments"], ["__PROJECT_ROOT__/bin/ihealth-run"])
+        # 起動するのは専用ランチャー (install-launchd.sh が置換。tests/test_launcher.py 参照)
+        self.assertEqual(plist["ProgramArguments"], ["__PROGRAM__"])
         self.assertFalse(plist["RunAtLoad"])
 
     @unittest.skipUnless(shutil.which("bash"), "bash が無い環境")
@@ -2570,13 +2571,21 @@ class LaunchAgentScheduleTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             project = root / "proj"
-            (project / "bin").mkdir(parents=True)
+            (project / "bin" / "launcher").mkdir(parents=True)
             (project / "LaunchAgent").mkdir()
-            for name in ("install-launchd.sh", "ihealth-run"):
+            for name in ("install-launchd.sh", "ihealth-run", "launcher/ihealth-launcher.c"):
                 shutil.copy2(PROJECT_ROOT / "bin" / name, project / "bin" / name)
             shutil.copy2(PROJECT_ROOT / "LaunchAgent" / self.PLIST, project / "LaunchAgent" / self.PLIST)
             home = root / "home"
             home.mkdir()
+            # C コンパイラがあれば専用ランチャー、無ければ bin/ihealth-run (install-launchd.sh と同じ順で探す)。
+            # installer はプロジェクトの実体のパスを使う (macOS の一時ディレクトリは /var → /private/var)
+            has_cc = (os.path.isfile("/usr/bin/cc") and os.access("/usr/bin/cc", os.X_OK)) \
+                or shutil.which("cc", path="/usr/bin:/bin") is not None
+            program = (
+                home / "Library" / "Application Support" / "ihealth-relay" / "ihealth-launcher"
+                if has_cc else project.resolve() / "bin" / "ihealth-run"
+            )
             cases = (
                 ("IHEALTH_PUBLISHER=obsidian\n", [7, 12, 21]),
                 ('IHEALTH_PUBLISHER="Obsidian"\r\n', [7, 12, 21]),
@@ -2600,7 +2609,7 @@ class LaunchAgentScheduleTest(unittest.TestCase):
                     )
                     plist = plistlib.loads(proc.stdout)
                     self.assertEqual([entry["Hour"] for entry in plist["StartCalendarInterval"]], hours)
-                    self.assertEqual(plist["ProgramArguments"], [str(project / "bin" / "ihealth-run")])
+                    self.assertEqual(plist["ProgramArguments"], [str(program)])
                     self.assertEqual(
                         plist["StandardErrorPath"], f"{home}/Library/Logs/ihealth-relay/launchd.log",
                     )

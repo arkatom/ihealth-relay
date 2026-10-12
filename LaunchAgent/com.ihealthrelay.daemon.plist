@@ -1,18 +1,29 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!--
   ihealth-relay LaunchAgent テンプレート.
-  `bin/install-launchd.sh` が __PROJECT_ROOT__ / __HOME__ を実パスに置換してから
-  ~/Library/LaunchAgents/ 配下にコピー → launchctl load する。
+  `bin/install-launchd.sh` が下の <string> にあるプレースホルダ (起動するプログラム /
+  プロジェクトルート / ホーム) を実パスに置換してから ~/Library/LaunchAgents/ 配下に
+  コピー → launchctl bootstrap する。このコメントの中にはプレースホルダを書かないこと
+  (置換されたパスに "-" が 2 つ続くと XML のコメントとして不正になる)。
 
   設計ポリシー:
   - launchd 自身が触るパス (WorkingDirectory / StandardOutPath / StandardErrorPath) は
     すべて $HOME 配下に固定する。リポジトリ本体が外部ボリューム /Volumes/... に置かれて
     いると、launchd が外部ボリュームへ chdir() / open() する段階で TCC に阻まれて
     EX_CONFIG=78 のまま起動前に死ぬため (実機検証済 2026-04-26)。子プロセス
-    (bin/ihealth-run → /usr/bin/python3) が起動した後は通常のユーザー権限で外部
-    ボリュームに自由にアクセスできる (python3 へのフルディスクアクセス付与は別途必要)。
-  - ProgramArguments は bin/ihealth-run ラッパー経由。ラッパー側で cd / PYTHONPATH /
-    LANG をセットアップするので、plist の EnvironmentVariables は不要。
+    (ランチャー → bin/ihealth-run → /usr/bin/python3) が起動した後は通常のユーザー権限で
+    動く。
+  - ProgramArguments[0] は専用ランチャー
+    ($HOME/Library/Application Support/ihealth-relay/ihealth-launcher)。TCC はジョブの
+    ファイルアクセスを ProgramArguments[0] (責任プロセス) によるものとみなすので、Health
+    Auto Export の iCloud フォルダを読むためのフルディスクアクセスは、このランチャーにだけ
+    与えればよい (bin/ihealth-run を直接書くと責任プロセスが /bin/bash になり、許可が
+    すべての bash スクリプトに及ぶ)。ランチャーは bin/ihealth-run だけを /bin/bash で
+    実行し、引数は受け付けない (引数付きで起動されたら何もせずに 64 で終わる) ので、
+    ProgramArguments にはランチャーだけを書く。ランチャーをビルドできない環境では
+    install-launchd.sh が bin/ihealth-run を直接入れる (非推奨)。
+  - bin/ihealth-run ラッパー側で cd / PYTHONPATH / LANG をセットアップするので、plist の
+    EnvironmentVariables は不要。
   - StartCalendarInterval で起動 (cron の直接的代替)。テンプレートは 07:00 / 12:00 /
     21:00 の 3 回で、bin/install-launchd.sh が .env の IHEALTH_PUBLISHER を見て決める:
     obsidian なら 3 回とも残し、それ以外 (notion / markdown / sqlite / slack / stdout /
@@ -39,7 +50,7 @@
 
     <key>ProgramArguments</key>
     <array>
-        <string>__PROJECT_ROOT__/bin/ihealth-run</string>
+        <string>__PROGRAM__</string>
     </array>
 
     <key>WorkingDirectory</key>

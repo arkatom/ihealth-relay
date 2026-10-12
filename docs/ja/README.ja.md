@@ -100,9 +100,12 @@ Apple Health のデータを、日々の記録先へ転記する macOS バッチ
    ```bash
    ./bin/install-launchd.sh
    ```
-   登録したら `/bin/bash` に **フルディスクアクセス** を与え (与えないと定期実行が
-   Health Auto Export の iCloud フォルダを読めない)、bash に **リマインダー** の操作を
-   許可するダイアログを許可する ([定期実行 (launchd)](#定期実行-launchd))。
+   installer は定期実行用の小さなランチャーをビルドし、最後に残りの手順を貼り付けて
+   使えるコマンド付きで表示する: ランチャー
+   `~/Library/Application Support/ihealth-relay/ihealth-launcher` に **フルディスク
+   アクセス** を与え (`/bin/bash` ではない。与えないと定期実行が Health Auto Export の
+   iCloud フォルダを読めない)、1 回試しに実行し、ihealth-launcher に **リマインダー** の
+   操作を許可するダイアログを許可する ([定期実行 (launchd)](#定期実行-launchd))。
 
 ## Obsidian 日記 (`--publisher obsidian`)
 
@@ -219,8 +222,9 @@ Github: "[🔀 my-app:PR #12: Add login form](https://github.com/your-name/my-ap
    ./bin/ihealth-run --publisher obsidian --dry-run   # "[dry-run] <ノート>: <キー>: 旧値 -> 新値" をログに出す
    ./bin/ihealth-run --publisher obsidian
    ```
-5. **定期実行**: `./bin/install-launchd.sh` を実行し、`/bin/bash` にフルディスクアクセスを
-   与えて、リマインダーの許可ダイアログを許可する ([定期実行 (launchd)](#定期実行-launchd))。
+5. **定期実行**: `./bin/install-launchd.sh` を実行し、最後に表示される手順に従う
+   (ランチャーへのフルディスクアクセス (`/bin/bash` ではない)・試し実行・リマインダーの
+   許可ダイアログ。[定期実行 (launchd)](#定期実行-launchd))。
 
 #### Obsidian 用の `.env` キー
 
@@ -282,8 +286,9 @@ property = "GitHub"          # GitHub 活動を "Github" ではなく "GitHub" �
 
 ### 定期実行 (launchd)
 
-`./bin/install-launchd.sh` は `bin/ihealth-run` を **引数なしで** 起動する LaunchAgent を
-登録する。起動時刻は `.env` の `IHEALTH_PUBLISHER` で決まる: `obsidian` なら
+`./bin/install-launchd.sh` は、小さなランチャー (下記) 経由で `bin/ihealth-run` を
+**引数なしで** 起動する LaunchAgent を登録する。起動時刻は `.env` の `IHEALTH_PUBLISHER`
+で決まる: `obsidian` なら
 **07:00 / 12:00 / 21:00** (毎回既定の期間を処理するので、今日の暫定値が日中も更新され、
 遅れて届いた再出力もその日のうちに拾う)、それ以外の publisher は従来どおり **07:00 だけ**
 (Slack が 1 日 3 回投稿するのを防ぐ)。`IHEALTH_PUBLISHER` を変えたら installer を
@@ -291,26 +296,66 @@ property = "GitHub"          # GitHub 活動を "Github" ではなく "GitHub" �
 確認できる。スリープ中に過ぎた起動は復帰後に 1 回だけ実行され、その直後は最大
 `IHEALTH_NETWORK_GRACE_SEC` 秒 Wi-Fi の接続を待つ。
 
-登録したら、定期実行に必要な macOS の許可を一度だけ与える:
+installer は最後に、次にやることを貼り付けて使えるコマンド付きで表示する。定期実行に
+必要な macOS の許可を一度だけ与える:
 
-- **`/bin/bash` にフルディスクアクセス**: launchd は bash スクリプト `bin/ihealth-run` を
-  起動するので、macOS のプライバシー保護 (TCC) は定期実行のファイルアクセスを
-  `/bin/bash` によるものとみなす。許可が無いと Health Auto Export の iCloud フォルダ
+- **ランチャーにフルディスクアクセス**
+  (`~/Library/Application Support/ihealth-relay/ihealth-launcher`): macOS のプライバシー
+  保護 (TCC) は、launchd ジョブのファイルアクセスを、ジョブに登録したプログラム
+  (責任プロセス = responsible process) によるものとみなす。そのプログラムが別の
+  プログラムを起動しても変わらない。launchd に bash スクリプト `bin/ihealth-run` を直接
+  起動させるとそれは `/bin/bash` になり、許可を `/bin/bash` に与えるしかない (launchd が
+  このユーザーで起動するすべての bash スクリプトに及ぶ)。そこで installer は
+  `bin/launcher/ihealth-launcher.c` を Xcode Command Line Tools の C コンパイラでビルドし、
+  ad-hoc 署名して、ジョブのプログラムとして登録する。ランチャーは
+  `/bin/bash <clone>/bin/ihealth-run` を実行するだけで (パスはビルド時に埋め込む)、引数は
+  受け付けない: launchd は引数を渡さないし、許可を持つプロセスに `--slack-webhook <URL>`
+  や `--markdown-out <パス>` で別の送り先を指定させないため (引数付きで起動されたら何も
+  実行せずに 64 で終わる。手で実行するときは `./bin/ihealth-run` を使う)。bash / Python /
+  動的リンカに別のコードを読み込ませる環境変数も渡さず、自分自身も `DYLD_*` を無視する。
+  許可が無いと Health Auto Export の iCloud フォルダ
   (`~/Library/Mobile Documents/iCloud~com~ifunography~HealthExport/Documents`) の
   読み込みが `[Errno 1] Operation not permitted` で失敗し、健康データの source だけが
-  失敗する (天気と GitHub は動き、終了コードは 12)。`/bin/bash` についてはダイアログが
-  出ないので、自分で追加する: システム設定 › プライバシーとセキュリティ ›
-  フルディスクアクセス › 「+」→ Cmd+Shift+G で `/bin/bash` を入力して追加し、オンにする。
-  vault を `~/Documents` や `~/Desktop` に置いている場合も、この許可で足りる。
-  この許可は、launchd がこのユーザーで起動するすべての bash スクリプトに及ぶ。
-- **リマインダー**: 定期実行が初めてリマインダーを作るとき、bash にリマインダーの操作を
-  許可するか macOS が尋ねるので、許可する (後から
-  システム設定 › プライバシーとセキュリティ › オートメーション › bash › リマインダー
-  でも許可できる)。許可するまでは通知がタイムアウトし、未送信のまま残って次の実行で
-  再送される。
+  失敗する (天気と GitHub は動き、終了コードは 12)。ダイアログは出ない。
+  `open -R "$HOME/Library/Application Support/ihealth-relay/ihealth-launcher"` でファイルを
+  表示し、`open "x-apple.systempreferences:com.apple.preference.security?Privacy_AllFiles"`
+  で開いたリストへドラッグしてオンにする。vault を `~/Documents` や `~/Desktop` に
+  置いている場合も、この許可で足りる。許可が及ぶのは `bin/ihealth-run` と clone 内の
+  コードがすることなので、clone は自分だけが書き込める場所に置く。
+- **許可を保つ**: 許可はビルドしたそのバイナリに結び付く。installer を再実行しても
+  ランチャーはそのまま残し、作り直すのはソース・clone の実際の場所 (symlink 経由や
+  大文字小文字を変えて installer を実行しても、同じ場所とみなす)・ビルド設定が変わった
+  ときだけ (作り直した結果が同じなら古いファイルを残す)。installer が新しいランチャーを
+  ビルドしたと表示したら、リストの古い `ihealth-launcher` を「−」で消してから追加し直す。
+- **C コンパイラが無い場合** (Command Line Tools 未導入) はランチャーをビルドできない。
+  installer はその旨を表示して `bin/ihealth-run` を直接登録し、フルディスクアクセスは
+  `/bin/bash` に与えることになる (おすすめしない。`xcode-select --install` を実行して
+  installer を再実行する)。
+- **リマインダー**: 定期実行が初めてリマインダーを作るとき、ihealth-launcher に
+  リマインダーの操作を許可するか macOS が尋ねるので、許可する (後から
+  システム設定 › プライバシーとセキュリティ › オートメーション › ihealth-launcher ›
+  リマインダー でも許可できる)。許可するまでは通知がタイムアウトし、未送信のまま残って
+  次の実行で再送される。
+- 以前の版の手順で `/bin/bash` にフルディスクアクセスを与えた (bash にリマインダーの
+  操作を許可した) 場合は、もう不要なので外してよい。
 
-許可したら `launchctl kickstart -k gui/$(id -u)/com.ihealthrelay.daemon` で試し、
-`logs/run.log` を確認する。
+許可したら 1 回実行し、1〜2 分してから結果を確かめる (installer は同じコマンドを、uid と
+パスを埋めて最後に表示する。最後のコマンドは clone の中で実行する):
+
+```bash
+launchctl kickstart -k "gui/$(id -u)/com.ihealthrelay.daemon"
+launchctl print "gui/$(id -u)/com.ihealthrelay.daemon" | grep -E "^.(state|last exit code) = "
+awk '/ihealth-relay 起動/{n=0} /ihealth-relay 起動|日記 [0-9-]+:|日記 完了:/{l[++n]=$0} END{for(i=1;i<=n;i++)print l[i]}' logs/run.log
+```
+
+`state = not running` で `last exit code = 0` なら成功。`awk` のコマンドは、run.log の
+うち最後の実行の要約の行だけを出す (Obsidian): 最後の行 (`日記 完了: …`) が `exit=0` で、
+各日の行が `health=complete` (今日の分は、まだデータが届いておらず `health=nodata` の
+こともある)。`health=failed` (exit 12) なら、許可がまだ効いていない。`state = running`
+ならまだ実行中なので (`last exit code` は前の回の値か `(never exited)`)、少し待って
+確かめ直す。ほかの publisher では、installer は同じ `awk` を
+`ihealth-relay 起動|集計完了|ERROR` の行について表示する: `集計完了` があり `ERROR` が
+無ければ成功。
 
 - アプリのログ: `logs/run.log` (日次ローテーション, 30 日保持)
 - launchd の stdout / stderr: `~/Library/Logs/ihealth-relay/launchd.log`。起動失敗・

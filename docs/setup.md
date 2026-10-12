@@ -8,6 +8,10 @@ sections marked *Obsidian* or *Notion* only apply to that publisher.
 - macOS 14+ (Sonoma) on Apple Silicon or Intel
 - Python 3.9+ (`/usr/bin/python3` is bundled with macOS as 3.9.x — verify
   with `/usr/bin/python3 --version`)
+- For scheduled runs: the C compiler of the Xcode Command Line Tools
+  (`xcode-select --install`, the same tools that provide `/usr/bin/python3`;
+  check with `/usr/bin/cc --version`). The launchd installer uses it once to
+  build a small launcher (see [section 9](#9-schedule-with-launchd-optional))
 - An iPhone signed in to the same iCloud account as the Mac
 - *Obsidian*: an Obsidian vault with a diary folder of `YYYY-MM-DD.md` notes,
   and for the GitHub part either a GitHub token or the
@@ -222,8 +226,9 @@ notes).
 ./bin/install-launchd.sh
 ```
 
-Installs `LaunchAgent/com.ihealthrelay.daemon.plist` to
-`~/Library/LaunchAgents/` and registers it. It runs `bin/ihealth-run`
+Builds a small launcher (below), installs
+`LaunchAgent/com.ihealthrelay.daemon.plist` to `~/Library/LaunchAgents/` and
+registers it. The job runs the launcher, which runs `bin/ihealth-run`
 without arguments, so the publisher comes from `IHEALTH_PUBLISHER`
 (default `notion`), and the installer picks the times from the same key:
 
@@ -237,27 +242,91 @@ without arguments, so the publisher comes from `IHEALTH_PUBLISHER`
 
 Re-run the installer after changing `IHEALTH_PUBLISHER`.
 `./bin/install-launchd.sh --print-plist` prints the plist it would install
-without changing anything.
+without changing anything (not even building the launcher).
 
-After installing, give the scheduled run its macOS permissions (once):
+The installer ends by printing the next steps with the exact commands to
+copy — scroll to the end of its output. Give the scheduled run its macOS
+permissions (once):
 
-- **Full Disk Access for `/bin/bash`**: launchd starts `bin/ihealth-run`, a
-  bash script, so macOS privacy protection (TCC) attributes the run's file
-  access to `/bin/bash`. Without the grant, reading the Health Auto Export
-  iCloud folder fails with `[Errno 1] Operation not permitted` (the health
-  source fails, exit 12; weather and GitHub still work), and macOS shows no
-  dialog for it. Open System Settings › Privacy & Security › Full Disk
-  Access, click "+", press Cmd+Shift+G, enter `/bin/bash`, add it and turn
-  it on. The grant applies to every bash script launchd starts for your
-  user.
+- **Full Disk Access for the launcher**
+  `~/Library/Application Support/ihealth-relay/ihealth-launcher`:
+  ```bash
+  open -R "$HOME/Library/Application Support/ihealth-relay/ihealth-launcher"   # reveals the file
+  open "x-apple.systempreferences:com.apple.preference.security?Privacy_AllFiles"
+  ```
+  Drag the file into the Full Disk Access list and turn it on (or click "+",
+  press Cmd+Shift+G and paste the path). Without the grant, reading the
+  Health Auto Export iCloud folder fails with `[Errno 1] Operation not
+  permitted` (the health source fails, exit 12; weather and GitHub still
+  work), and macOS shows no dialog for it.
+
+  *Why a launcher*: macOS privacy protection (TCC) attributes a launchd
+  job's file access to the job's program (the *responsible process*), also
+  after that program starts others. If launchd started the bash script
+  `bin/ihealth-run` itself, the grant would have to go to `/bin/bash` and
+  would cover every bash script launchd starts for your user. The installer
+  instead builds `bin/launcher/ihealth-launcher.c` (with `/usr/bin/cc`),
+  signs it ad hoc (`com.ihealthrelay.launcher`) and registers it as the
+  job's program. It only runs `/bin/bash <clone>/bin/ihealth-run` (the path
+  is compiled in) and takes no arguments: launchd passes none, and a
+  process holding the grant must not be pointed at another destination such
+  as `--slack-webhook <URL>` or `--markdown-out <path>` (given arguments, it
+  exits with 64 without running anything; run `./bin/ihealth-run` by hand
+  instead). It drops environment variables that would make bash, Python or
+  the dynamic linker load other code (`BASH_ENV`, exported functions,
+  `SHELLOPTS`/`PS4`, `PYTHON*`, `DYLD_*`), and ignores `DYLD_*` variables
+  itself. The grant then covers what `bin/ihealth-run` and the code in your
+  clone do, so keep the clone where only you can write.
+
+  *Keeping the grant*: a grant applies to one exact build. The installer
+  writes `ihealth-launcher.stamp` next to the launcher (source hash, real
+  path of `bin/ihealth-run` with symlinks and letter case resolved, build
+  settings, binary hash) and rebuilds only when it no longer matches; if the
+  new build is byte-for-byte the same, the old file is kept. Only when the
+  installer reports a newly built launcher (its final block is marked
+  【要対応】), remove the old `ihealth-launcher` entry ("−") and add the file
+  again. Running the installer from another clone or worktree re-registers
+  the job for that clone and rebuilds the launcher.
+  `./bin/install-launchd.sh --build-launcher <dir>` builds a launcher into
+  another existing directory only (for tests); it refuses the directory the
+  scheduled job uses and never touches launchd.
+
+  *Without a C compiler* (no Command Line Tools) the installer registers
+  `bin/ihealth-run` directly and says so; Full Disk Access would then have
+  to go to `/bin/bash` (not recommended: run `xcode-select --install` and
+  re-run the installer instead). `IHEALTH_CC=/path/to/cc` selects another
+  compiler.
 - **Reminders**: the first time a scheduled run creates a reminder, macOS
-  asks whether bash may control Reminders. Allow it (or later under System
-  Settings › Privacy & Security › Automation › bash › Reminders); until
-  then the reminder times out, is kept as undelivered and is retried on the
-  next run.
+  asks whether ihealth-launcher may control Reminders. Allow it (or later
+  under System Settings › Privacy & Security › Automation ›
+  ihealth-launcher › Reminders); until then the reminder times out, is kept
+  as undelivered and is retried on the next run.
+- If you gave `/bin/bash` Full Disk Access (or allowed bash to control
+  Reminders) for an earlier version, remove those entries.
 
-Then test the job with `launchctl kickstart -k gui/$(id -u)/com.ihealthrelay.daemon`
-and check `logs/run.log`.
+Then run the job once and check the result a minute or two later (the
+installer prints these commands at the end with your uid and paths filled
+in; run the last one in the clone):
+
+```bash
+launchctl kickstart -k "gui/$(id -u)/com.ihealthrelay.daemon"
+launchctl print "gui/$(id -u)/com.ihealthrelay.daemon" | grep -E "^.(state|last exit code) = "
+awk '/ihealth-relay 起動/{n=0} /ihealth-relay 起動|日記 [0-9-]+:|日記 完了:/{l[++n]=$0} END{for(i=1;i<=n;i++)print l[i]}' logs/run.log
+```
+
+- `state = not running` and `last exit code = 0`: the run finished
+  successfully. While `state = running` it is still going (`last exit code`
+  is then the previous run's, or `(never exited)`); check again shortly.
+- The `awk` command prints only the summary lines of the last run, from its
+  `ihealth-relay 起動` line on (an Obsidian run writes several lines for
+  each of 8 or more days, so `tail` would cut it off). Obsidian: the last
+  line (`日記 完了: …`) ends with `exit=0`, and each day shows
+  `health=complete` (today may show `health=nodata` while its data has not
+  arrived). `health=failed` (exit 12) means the grant is not in effect yet;
+  `logs/run.log` then contains `Operation not permitted`.
+- Other publishers: the installer prints the same `awk` command for the
+  lines `ihealth-relay 起動|集計完了|ERROR`; success is `集計完了` and no
+  `ERROR`.
 
 Runs missed while the Mac sleeps are run once after wake; the Obsidian
 pipeline then waits up to `IHEALTH_NETWORK_GRACE_SEC` (60) seconds for the
@@ -276,6 +345,9 @@ To unregister:
 launchctl bootout "gui/$(id -u)/com.ihealthrelay.daemon" 2>/dev/null \
     || launchctl unload ~/Library/LaunchAgents/com.ihealthrelay.daemon.plist
 ```
+
+This keeps the launcher (and its Full Disk Access), so registering again
+needs no new grant; [Uninstalling](#uninstalling) removes it too.
 
 ## 10. Daily operations
 
@@ -342,8 +414,8 @@ launchctl bootout "gui/$(id -u)/com.ihealthrelay.daemon" 2>/dev/null \
 | Obsidian: `アクティビティ詳細` not written | no mindfulness, workout or Apple Exercise Time that day and no heart-rate data either (Watch not worn; a 0-minute Apple Exercise Time alone does not count), or an input could not be read (then it is not written even with heart-rate data) | nothing to do; check that the automation exports Mindful Minutes, Apple Exercise Time and Heart Rate |
 | Obsidian: `アクティビティ詳細` shows `エクササイズN分` instead of workout names | the automation does not export workouts (with workouts exported, a day without any workout of at least 1 minute also shows `エクササイズN分`) | turn on **Include Workouts** in the Health Auto Export automation |
 | Obsidian: an `アクティビティ詳細` you typed was replaced (e.g. by `なし` or `エクササイズN分`) | within the default window (yesterday back 7 days plus today) the tool writes this key like its other keys; `なし` means heart-rate data but no mindfulness, workout or exercise record that day | to keep your value, add a comment to its line (`アクティビティ詳細: "ヨガ30分" # 手入力`; the entry is then `kept`); for workout names, turn on **Include Workouts** |
-| Works by hand, but under launchd reading fails with `[Errno 1] Operation not permitted` (typically the health source fails, exit 12, while weather and GitHub still work) | macOS privacy protection (TCC) attributes the scheduled run's file access to `/bin/bash`, because launchd starts the bash script `bin/ihealth-run`, and `/bin/bash` may not read the Health Auto Export iCloud folder (`~/Library/Mobile Documents/iCloud~com~ifunography~HealthExport/Documents`). macOS shows no dialog for it (`/bin/bash` is a platform binary) | System Settings › Privacy & Security › Full Disk Access › "+", press Cmd+Shift+G, enter `/bin/bash`, add it and turn it on; then run `launchctl kickstart -k gui/$(id -u)/com.ihealthrelay.daemon` and check `logs/run.log`. If the vault itself is in `~/Documents` or `~/Desktop`, the same grant covers it. The grant applies to every bash script launchd starts for your user |
-| Under launchd no reminder appears and `logs/run.log` shows `Reminders 通知がタイムアウト` | the scheduled run needs Automation permission for bash to control Reminders; macOS asks for it with a dialog | allow it on the dialog, or later under System Settings › Privacy & Security › Automation › bash › Reminders. Until then the reminder is kept as undelivered and retried on the next run |
+| Works by hand, but under launchd reading fails with `[Errno 1] Operation not permitted` (typically the health source fails, exit 12, while weather and GitHub still work) | macOS privacy protection (TCC) attributes the scheduled run's file access to the job's program, the launcher `~/Library/Application Support/ihealth-relay/ihealth-launcher` (or `/bin/bash` when the installer could not build it and registered `bin/ihealth-run` directly), and that program may not read the Health Auto Export iCloud folder (`~/Library/Mobile Documents/iCloud~com~ifunography~HealthExport/Documents`). macOS shows no dialog for it. A grant given to an earlier build of the launcher does not cover a rebuilt one | Re-run `./bin/install-launchd.sh` and follow the steps it prints at the end: `open -R "$HOME/Library/Application Support/ihealth-relay/ihealth-launcher"`, `open "x-apple.systempreferences:com.apple.preference.security?Privacy_AllFiles"`, drag the launcher into the list and turn it on (remove an old `ihealth-launcher` entry first); then `launchctl kickstart -k gui/$(id -u)/com.ihealthrelay.daemon` and check `logs/run.log`. If the vault itself is in `~/Documents` or `~/Desktop`, the same grant covers it. `launchctl print gui/$(id -u)/com.ihealthrelay.daemon` shows the registered `program` |
+| Under launchd no reminder appears and `logs/run.log` shows `Reminders 通知がタイムアウト` | the scheduled run needs Automation permission for ihealth-launcher (bash without the launcher) to control Reminders; macOS asks for it with a dialog | allow it on the dialog, or later under System Settings › Privacy & Security › Automation › ihealth-launcher › Reminders. Until then the reminder is kept as undelivered and retried on the next run |
 | Reminder shows `想定外エラー` ("Unexpected error", exit 1) | unhandled exception | check `logs/run.log`, file an issue |
 
 ## Uninstalling
@@ -352,8 +424,12 @@ launchctl bootout "gui/$(id -u)/com.ihealthrelay.daemon" 2>/dev/null \
 launchctl bootout "gui/$(id -u)/com.ihealthrelay.daemon" 2>/dev/null \
     || launchctl unload ~/Library/LaunchAgents/com.ihealthrelay.daemon.plist
 rm ~/Library/LaunchAgents/com.ihealthrelay.daemon.plist
+rm -rf "$HOME/Library/Application Support/ihealth-relay"   # the launcher
 rm -rf ~/src/ihealth-relay   # or wherever you cloned it
 ```
+
+Then remove `ihealth-launcher` from System Settings › Privacy & Security ›
+Full Disk Access and from Automation.
 
 `data/` (health archives, Obsidian backups, the ledger `diary-state.json`)
 and `logs/` (logs, run reports) inside the clone hold personal data; deleting
