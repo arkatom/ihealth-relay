@@ -93,6 +93,9 @@ See [`docs/architecture.md`](docs/architecture.md) for module-level details.
 
 - macOS 14+ (Sonoma) on Apple Silicon (also tested on Intel)
 - Python 3.9+ (`/usr/bin/python3` is bundled with macOS as 3.9.x)
+- For scheduled runs: the Xcode Command Line Tools' C compiler
+  (`xcode-select --install`; the same tools provide `/usr/bin/python3`),
+  used once by the installer to build the launcher
 - iPhone with iCloud syncing on, and **Health Auto Export — JSON+CSV**
   (App ID 1115567069) Premium one-time purchase
 - For the GitHub part of the Obsidian diary: a GitHub token, or the
@@ -140,9 +143,12 @@ See [`docs/architecture.md`](docs/architecture.md) for module-level details.
    ```bash
    ./bin/install-launchd.sh   # installs LaunchAgent/com.ihealthrelay.daemon.plist
    ```
-   Then grant **Full Disk Access to `/bin/bash`** (otherwise scheduled runs
-   cannot read the Health Auto Export iCloud folder) and allow the dialog
-   that lets bash control **Reminders** — see
+   The installer builds a small launcher for the scheduled runs and ends by
+   printing the remaining steps with commands to copy: give **Full Disk
+   Access to the launcher** `~/Library/Application Support/ihealth-relay/ihealth-launcher`
+   (not to `/bin/bash`; otherwise scheduled runs cannot read the Health Auto
+   Export iCloud folder), run the job once, and allow the dialog that lets
+   ihealth-launcher control **Reminders** — see
    [Schedule (launchd)](#schedule-launchd).
 
 See [`docs/setup.md`](docs/setup.md) for detailed instructions, including
@@ -271,8 +277,9 @@ Github: "[🔀 my-app:PR #12: Add login form](https://github.com/your-name/my-ap
    ./bin/ihealth-run --publisher obsidian --dry-run   # logs "[dry-run] <note>: <key>: old -> new"
    ./bin/ihealth-run --publisher obsidian
    ```
-5. **Schedule**: `./bin/install-launchd.sh`, then grant Full Disk Access to
-   `/bin/bash` and allow the Reminders dialog (see [Schedule](#schedule-launchd)).
+5. **Schedule**: `./bin/install-launchd.sh`, then follow the steps it prints
+   at the end: Full Disk Access for its launcher (not `/bin/bash`), a test
+   run, and the Reminders dialog (see [Schedule](#schedule-launchd)).
 
 #### `.env` keys for Obsidian
 
@@ -338,8 +345,9 @@ startup (exit 3) instead of silently losing a value.
 ### Schedule (launchd)
 
 `./bin/install-launchd.sh` installs a LaunchAgent that runs `bin/ihealth-run`
-**without arguments**. The installer picks the times from `IHEALTH_PUBLISHER`
-in `.env`: **07:00, 12:00 and 21:00** for `obsidian` (each run processes the
+**without arguments**, through a small launcher (below). The installer picks
+the times from `IHEALTH_PUBLISHER` in `.env`: **07:00, 12:00 and 21:00** for
+`obsidian` (each run processes the
 default window, so today's provisional values stay current and late
 re-exports are picked up the same day), and **07:00 only** for every other
 publisher (as before — Slack would otherwise post three times a day). Re-run
@@ -349,27 +357,76 @@ without changing anything.
 Runs missed while the Mac was asleep are run once after wake; the tool then
 waits up to `IHEALTH_NETWORK_GRACE_SEC` seconds for Wi-Fi.
 
-After installing, give the scheduled run its macOS permissions (once):
+The installer ends by printing what to do next, with the commands to copy.
+Give the scheduled run its macOS permissions (once):
 
-- **Full Disk Access for `/bin/bash`**: launchd starts `bin/ihealth-run`, a
-  bash script, so macOS privacy protection (TCC) attributes the run's file
-  access to `/bin/bash`. Without the grant, reading the Health Auto Export
-  iCloud folder
+- **Full Disk Access for the launcher**
+  `~/Library/Application Support/ihealth-relay/ihealth-launcher`. macOS
+  privacy protection (TCC) attributes a launchd job's file access to the
+  job's program (the *responsible process*), also after that program starts
+  others. If launchd started the bash script `bin/ihealth-run` itself, that
+  would be `/bin/bash`, and the grant would have to go to `/bin/bash` —
+  covering every bash script launchd starts for your user. So the installer
+  builds `bin/launcher/ihealth-launcher.c` with the C compiler of the Xcode
+  Command Line Tools, signs it ad hoc and registers it as the job's
+  program. The launcher only runs `/bin/bash <clone>/bin/ihealth-run` (the
+  path is compiled in) and takes no arguments: launchd passes none, and a
+  process holding the grant must not be pointed at another destination such
+  as `--slack-webhook <URL>` or `--markdown-out <path>` (with arguments it
+  exits with 64 without running anything; run `./bin/ihealth-run` yourself
+  instead). It also drops environment variables that would make bash, Python
+  or the dynamic linker load other code, and ignores `DYLD_*` variables
+  itself. Without the grant, reading the Health
+  Auto Export iCloud folder
   (`~/Library/Mobile Documents/iCloud~com~ifunography~HealthExport/Documents`)
   fails with `[Errno 1] Operation not permitted`: the health source fails
-  (exit 12) while weather and GitHub still work. macOS shows no dialog for
-  `/bin/bash`, so add it yourself: System Settings › Privacy & Security ›
-  Full Disk Access › "+", press Cmd+Shift+G, enter `/bin/bash`, add it and
-  turn it on. This also covers a vault in `~/Documents` or `~/Desktop`. The
-  grant applies to every bash script launchd starts for your user.
+  (exit 12) while weather and GitHub still work, and macOS shows no dialog.
+  Reveal the file with `open -R "$HOME/Library/Application Support/ihealth-relay/ihealth-launcher"`,
+  open the list with
+  `open "x-apple.systempreferences:com.apple.preference.security?Privacy_AllFiles"`,
+  drag the file into it and turn it on. This also covers a vault in
+  `~/Documents` or `~/Desktop`. The grant covers what `bin/ihealth-run` and
+  the code in your clone do, so keep the clone where only you can write.
+- **Keeping the grant**: a grant applies to one exact build. Re-running the
+  installer keeps the launcher as it is; it rebuilds it only when its
+  source, the clone's real location (running the installer through a
+  symlink or with different letter case does not count) or the build
+  settings change, and keeps the old file when the new build is identical.
+  When the installer says it built a new launcher, remove the old
+  `ihealth-launcher` entry ("−") and add the file again.
+- **Without a C compiler** (no Command Line Tools) the launcher cannot be
+  built: the installer then registers `bin/ihealth-run` directly and says
+  so, and Full Disk Access would have to go to `/bin/bash` (not
+  recommended — run `xcode-select --install` and re-run the installer
+  instead).
 - **Reminders**: the first time a scheduled run creates a reminder, macOS
-  asks whether bash may control Reminders. Allow it (or later under System
-  Settings › Privacy & Security › Automation › bash › Reminders); until
-  then the reminder times out, is kept as undelivered and is retried on the
-  next run.
+  asks whether ihealth-launcher may control Reminders. Allow it (or later
+  under System Settings › Privacy & Security › Automation ›
+  ihealth-launcher › Reminders); until then the reminder times out, is kept
+  as undelivered and is retried on the next run.
+- If you gave `/bin/bash` Full Disk Access (or allowed bash to control
+  Reminders) for an earlier version, remove those entries; they are no
+  longer needed.
 
-Then test the job with `launchctl kickstart -k gui/$(id -u)/com.ihealthrelay.daemon`
-and check `logs/run.log`.
+Then run the job once and check the result a minute or two later (the
+installer prints these commands at the end with your uid and paths filled
+in; run the last one in the clone):
+
+```bash
+launchctl kickstart -k "gui/$(id -u)/com.ihealthrelay.daemon"
+launchctl print "gui/$(id -u)/com.ihealthrelay.daemon" | grep -E "^.(state|last exit code) = "
+awk '/ihealth-relay 起動/{n=0} /ihealth-relay 起動|日記 [0-9-]+:|日記 完了:/{l[++n]=$0} END{for(i=1;i<=n;i++)print l[i]}' logs/run.log
+```
+
+It worked when `state = not running` and `last exit code = 0`. The `awk`
+command prints only the summary lines of the last run (Obsidian): its last
+line (`日記 完了: …`) ends with `exit=0`, and each day shows
+`health=complete` (today may show `health=nodata` while its data has not
+arrived). `health=failed` (exit 12) means the grant is not in effect yet.
+While `state = running` the run is still going (`last exit code` is then
+the previous run's, or `(never exited)`); check again shortly. For the
+other publishers the installer prints the same `awk` command for the lines
+`ihealth-relay 起動|集計完了|ERROR`: success is `集計完了` and no `ERROR`.
 
 - Application log: `logs/run.log` (daily rotation, 30 days).
 - launchd stdout/stderr: `~/Library/Logs/ihealth-relay/launchd.log` — start-up

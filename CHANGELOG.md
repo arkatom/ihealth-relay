@@ -169,6 +169,42 @@ days per run. The single-day sinks keep working as before.
   07:00 only (unchanged) for every other publisher. Re-run the installer
   after changing `IHEALTH_PUBLISHER`; `--print-plist` shows the plist
   without installing it.
+- **launchd runs a dedicated launcher** instead of the bash script:
+  macOS privacy protection (TCC) attributes a launchd job's file access to
+  the job's program, also after it starts other programs, so with
+  `bin/ihealth-run` registered directly the Full Disk Access needed for the
+  Health Auto Export iCloud folder would have to go to `/bin/bash` — and
+  cover every bash script launchd starts for the user. `install-launchd.sh`
+  now builds `bin/launcher/ihealth-launcher.c` with `/usr/bin/cc` (Xcode
+  Command Line Tools; `IHEALTH_CC` overrides) into
+  `~/Library/Application Support/ihealth-relay/ihealth-launcher`, signs it
+  ad hoc (`com.ihealthrelay.launcher`) and registers it as the job's
+  program (`__PROGRAM__` in the plist template). The launcher only runs
+  `/bin/bash <clone>/bin/ihealth-run` (the path is compiled in) and takes no
+  arguments: launchd passes none, and given any it exits with 64 without
+  running anything, so a process holding the grant cannot be pointed at
+  another destination (`--slack-webhook <URL>`, `--markdown-out <path>`, …).
+  It does not pass on environment variables that would make bash, Python or
+  the dynamic linker load other code (`BASH_ENV`, exported functions,
+  `SHELLOPTS` / `PS4`, `PYTHON*`, `DYLD_*`, …), and is linked with a
+  `__RESTRICT` segment so `DYLD_INSERT_LIBRARIES` is ignored. It is rebuilt
+  only when `ihealth-launcher.stamp` (source hash, compiled-in path, build
+  settings, binary hash) no longer matches, and an identical rebuild keeps
+  the old file, so the grant survives re-running the installer; the
+  compiled-in path is the clone's real path (symlinks and letter case
+  resolved), so running the installer through a symlink does not rebuild
+  it. Without a C compiler the installer registers `bin/ihealth-run`
+  directly and warns that Full Disk Access would then have to go to
+  `/bin/bash`. `--print-plist` shows the program without building
+  anything; `--build-launcher <dir>` (for tests) builds into another
+  existing directory and refuses the one the scheduled job uses.
+- `install-launchd.sh` ends with the next steps and copy-pasteable commands
+  (reveal the launcher, open the Full Disk Access settings, `launchctl
+  kickstart`, then `launchctl print … | grep -E "^.(state|last exit code) = "`
+  and an `awk` command that prints only the summary lines of the last run
+  in `logs/run.log`), after the registration status instead of before it,
+  and refuses project / home paths containing `"`, `$`, a backtick, `!` or
+  control characters (besides `|`, `&`, `\`).
 - Under launchd (stderr not a terminal) only warnings and errors are
   written to stderr, i.e. to the unrotated `launchd.log`; `logs/run.log`
   keeps everything. `--verbose` and dry runs (`--dry-run`, or the `dryrun`
@@ -213,15 +249,18 @@ days per run. The single-day sinks keep working as before.
 
 ### Notes
 
-- **Scheduled runs need Full Disk Access for `/bin/bash`**: launchd starts
-  the bash script `bin/ihealth-run`, so macOS attributes the run's file
-  access to `/bin/bash`; without the grant, reading the Health Auto Export
-  iCloud folder fails with `Operation not permitted` (the health source
-  fails, exit 12) and macOS shows no dialog. Add `/bin/bash` under System
-  Settings › Privacy & Security › Full Disk Access (the grant applies to
-  every bash script launchd starts for your user), and allow the dialog
-  that lets bash control Reminders, or reminders time out and are retried
-  on the next run.
+- **Scheduled runs need Full Disk Access for the launcher**
+  `~/Library/Application Support/ihealth-relay/ihealth-launcher` (not for
+  `/bin/bash`): without the grant, reading the Health Auto Export iCloud
+  folder fails with `Operation not permitted` (the health source fails,
+  exit 12) and macOS shows no dialog. `install-launchd.sh` prints the
+  commands at the end of its output (`open -R` on the launcher, the Full
+  Disk Access settings, a test run with `launchctl kickstart`). Re-add the
+  launcher only when the installer reports that it built a new one. Allow
+  the dialog that lets ihealth-launcher control Reminders, or reminders
+  time out and are retried on the next run. If `/bin/bash` was given Full
+  Disk Access (or allowed to control Reminders) following earlier
+  instructions, remove it.
 
 ### Notes for diaries migrated from the predecessor
 
@@ -264,6 +303,18 @@ are left alone, but new values are computed slightly differently:
 - 1,400+ unit tests (no network, no real vault / iCloud / `gh`, independent
   of the machine's time zone), including the end-to-end diary test, on
   `/usr/bin/python3` 3.9.6
+- `tests/test_launcher.py`: the launcher is built with the local C compiler
+  (`-Wall -Wextra -Werror`) and run against stand-in scripts (compiled-in
+  script only, arguments refused with exit 64 without running anything,
+  dropped environment variables, exit 126 when bash cannot be started); the
+  installer's stamp logic (also through a symlinked or differently cased
+  path), clean-up after a failed compile, `--build-launcher <dir>` leaving
+  the scheduled job's launcher alone, `--print-plist`, path checks for the
+  project and HOME, and the fallback without a compiler run in a temporary
+  HOME; on macOS also the signature, clean-up after a failed `codesign`, the
+  ignored `DYLD_INSERT_LIBRARIES` and a full install with a stand-in
+  `launchctl` whose output ends with the next steps, whose result-check
+  commands are run as pasted into bash, zsh and (if installed) fish
 
 ## [0.1.0] - 2026-04-29
 
